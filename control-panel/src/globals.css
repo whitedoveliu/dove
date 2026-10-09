@@ -1,0 +1,483 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================================
+   Dove — 设计系统（移植自 DeepSeek Harness 前端）
+   ----------------------------------------------------------------------------
+   令牌分层与命名沿用 DSH：
+     static（原始色阶） → alias（语义：bg / label / border / interactive） → 组件
+   颜色存 RGB 三分量，Tailwind 用 rgb(var(--x) / <alpha-value>) 组合透明度。
+   字体：界面用系统无衬线，只有代码/数字用等宽（DSH 的做法）。
+   ========================================================================== */
+
+@layer base {
+  /* ============================== 亮色（默认） ============================== */
+  :root {
+    /* ---- static：中性偏蓝灰阶（DSH neutral-bluish）---- */
+    --nb-00: 255 255 255;
+    --nb-50: 249 250 251;
+    --nb-60: 245 246 247;
+    --nb-75: 241 243 245;
+    --nb-100: 235 238 242;
+    --nb-150: 233 236 242;
+    --nb-200: 225 229 238;
+    --nb-300: 207 211 214;
+    --nb-400: 173 178 184;
+    --nb-500: 151 157 166;
+    --nb-600: 129 133 140;
+    --nb-700: 97 102 107;
+    --nb-750: 67 69 74;
+    --nb-800: 53 54 56;
+    --nb-850: 44 44 46;
+    --nb-875: 35 35 36;
+    --nb-900: 27 27 28;
+    --nb-950: 21 21 23;
+    --nb-1000: 15 17 21;
+
+    /* ---- static：品牌蓝（DSH deepseek）---- */
+    --ds-50: 237 243 254;
+    --ds-100: 228 237 253;
+    --ds-200: 211 226 255;
+    --ds-300: 183 200 254;
+    --ds-400: 122 170 255;
+    --ds-450: 86 134 254;
+    --ds-500: 65 118 230;
+    --ds-600: 72 104 178;
+
+    /* ---- static：状态色 ---- */
+    --green-500: 22 163 74;
+    --green-600: 21 128 61;
+    --amber-400: 247 173 49;
+    --amber-500: 245 158 11;
+    --red-500: 236 19 19;
+    --red-600: 200 30 30;
+    --blue-500: 59 130 246;
+    --violet-500: 139 118 246;
+
+    /* ---- alias：底色 ---- */
+    --surface-app: var(--nb-60);         /* 窗口底 / 面板之间的缝 */
+    --surface-sunken: var(--nb-50);      /* 侧栏（深一档的灰） */
+    --sidebar-fill: 235 238 242;         /* DSH 侧栏：明显灰于聊天区 */
+    --surface-raised: var(--nb-00);      /* 面板 / 卡片 */
+    --surface-overlay: var(--nb-00);     /* 弹层 */
+    --surface-inset: var(--nb-60);       /* 输入槽 / 代码块 */
+    --surface-hover: rgba(38, 49, 72, 0.06);
+    --surface-active: rgba(38, 49, 72, 0.1);
+    --surface-selected: var(--ds-50);
+    --surface-scrim: 0 0 0;
+    --surface-glass: 255 255 255;
+
+    /* ---- alias：文字 ---- */
+    --text-primary: var(--nb-1000);
+    --text-secondary: var(--nb-700);
+    --text-tertiary: var(--nb-600);
+    --text-disabled: var(--nb-400);
+    --text-inverse: var(--nb-00);
+    --text-accent: var(--ds-500);
+
+    /* ---- alias：描边（DSH 用极淡的黑）---- */
+    --border-rgb: 0 0 0;        /* 边框基色；透明度在组件/配置里给 */
+    --border-subtle: var(--border-rgb);
+    --border-default: var(--border-rgb);
+    --border-strong: var(--border-rgb);
+
+    /* ---- alias：强调 ---- */
+    --accent: var(--ds-500);
+    --accent-hover: var(--ds-600);
+    --accent-active: var(--ds-600);
+    --accent-fg: var(--nb-00);
+    --accent-subtle: var(--ds-50);
+    --accent-subtle-hover: var(--ds-100);
+    --accent-subtle-fg: var(--ds-500);
+    --accent-border: var(--ds-200);
+    --accent-ring: var(--ds-400);
+
+    /* ---- alias：状态 ---- */
+    --success: var(--green-500);
+    --success-subtle: 240 253 244;
+    --success-fg: var(--green-600);
+    --warning: var(--amber-500);
+    --warning-subtle: 254 245 231;
+    --warning-fg: 180 83 9;
+    --danger: var(--red-500);
+    --danger-hover: var(--red-600);
+    --danger-subtle: 254 242 242;
+    --danger-fg: var(--red-600);
+    --info: var(--blue-500);
+    --info-subtle: 239 246 255;
+    --info-fg: 37 99 235;
+    --thinking: var(--violet-500);
+    --thinking-subtle: 244 242 255;
+    --thinking-fg: 109 90 220;
+
+    /* ---- 气泡（DSH 用品牌浅蓝）---- */
+    --bubble: var(--ds-50);
+    --bubble-strong: var(--ds-200);
+    --bubble-border: var(--ds-100);
+
+    /* ---- 字体：界面无衬线，代码等宽（DSH 的做法）---- */
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+      "Liberation Mono", monospace;
+
+    /* ---- 圆角（DSH 的柔和风格）---- */
+    --radius-xs: 4px;
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 10px;
+    --radius-xl: 12px;
+    --radius-2xl: 16px;
+    --radius-3xl: 20px;
+    --radius: var(--radius-lg);
+
+    /* ---- 阴影 / 层级（DSH elevation：先描边，再一层很淡的投影）---- */
+    --shadow-xs: 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+    --shadow-sm: 0 0 0 0.5px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.04);
+    --shadow-md: 0 0 0 0.5px rgba(0, 0, 0, 0.04), 0 2px 4px rgba(0, 0, 0, 0.05);
+    --shadow-lg: 0 0 0 0.5px rgba(0, 0, 0, 0.04), 0 4px 12px rgba(0, 0, 0, 0.02),
+      0 2px 8px rgba(0, 0, 0, 0.04);
+    --shadow-xl: 0 0 1px rgba(0, 0, 0, 0.2), 0 0 4px rgba(0, 0, 0, 0.02),
+      0 12px 32px rgba(0, 0, 0, 0.08);
+    --shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.03);
+    --shadow-focus: 0 0 0 3px rgb(var(--accent-ring) / 0.28);
+    --shadow-accent: 0 1px 2px rgba(65, 118, 230, 0.24);
+
+    /* ---- 动效 ---- */
+    --duration-instant: 80ms;
+    --duration-fast: 120ms;
+    --duration-normal: 180ms;
+    --duration-slow: 260ms;
+    --duration-slower: 400ms;
+    --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+    --ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+    --ease-spring: cubic-bezier(0.34, 1.3, 0.64, 1);
+
+    /* ---- 层级 ---- */
+    --z-base: 0;
+    --z-raised: 10;
+    --z-sticky: 100;
+    --z-overlay: 1000;
+    --z-modal: 1100;
+    --z-popover: 1200;
+    --z-toast: 1300;
+    --z-tooltip: 1400;
+    --sidebar-width: 17.5rem;
+    --sidebar-rail-width: 3.25rem;
+    --chat-width: 26rem;
+
+    /* ---- 组件别名（沿用既有命名，组件层不用改）---- */
+    --background: var(--surface-raised);
+    --foreground: var(--text-primary);
+    --card: var(--surface-raised);
+    --card-foreground: var(--text-primary);
+    --popover: var(--surface-overlay);
+    --popover-foreground: var(--text-primary);
+    --primary: var(--accent);
+    --primary-foreground: var(--accent-fg);
+    --secondary: var(--nb-75);
+    --secondary-foreground: var(--nb-1000);
+    --muted: var(--surface-inset);
+    --muted-foreground: var(--text-secondary);
+    --accent-foreground: var(--accent-subtle-fg);
+    --destructive: var(--danger);
+    --destructive-foreground: var(--nb-00);
+    --border: var(--border-default);
+    --input: var(--border-default);
+    --ring: var(--accent-ring);
+  }
+
+  /* ================================ 深色 ================================ */
+  .dark {
+    --sidebar-fill: 27 27 28;
+    --surface-app: var(--nb-950);
+    --surface-sunken: var(--nb-900);
+    --surface-raised: var(--nb-900);
+    --surface-overlay: var(--nb-850);
+    --surface-inset: var(--nb-875);
+    --surface-hover: rgba(255, 255, 255, 0.06);
+    --surface-active: rgba(255, 255, 255, 0.1);
+    --surface-selected: 40 49 66;
+    --surface-scrim: 0 0 0;
+    --surface-glass: 27 27 28;
+
+    --text-primary: var(--nb-50);
+    --text-secondary: var(--nb-300);
+    --text-tertiary: var(--nb-400);
+    --text-disabled: var(--nb-500);
+    --text-inverse: var(--nb-1000);
+    --text-accent: var(--ds-400);
+
+    --border-rgb: 255 255 255;
+
+    --accent: var(--ds-500);
+    --accent-hover: var(--ds-450);
+    --accent-active: var(--ds-400);
+    --accent-fg: var(--nb-00);
+    --accent-subtle: 40 49 66;
+    --accent-subtle-hover: 47 58 79;
+    --accent-subtle-fg: var(--ds-300);
+    --accent-border: 52 65 91;
+    --accent-ring: var(--ds-450);
+
+    --success-subtle: 22 42 30;
+    --success-fg: 110 231 153;
+    --warning-subtle: 39 36 31;
+    --warning-fg: var(--amber-400);
+    --danger-subtle: 45 25 25;
+    --danger-fg: 248 113 113;
+    --info-subtle: 30 41 59;
+    --info-fg: 147 197 253;
+    --thinking-subtle: 40 36 56;
+    --thinking-fg: 178 164 255;
+
+    --bubble: 40 49 66;
+    --bubble-strong: 52 65 91;
+    --bubble-border: 47 58 79;
+
+    --shadow-xs: 0 0 0 0.5px rgba(255, 255, 255, 0.06);
+    --shadow-sm: 0 0 0 0.5px rgba(255, 255, 255, 0.06), 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 0 0 0.5px rgba(255, 255, 255, 0.06), 0 2px 4px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 0 0 0.5px rgba(255, 255, 255, 0.08), 0 8px 24px rgba(0, 0, 0, 0.5);
+    --shadow-xl: 0 0 1px rgba(0, 0, 0, 0.5), 0 12px 32px rgba(0, 0, 0, 0.6);
+    --shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+
+    --secondary: var(--nb-850);
+    --secondary-foreground: var(--nb-100);
+  }
+
+  /* ============================== 基础样式 ============================== */
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-surface-app text-foreground antialiased;
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 24px;
+    font-feature-settings: "cv11";
+    text-rendering: optimizeLegibility;
+    overscroll-behavior: none;
+  }
+
+  /* 只有代码/数字走等宽 */
+  code, kbd, samp, pre, .tabular, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background-color: rgb(var(--accent) / 0.18);
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent-ring) / 0.9);
+    outline-offset: 1px;
+  }
+
+  button, [role="button"] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  input, textarea {
+    font-family: inherit;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--nb-200)) transparent;
+  }
+  .dark * {
+    scrollbar-color: rgb(var(--nb-750)) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: rgba(0, 0, 0, 0.16);
+    border: 3px solid transparent;
+    border-radius: 9999px;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(0, 0, 0, 0.28);
+    background-clip: content-box;
+  }
+  .dark ::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.18);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+/* ============================ 组件配方 ============================ */
+@layer components {
+  /* DSH 没有一堆框：分区靠底色，不靠描边 */
+  .pane {
+    @apply flex min-h-0 min-w-0 flex-col overflow-hidden bg-surface-raised;
+  }
+
+  .pane-header {
+    @apply flex h-12 shrink-0 items-center gap-2 bg-surface-raised px-3.5;
+    border-bottom: 1px solid rgb(var(--border-rgb) / 0.04);
+  }
+
+  .section-label {
+    @apply px-2 text-2xs font-medium uppercase tracking-[0.06em] text-text-tertiary;
+  }
+
+  /* 侧栏导航项（对齐 DSH 的 sidebar nav） */
+  .tree-row {
+    @apply relative flex h-7 w-full select-none items-center gap-1.5 rounded-md pr-2 text-xs text-text-secondary;
+    transition: background-color var(--duration-fast) var(--ease-standard),
+      color var(--duration-fast) var(--ease-standard);
+  }
+  .tree-row:hover {
+    background-color: rgb(var(--nb-75));
+    color: rgb(var(--text-primary));
+  }
+  .dark .tree-row:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+  }
+  .tree-row[data-active="true"] {
+    background-color: var(--surface-selected);
+    color: rgb(var(--accent-subtle-fg));
+    font-weight: 500;
+  }
+
+  .kbd {
+    @apply inline-flex h-5 min-w-[1.25rem] select-none items-center justify-center rounded border border-border-default bg-surface-inset px-1.5 font-mono text-2xs text-text-tertiary;
+  }
+
+  .hairline {
+    @apply h-px w-full shrink-0 bg-border-subtle;
+  }
+}
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+  .text-pretty { text-wrap: pretty; }
+  .no-scrollbar { scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .surface-sheen { box-shadow: none; }
+}
+
+/* ====================== markdown（对齐 DSH 的字号体系） ======================
+   base 14/24 · h1 700 21/30 · h2 700 19/28 · h3 700 18/26 · h4 600 14/24
+   strong 600 · code 12/19 等宽
+   ========================================================================== */
+.prose {
+  color: rgb(var(--text-primary));
+  max-width: none;
+  font-size: 14px;
+  line-height: 24px;
+}
+
+.prose :where(p):not(:where([class~="not-prose"] *)) {
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+.prose :where(h1, h2, h3, h4, h5, h6) {
+  color: rgb(var(--text-primary));
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-top: 1.2em;
+  margin-bottom: 0.5em;
+}
+.prose :where(h1) { font-size: 21px; line-height: 30px; }
+.prose :where(h2) { font-size: 19px; line-height: 28px; }
+.prose :where(h3) { font-size: 18px; line-height: 26px; }
+.prose :where(h4) { font-size: 14px; line-height: 24px; font-weight: 600; }
+
+.prose :where(strong) { font-weight: 600; }
+.prose :where(em) { font-style: italic; }
+
+.prose :where(code):not(:where([class~="not-prose"] *)) {
+  font-size: 12px;
+  line-height: 19px;
+  font-weight: 400;
+  background: rgb(var(--surface-inset));
+  border: 1px solid rgb(var(--border-rgb) / 0.04);
+  border-radius: var(--radius-xs);
+  padding: 0.1em 0.35em;
+}
+.prose :where(code)::before,
+.prose :where(code)::after { content: none; }
+
+.prose :where(pre) {
+  background: rgb(var(--surface-inset));
+  border: 1px solid rgb(var(--border-rgb) / 0.04);
+  border-radius: var(--radius-lg);
+  padding: 12px 14px;
+  margin: 0.75em 0;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 19px;
+}
+.prose :where(pre code) {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 12px;
+}
+
+.prose :where(a) {
+  color: rgb(var(--text-accent));
+  text-decoration: underline;
+  text-decoration-color: rgb(var(--accent) / 0.35);
+  text-underline-offset: 2px;
+}
+
+.prose :where(ul, ol) { padding-left: 1.25em; }
+.prose :where(ul) { list-style: disc; }
+.prose :where(ol) { list-style: decimal; }
+.prose :where(li) { margin: 0.125em 0; }
+.prose :where(li)::marker { color: rgb(var(--text-tertiary)); }
+
+.prose :where(blockquote) {
+  border-left: 2px solid rgb(var(--border-rgb) / 0.07);
+  padding-left: 0.75em;
+  color: rgb(var(--text-secondary));
+}
+
+.prose :where(hr) { border-color: rgb(var(--border-rgb) / 0.04); margin: 1em 0; }
+
+.prose :where(table) {
+  font-size: 13px;
+  border-collapse: collapse;
+  width: 100%;
+}
+.prose :where(th) {
+  background: rgb(var(--surface-inset));
+  font-weight: 600;
+  text-align: left;
+}
+.prose :where(th, td) {
+  border: 1px solid rgb(var(--border-rgb) / 0.04);
+  padding: 6px 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

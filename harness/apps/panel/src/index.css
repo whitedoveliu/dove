@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+/* ===== 设计令牌：Codex/Ada 深色语言（见 docs/design-system.md） ===== */
+@theme {
+  /* 底色梯度 */
+  --color-shell: #0a0a0a;
+  --color-panel: #111111;
+  --color-raised: #171717;
+  --color-inset: #0d0d0d;
+
+  /* 描边 */
+  --color-line: #1e1e1e;
+  --color-line-strong: #2a2a2a;
+  --color-line-soft: #3a3a3a;
+
+  /* 前景 */
+  --color-fg: #d0d0d0;
+  --color-fg-dim: #8a8a8a;
+  --color-fg-mute: #6a6a6a;
+
+  /* 语义色：只保留五支 */
+  --color-accent: #5fafff;
+  --color-success: #87ff87;
+  --color-danger: #ff5f5f;
+  --color-info: #5fd7ff;
+  --color-think: #af87ff;
+  --color-warn: #ffd75f;
+
+  /* 中文优先；等宽用于数字/路径/标签 */
+  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC",
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    "PingFang SC", "Microsoft YaHei", monospace;
+
+  /* 终端语言：几乎见棱见角 */
+  --radius-xs: 1px;
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-shell);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 32%, transparent);
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+
+  /* 细滚动条，融进底色 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2a2a2a;
+    background-clip: content-box;
+    border: 2px solid transparent;
+    border-radius: 6px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a3a3a;
+    background-clip: content-box;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      transition-duration: 0.001ms !important;
+    }
+  }
+}
+
+/* 流式光标 */
+@keyframes dove-caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+.dove-caret {
+  display: inline-block;
+  width: 6px;
+  height: 12px;
+  margin-left: 2px;
+  vertical-align: -1px;
+  background: var(--color-accent);
+  animation: dove-caret 1s steps(1) infinite;
+}

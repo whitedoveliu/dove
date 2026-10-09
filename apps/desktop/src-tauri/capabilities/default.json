@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Dove 默认能力",
+  "windows": ["main"],
+  "permissions": [
+    "dialog:default","core:default"]
+}
