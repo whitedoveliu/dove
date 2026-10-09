@@ -1,0 +1,38 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+build/
+.next/
+*.tsbuildinfo
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# 密钥 —— **绝对不要提交**
+env
+env.*
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 运行时数据
+.data/
+.logs/
+.spill/
+logs/
+tmp/
+outputs/
+*.log
+
+# 向量模型（用 fetch-model.mjs 下载）
+models/
+*.onnx
+
+# 系统
+.DS_Store
+__pycache__/
+*.pyc

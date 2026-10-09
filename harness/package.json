@@ -1,0 +1,21 @@
+{
+  "name": "dove-harness",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dove Agent Harness — 常驻、有记忆、双层循环、事件溯源的桌面创意 Agent 内核",
+  "scripts": {
+    "dev": "node --no-warnings packages/server/src/main.ts",
+    "start": "node --no-warnings packages/server/src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --no-warnings --test packages/core/test/*.test.ts",
+    "smoke:routes": "node --no-warnings scripts/smoke-routes.mjs",
+    "smoke:screen": "node --no-warnings scripts/smoke-screen-memory.ts",
+    "lint:size": "node tools/lint-file-size.mjs",
+    "lint:layers": "node tools/lint-layering.mjs",
+    "lint": "npm run lint:size && npm run lint:layers"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

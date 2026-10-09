@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>联系 · 林知夏</title>
+  <link rel="stylesheet" href="styles/main.css" />
+</head>
+<body>
+  <header class="site-header">
+    <nav class="nav">
+      <a class="brand" href="index.html">林知夏</a>
+      <ul class="nav-links">
+        <li><a href="index.html">首页</a></li>
+        <li><a href="works.html">作品</a></li>
+        <li><a href="about.html">关于</a></li>
+        <li><a href="contact.html" class="active">联系</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section class="section">
+      <h1>聊聊你的项目</h1>
+      <form id="contact-form" class="form">
+        <label>你的名字<input type="text" name="name" required /></label>
+        <label>邮箱<input type="email" name="email" required /></label>
+        <label>想聊什么<textarea name="message" rows="5"></textarea></label>
+        <button class="btn btn-primary" type="submit">发送</button>
+        <p class="form-status" id="form-status"></p>
+      </form>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>© 2026 林知夏 · hello@linzhixia.design</p>
+  </footer>
+
+  <script src="scripts/data.js"></script>
+  <script src="scripts/main.js"></script>
+</body>
+</html>

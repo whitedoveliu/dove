@@ -1,0 +1,11 @@
+{
+  "name": "dove-studio",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Dove 回归夹具：一个个人作品集站点（零依赖，npm run build 用 node 自检）",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "node tools/build.mjs"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "dove"
+version = "0.1.0"
+description = "Dove 桌面端（Tauri 外壳 + Python agent sidecar）"
+edition = "2021"
+
+[lib]
+name = "dove_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri-plugin-dialog = "2"
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

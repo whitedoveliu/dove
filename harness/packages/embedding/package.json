@@ -1,0 +1,14 @@
+{
+  "name": "@dove/embedding",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "本地 ONNX 文本向量（唯一带 npm 依赖的包，隔离在这里）",
+  "main": "src/index.ts",
+  "scripts": {
+    "fetch-model": "node --no-warnings scripts/fetch-model.mjs"
+  },
+  "optionalDependencies": {
+    "onnxruntime-node": "^1.21.0"
+  }
+}

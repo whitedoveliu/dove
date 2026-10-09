@@ -1,0 +1,141 @@
+/* 主题变量 —— 改配色只改这里 */
+:root {
+  --color-bg: #faf7f2;
+  --color-surface: #ffffff;
+  --color-text: #1f1c18;
+  --color-muted: #7a7267;
+  --color-border: #e6ded2;
+  --color-accent: #2f5d50;
+  --color-accent-hover: #244a40;
+  --color-danger: #a8443a;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --radius: 8px;
+  --space-1: 8px;
+  --space-2: 16px;
+  --space-3: 24px;
+  --space-4: 40px;
+  --space-5: 72px;
+  --max-width: 960px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text);
+  line-height: 1.75;
+  font-size: 17px;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: inherit; text-decoration: none; }
+ul { list-style: none; }
+
+.site-header {
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.nav {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand { font-weight: 600; letter-spacing: 0.06em; }
+
+.nav-links { display: flex; gap: var(--space-3); font-size: 15px; color: var(--color-muted); }
+.nav-links a:hover { color: var(--color-text); }
+.nav-links a.active { color: var(--color-accent); font-weight: 600; }
+
+main { max-width: var(--max-width); margin: 0 auto; padding: 0 var(--space-3); }
+
+.hero { padding: var(--space-5) 0 var(--space-4); }
+.hero h1 { font-size: 40px; line-height: 1.25; letter-spacing: -0.01em; max-width: 18em; }
+.lead { color: var(--color-muted); margin-top: var(--space-2); max-width: 32em; font-size: 18px; }
+
+.section { padding: var(--space-4) 0; }
+.section h2 { font-size: 24px; margin-bottom: var(--space-3); }
+
+.btn {
+  display: inline-block;
+  padding: 10px 20px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+  font-size: 15px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.btn-primary { background: var(--color-accent); color: #fff; margin-top: var(--space-3); }
+.btn-primary:hover { background: var(--color-accent-hover); }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-3);
+}
+
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  transition: transform 0.15s ease;
+}
+.card:hover { transform: translateY(-2px); }
+.card img { width: 100%; display: block; aspect-ratio: 4 / 3; object-fit: cover; background: var(--color-border); }
+.card-body { padding: var(--space-2); }
+.card-title { font-weight: 600; }
+.card-meta { color: var(--color-muted); font-size: 14px; }
+
+.filter-bar { display: flex; gap: var(--space-1); margin-bottom: var(--space-3); flex-wrap: wrap; }
+.chip {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-muted);
+  cursor: pointer;
+  font-size: 14px;
+  font-family: inherit;
+}
+.chip.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+
+.form { display: flex; flex-direction: column; gap: var(--space-2); max-width: 480px; }
+.form label { display: flex; flex-direction: column; gap: 6px; font-size: 15px; color: var(--color-muted); }
+.form input, .form textarea {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font-family: inherit;
+  font-size: 16px;
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.form-status { font-size: 14px; color: var(--color-muted); min-height: 1.5em; }
+.form-status.error { color: var(--color-danger); }
+
+.about { display: flex; gap: var(--space-4); align-items: flex-start; flex-wrap: wrap; }
+.avatar { width: 160px; height: 160px; border-radius: var(--radius); object-fit: cover; background: var(--color-border); }
+
+.site-footer {
+  border-top: 1px solid var(--color-border);
+  margin-top: var(--space-5);
+  padding: var(--space-3);
+  text-align: center;
+  color: var(--color-muted);
+  font-size: 14px;
+}
+
+@media (max-width: 720px) {
+  .hero h1 { font-size: 30px; }
+  .nav-links { gap: var(--space-2); font-size: 14px; }
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>作品 · 林知夏</title>
+  <link rel="stylesheet" href="styles/main.css" />
+</head>
+<body>
+  <header class="site-header">
+    <nav class="nav">
+      <a class="brand" href="index.html">林知夏</a>
+      <ul class="nav-links">
+        <li><a href="index.html">首页</a></li>
+        <li><a href="works.html" class="active">作品</a></li>
+        <li><a href="about.html">关于</a></li>
+        <li><a href="contact.html">联系</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main>
+    <section class="section">
+      <h1>全部作品</h1>
+      <div class="filter-bar">
+        <button class="chip active" data-filter="all">全部</button>
+        <button class="chip" data-filter="brand">品牌</button>
+        <button class="chip" data-filter="web">网页</button>
+        <button class="chip" data-filter="print">印刷</button>
+      </div>
+      <div class="card-grid" id="work-list"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>© 2026 林知夏 · hello@linzhixia.design</p>
+  </footer>
+
+  <script src="scripts/data.js"></script>
+  <script src="scripts/main.js"></script>
+</body>
+</html>
