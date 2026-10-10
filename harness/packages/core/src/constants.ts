@@ -134,6 +134,19 @@ export const ACTIVITY_INJECT = {
 // ── 子代理 ────────────────────────────────────────────
 export const SUBAGENT_MAX_STEPS = 100;
 
+// ── 图片（ReadImage / image part 链路） ────────────────
+/**
+ * 单张图片上限。**单点定义**：ReadImage 工具与 context/images.ts 的装配共用，
+ * 两处写两个数就会出现「工具说能读、装配时被静默跳过」的错位。
+ */
+export const IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+/** 一条消息最多带几张图（超出不发送，避免一次请求把上下文撑爆） */
+export const IMAGE_MAX_PER_MESSAGE = 6;
+/** 一轮最多允许 ReadImage 挂几张图（防模型一次读几十张把历史撑爆） */
+export const IMAGE_MAX_PER_TURN = 8;
+/** 上下文「接近压缩线」的判定：used ≥ compactAt × 该比例 */
+export const CONTEXT_NEAR_COMPACT_FRACTION = 0.85;
+
 // ── 主动性 ────────────────────────────────────────────
 export const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 

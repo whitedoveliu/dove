@@ -26,6 +26,7 @@ import { handleChatRoutes } from "./routes-chat.ts";
 import { handleProjectRoutes } from "./routes-project.ts";
 import { handleLogRoutes } from "./routes-logs.ts";
 import { handlePermissionRoutes } from "./routes-permission.ts";
+import { handleGoalRoutes } from "./routes-goal.ts";
 import { handleSubagentRoutes } from "./routes-subagents.ts";
 
 export interface LegacyContext { svc: Services }
@@ -174,6 +175,7 @@ export async function handleLegacy(
   if (await handleProjectRoutes(path, url, req, res, svc)) return true;
   if (await handleLogRoutes(path, url, req, res, svc)) return true;
   if (await handlePermissionRoutes(path, url, req, res, svc)) return true;
+  if (await handleGoalRoutes(path, url, req, res, svc)) return true;
   if (await handleSubagentRoutes(path, url, req, res, svc)) return true;
 
   // 没实现的端点：明确 404（前端会看到，但不会白屏）

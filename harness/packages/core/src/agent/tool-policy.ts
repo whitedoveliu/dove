@@ -10,11 +10,20 @@ import type { Tool } from "../tools/types.ts";
 /** 会改动文件系统 / 产生副作用的工具 */
 export const MUTATING_TOOLS = new Set([
   "Write", "Edit", "Delete", "Bash", "KillShell",
-  "GenerateImage", "GeneratePPT", "QuickEdit",
+  "QuickEdit",
 ]);
 
 /** Home 线程额外允许的工具（调度能力） */
 export const HOME_EXTRA_TOOLS = new Set(["DispatchToProject"]);
+
+/**
+ * 只读模式下**额外**要裁掉的（不是「改文件」，而是「会派活/会留下持久副作用」）：
+ * - SendMessage 可以让已结束的子代理续跑，而子代理是有写权限的 → 等于绕开只读；
+ * - CronCreate / CronDelete 会留下长期副作用（到点自动跑）；
+ * - DispatchToProject / Task 本来就是派活。
+ * Home 线程**不裁**这些 —— 调度台本来就是干这个的。
+ */
+const READONLY_EXTRA_BLOCKED = new Set(["DispatchToProject", "Task", "SendMessage", "CronCreate", "CronDelete"]);
 
 /** 任何线程都必须有的元工具 */
 const ALWAYS = new Set(["AttemptCompletion", "AskUserQuestion", "TodoWrite", "ToolSearch", "Skill"]);
@@ -49,7 +58,7 @@ export function applyThreadPolicy(
   const allowed = new Map<string, Tool>();
   const blocked: string[] = [];
   // 只读模式更严：连 AskUserQuestion / TodoWrite 之外有副作用的都去掉
-  const readOnlyBlocked = new Set([...MUTATING_TOOLS, "DispatchToProject", "Task"]);
+  const readOnlyBlocked = new Set([...MUTATING_TOOLS, ...READONLY_EXTRA_BLOCKED]);
   const deny = opts.readOnly ? readOnlyBlocked : MUTATING_TOOLS;
 
   for (const [name, tool] of tools) {

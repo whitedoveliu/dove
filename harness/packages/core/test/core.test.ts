@@ -340,14 +340,14 @@ test("只读模式：连派活和子代理都被裁掉（不只是写文件）",
     ["Bash", fakeTool({ name: "Bash" })],
     ["DispatchToProject", fakeTool({ name: "DispatchToProject" })],
     ["Task", fakeTool({ name: "Task" })],
-    ["GeneratePPT", fakeTool({ name: "GeneratePPT" })],
+    ["KillShell", fakeTool({ name: "KillShell" })],
     ["AskUserQuestion", fakeTool({ name: "AskUserQuestion" })],
   ]);
   const r = applyThreadPolicy("project", tools, { readOnly: true });
   assert.equal(r.reason, "read-only");
   assert.ok(r.tools.has("Read"));
   assert.ok(r.tools.has("AskUserQuestion"), "提问是允许的（只读不等于不许沟通）");
-  for (const blocked of ["Write", "Bash", "DispatchToProject", "Task", "GeneratePPT"]) {
+  for (const blocked of ["Write", "Bash", "DispatchToProject", "Task", "KillShell"]) {
     assert.ok(!r.tools.has(blocked), blocked + " 在只读模式下必须被裁掉");
   }
 });

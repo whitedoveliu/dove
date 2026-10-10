@@ -4,7 +4,8 @@
  */
 // v2：M6 cron_* / M7 activity_* 新表
 // v3：activity_ocr_terms —— 屏幕内容的倒排索引，补上「OCR 存了但检索不到」这一环
-export const SCHEMA_VERSION = 3;
+// v4：goals —— 长期目标（每线程至多一个），跨轮自动续跑靠它
+export const SCHEMA_VERSION = 4;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -227,4 +228,20 @@ CREATE TABLE IF NOT EXISTS activity_ocr_terms (
 CREATE INDEX IF NOT EXISTS idx_ocr_terms_term ON activity_ocr_terms(term);
 CREATE INDEX IF NOT EXISTS idx_ocr_terms_at ON activity_ocr_terms(at DESC);
 CREATE INDEX IF NOT EXISTS idx_ocr_terms_frame ON activity_ocr_terms(frame_id);
+
+-- 长期目标（v4）：一个线程至多一个 goal；revision 做乐观并发。
+-- phase: active | paused | blocked | complete
+CREATE TABLE IF NOT EXISTS goals (
+  id             TEXT PRIMARY KEY,
+  thread_id      TEXT NOT NULL,
+  revision       INTEGER NOT NULL DEFAULT 1,
+  objective      TEXT NOT NULL,
+  phase          TEXT NOT NULL DEFAULT 'active',
+  rounds_started INTEGER NOT NULL DEFAULT 0,
+  max_rounds     INTEGER NOT NULL DEFAULT 20,
+  blocked_reason TEXT,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_goals_thread ON goals(thread_id, updated_at DESC);
 `;

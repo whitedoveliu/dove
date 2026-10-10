@@ -12,6 +12,7 @@ import { json, readBody, projectIdToPort, portToProject, type LegacyProject } fr
 import { toLegacy, sessionIdEvent, MODIFYING_TOOLS, type LegacyEvent } from "./sse-compat.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { runWithGoalContinuation } from "../goal-runner.ts";
 
 /** 项目里有没有可跑的构建脚本（没有就别假装构建失败） */
 function hasBuildScript(dir: string): boolean {
@@ -87,7 +88,9 @@ export async function handleChatRoutes(
     };
 
     try {
-      await svc.runtime.run({
+      // 目标续跑：一轮跑完后如果会话还有 active 目标，会自动带着 <goal_round> 再开一轮
+      // （判定在代码里，见 goal-runner.ts；单次请求内有硬上限）
+      await runWithGoalContinuation(svc.runtime, {
         threadId: thread.id, userText: message, projectId: proj.id,
         model: b.model ? String(b.model) : undefined,
         signal: ctrl.signal, sink,

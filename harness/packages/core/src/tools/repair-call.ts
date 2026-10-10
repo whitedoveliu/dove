@@ -30,8 +30,8 @@ const NAME_ALIASES: Record<string, string> = {
 
   webfetch: "WebFetch", web_fetch: "WebFetch", fetch: "WebFetch", url_fetch: "WebFetch",
   websearch: "WebSearch", web_search: "WebSearch", google: "WebSearch", search_web: "WebSearch",
-  generateppt: "GeneratePPT", generate_ppt: "GeneratePPT", makepresentation: "GeneratePPT",
-  generatevideo: "GenerateVideo", generate_slideshow_video: "GenerateVideo", generate_video: "GenerateVideo",
+  // GenerateImage / GeneratePPT / GenerateVideo 已移除（生图/PPT/视频改走技能），
+  // 模型若幻觉出这些名字，不映射到任何工具，让 repair 返回未找到。
   deletefile: "Delete", delete_file: "Delete", rm: "Delete",
 };
 

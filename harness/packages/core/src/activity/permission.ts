@@ -76,10 +76,30 @@ export function resetAskedMarker(configDir: string): void {
 export async function ensureScreenPermission(
   configDir: string,
 ): Promise<{ granted: boolean; asked: boolean; everAsked: boolean; error?: string }> {
-  try {
-    if (await isScreenRecordingAllowed()) return { granted: true, asked: false, everAsked: hasAsked(configDir) };
-  } catch { /* 探测失败继续 */ }
+  // ── App 形态下：申请由 Dove.app 负责（见 apps/desktop/src-tauri/src/lib.rs 的
+  //    ensure_screen_permission），内核**只查不申请**。
+  //
+  //    为什么（用户反馈"每次重启都问一遍"的根因）：TCC 把授权记在**发起申请的进程**头上。
+  //    内核原来用 swiftc 运行时编译出来的 helper 去申请，系统记的是那个临时二进制，
+  //    不是 Dove.app —— 下次换个身份来问，系统又弹一遍，永远点不完。
+  const appOwns = process.env.DOVE_APP_OWNS_SCREEN_PERMISSION === "1";
 
+  // ① 先做**不弹窗**的预检（CGPreflightScreenCaptureAccess，快且不碰屏幕）
+  const pre = await checkScreenPermission();
+  if (pre.ok && pre.granted) return { granted: true, asked: false, everAsked: hasAsked(configDir) };
+  if (appOwns) {
+    return { granted: false, asked: false, everAsked: true, ...(pre.ok ? {} : { error: pre.error }) };
+  }
+
+  // ② 预检不可用（没装 swiftc 等）→ 退回「探测截图」这条老路
+  if (!pre.ok) {
+    try {
+      if (await isScreenRecordingAllowed()) return { granted: true, asked: false, everAsked: hasAsked(configDir) };
+    } catch { /* 探测失败继续 */ }
+  }
+
+  // ③ 没权限：只在**从没问过**时申请一次（从终端直接跑内核时才走这里；
+  //    这时"负责进程"是终端，授权会记在终端头上，与 App 互不干扰）
   if (hasAsked(configDir)) {
     // 问过了还没权限 —— 说明用户拒了或还没去系统设置开。**不要再弹**。
     return { granted: false, asked: false, everAsked: true };

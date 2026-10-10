@@ -5,6 +5,8 @@
 export { CronScheduler } from "./cron.ts";
 export * from "./cron-model.ts";
 export type { CronSchedulerOptions } from "./cron.ts";
+// 模型可用的定时任务端口（CronCreate / CronList / CronDelete）—— bootstrap 注入用
+export { makeCronOps } from "./cron-ops.ts";
 
 export {
   Heartbeat,

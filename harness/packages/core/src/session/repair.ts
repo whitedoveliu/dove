@@ -20,7 +20,7 @@ export interface RepairResult {
 }
 
 const WRITE_TOOLS = new Set([
-  "Write", "Edit", "Delete", "Bash", "GeneratePPT", "GenerateVideo",
+  "Write", "Edit", "Delete", "Bash",
 ]);
 
 /** 未完成的工具状态 = 执行结果未知 */

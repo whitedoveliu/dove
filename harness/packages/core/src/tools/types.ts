@@ -68,6 +68,189 @@ export interface ToolServices {
    * 没配 key 时 WebSearch 自动退回抓搜索引擎 HTML —— 质量差但零依赖。
    */
   webSearchKey?: string;
+  /**
+   * 把一张本地图片挂进对话（ReadImage 用）。
+   *
+   * 为什么不是一个普通的返回值：OpenAI 兼容协议里 role:"tool" 的 content **只能是字符串**，
+   * 图片塞不进工具结果。所以图片必须走既有的 image part 链路（消息 parts 的 "image" 类型），
+   * 由运行时负责落库 + 在下一步注入。工具侧只递一个请求，不认识 store / loop。
+   */
+  attachImage?: (req: ImageAttachRequest) => Promise<ImageAttachResult>;
+  /** MCP 资源能力（ListMcpResources / ReadMcpResource 用）；没接 MCP 时为 undefined */
+  mcp?: McpResourcePort;
+  /** 子代理控制面（ListAgents 用）；由 agent 运行时实现 */
+  listAgents?: () => AgentSummary[];
+  /** 给子代理追加消息（SendMessage 用）；语义见返回值里的 mode */
+  sendAgentMessage?: (id: string, message: string) => Promise<AgentSendResult>;
+  /** 中断正在跑的子代理（InterruptAgent 用） */
+  interruptAgent?: (id: string) => AgentInterruptResult;
+  /** 定时任务（CronCreate / CronList / CronDelete 用） */
+  cron?: CronOps;
+  /** 当前上下文统计（GetContextRemaining 用）；拿不到真实 usage 时返回估算值 */
+  contextStats?: () => ContextStats;
+  /** 长期目标（CreateGoal / GetGoal / UpdateGoal 用）；面板的 /goal 共用同一张表 */
+  goals?: GoalPort;
+  /** 计划批准后退出计划模式（ExitPlanMode 用）；**只有处于计划模式时**运行时才会挂上 */
+  exitPlanMode?: (plan: string) => Promise<{ ok: boolean; error?: string }>;
+}
+
+/** 图片附件请求 / 结果（ReadImage → 运行时） */
+export interface ImageAttachRequest {
+  /** 绝对路径 */
+  path: string;
+  mediaType: string;
+  filename?: string;
+}
+export interface ImageAttachResult {
+  ok: boolean;
+  /** 落库后的消息 id（图片作为一条 user 消息存进线程） */
+  id?: string;
+  error?: string;
+  note?: string;
+}
+
+/** MCP 资源（列表 / 模板 / 内容）——形状对齐 mcp/client.ts 的 McpResource 等 */
+export interface McpResourceInfo { uri: string; name?: string; mimeType?: string; description?: string }
+export interface McpResourceTemplateInfo { uriTemplate: string; name?: string; mimeType?: string; description?: string }
+export interface McpResourceListing {
+  server: string;
+  ok: boolean;
+  resources?: McpResourceInfo[];
+  templates?: McpResourceTemplateInfo[];
+  error?: string;
+  note?: string;
+}
+export interface McpResourceContentInfo {
+  uri?: string;
+  mimeType?: string;
+  text?: string;
+  /** blob 只报字节数：base64 塞进上下文既没用又贵 */
+  blobBytes?: number;
+  note?: string;
+}
+export interface McpResourceReadResult {
+  server: string;
+  ok: boolean;
+  contents?: McpResourceContentInfo[];
+  error?: string;
+  note?: string;
+}
+/**
+ * 长期目标的一条视图（工具与面板看到的是同一份形状）。
+ * 真正的存储在 agents/goal-store.ts；tools 层只依赖这个形状，不 import agents/。
+ */
+export interface GoalView {
+  id: string;
+  revision: number;
+  objective: string;
+  phase: string;
+  roundsStarted: number;
+  maxRounds: number;
+  blockedReason?: string;
+}
+
+/** 目标端口：GoalStore 结构化实现它（不 import agents/，靠形状对上） */
+export interface GoalPort {
+  get(threadId: string): GoalView | null;
+  create(threadId: string, input: { objective: string; maxRounds?: number }): GoalView;
+  update(threadId: string, input: {
+    goalId: string;
+    revision: number;
+    action: "edit" | "pause" | "resume" | "complete" | "blocked";
+    objective?: string;
+    maxRounds?: number;
+    blockedReason?: string;
+  }): GoalView;
+}
+
+export interface McpResourcePort {
+  servers(): { name: string; connected: boolean; enabled: boolean; error?: string }[];
+  list(server?: string): Promise<McpResourceListing[]>;
+  read(uri: string, server?: string): Promise<McpResourceReadResult[]>;
+}
+
+/** 子代理 / 后台任务的一条摘要（ListAgents 的输出行） */
+export interface AgentSummary {
+  id: string;
+  label: string;
+  status: "running" | "done" | "error" | "canceled" | "unknown";
+  background: boolean;
+  /** 后台任务 id（TaskRegistry）；前台子代理没有 */
+  taskId?: string;
+  startedAt: number;
+  finishedAt?: number;
+  steps?: number;
+  endReason?: string;
+  /** live = 本进程还在跟踪（能中断/追加）；record = 只在库里 */
+  source: "live" | "record";
+  outputPreview?: string;
+}
+export interface AgentSendResult {
+  ok: boolean;
+  /**
+   * injected = 子代理还在跑，消息会在它的下一步被读进去（真注入）；
+   * resumed  = 它已经结束了，带着它之前的最终答复**新起一个**子代理继续做。
+   */
+  mode?: "injected" | "resumed";
+  error?: string;
+  note?: string;
+  ///* resumed 时是新子代理的结论 */
+  output?: string;
+  subagentId?: string;
+}
+export interface AgentInterruptResult {
+  ok: boolean;
+  error?: string;
+  note?: string;
+  status?: string;
+}
+
+/** 定时任务（CronCreate / CronList / CronDelete 用） */
+export interface CronJobInfo {
+  id: string;
+  name: string;
+  type: string;
+  schedule: string;
+  mode: string;
+  prompt: string;
+  enabled: boolean;
+  timezone?: string;
+  createdAt: number;
+  nextRunAt?: number | null;
+  lastRunAt?: number | null;
+  runCount: number;
+}
+export interface CronCreateResult { ok: boolean; job?: CronJobInfo; error?: string; warning?: string }
+export interface CronOps {
+  create(job: {
+    name?: string; type?: string; schedule: string; mode?: string;
+    prompt: string; timezone?: string; model?: string; deliverTo?: string;
+  }): CronCreateResult;
+  list(): CronJobInfo[];
+  remove(id: string): { ok: boolean; error?: string };
+  /** 当前生效的时区名（模型需要知道「本地时间」到底是哪个时区） */
+  timezone(): string;
+}
+
+/**
+ * 当前上下文统计（GetContextRemaining 用）。
+ * source=usage 时 used 来自 provider 上报的真实用量；source=estimate 时是本地估算。
+ */
+export interface ContextStats {
+  model: string;
+  contextWindow: number;
+  /** 压缩触发线（窗口 × 阈值%，与「窗口 − 输出预留」取较小者） */
+  compactAt: number;
+  used: number;
+  /** used / contextWindow × 100 */
+  percent: number;
+  /** used / compactAt × 100 */
+  compactPercent: number;
+  nearCompact: boolean;
+  wouldCompactNow: boolean;
+  source: "usage" | "estimate";
+  messages: number;
+  note?: string;
 }
 
 /** 屏幕检索的一条命中（结构来自 memory/screen-index.ts，这里只声明形状避免跨层 import） */

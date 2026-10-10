@@ -60,6 +60,18 @@ export function toolInfoLine(input: Record<string, unknown> | undefined): string
   //    界面上只剩「WebFetch」四个字母，看不出在抓哪个页面。实测踩过。
   push(input.url);
   push(input.command);
+  // ⚠️ Present（交付物）的参数是 { files: [{ path, description? }] } —— 上面一个都不匹配。
+  //    不读它的话历史回放里 tool_info 恒为空字符串，界面上的**交付卡片刷新后就重建不出来**
+  //    （实测踩过：实时流靠 tool_params 有卡片，一刷新全没了）。这里只放路径，description 会丢。
+  if (Array.isArray(input.files)) {
+    for (const f of input.files) {
+      if (typeof f === "string") push(f);
+      else if (f && typeof f === "object") push((f as { path?: unknown }).path);
+    }
+  }
+  // ExitPlanMode 的参数是 { plan } —— 历史回放只发 tool_info（没有 tool_params），
+  // 不读它的话刷新后计划卡片只剩一个空标题。info 会被截到 300 字符，所以回放里看到的是计划开头。
+  if (typeof input.plan === "string") push(input.plan);
   if (typeof input.old_path === "string" && typeof input.new_path === "string") {
     parts.push(`${input.old_path} -> ${input.new_path}`);
   }

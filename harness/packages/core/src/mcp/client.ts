@@ -73,6 +73,15 @@ export interface McpResourceContent {
   blob?: string;
 }
 
+/** resources/templates/list 的一项（uriTemplate 里带 {占位符}） */
+export interface McpResourceTemplate {
+  uriTemplate: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
+  [k: string]: unknown;
+}
+
 export interface McpReadResourceResult {
   contents?: McpResourceContent[];
   [k: string]: unknown;
@@ -206,6 +215,15 @@ export class McpClient {
   /** resources/list（可选能力；服务端没实现会抛 RpcError -32601） */
   async listResources(): Promise<McpResource[]> {
     return this.#paginate<McpResource>("resources/list", (r) => (Array.isArray(r.resources) ? (r.resources.filter(isObj) as unknown as McpResource[]) : []));
+  }
+
+  /**
+   * resources/templates/list（可选能力；服务端没实现会抛 RpcError -32601）。
+   * 与 resources/list 一样带 cursor 分页。
+   */
+  async listResourceTemplates(): Promise<McpResourceTemplate[]> {
+    return this.#paginate<McpResourceTemplate>("resources/templates/list", (r) =>
+      (Array.isArray(r.resourceTemplates) ? (r.resourceTemplates.filter(isObj) as unknown as McpResourceTemplate[]) : []));
   }
 
   /** resources/read */

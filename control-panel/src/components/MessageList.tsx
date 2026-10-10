@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { createContext, useContext, useMemo, useState, useRef, useEffect } from "react";
 import { 
   MessageCircle, 
   Bot, 
@@ -67,6 +67,23 @@ import remarkBreaks from "remark-breaks";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import TodoPanel from "./TodoPanel";
+import { PresentedFiles } from "@/components/presented-files";
+import { PlanCard } from "@/components/plan-card";
+import {
+  extractPresentedFiles,
+  matchPresentedPath,
+  type PresentedFile,
+} from "@/lib/presented-files";
+
+/**
+ * 交付物上下文：`Present` 声明过的文件路径 —— 正文里 inline-code 写的同一个路径
+ * 也能点开预览（见 MarkdownContent 的 code 渲染器）。
+ * 默认 null：这条消息没有交付物，一切渲染保持原样。
+ */
+const PresentedFileContext = createContext<{
+  files: PresentedFile[];
+  open?: (path: string) => void;
+} | null>(null);
 
 interface MessageListProps {
   messages: Message[];
@@ -81,6 +98,8 @@ interface MessageListProps {
   onScreenshotSubmit?: (messageId: string, sessionId: string, screenshot: string) => void;
   onScreenshotCancel?: (sessionId: string) => void;
   onRetry?: () => void;  // 重试
+  /** 打开项目内文件（交付物卡片 / 正文路径点击）——接到右侧预览面板 */
+  onOpenFile?: (path: string) => void;
 }
 
 // Restore Confirm 内联组件
@@ -950,6 +969,8 @@ function parseNextStepActions(content: string): { actions: string[]; cleanConten
 
 // Markdown 组件配置
 function MarkdownContent({ content }: { content: string }) {
+  // 交付物上下文：命中时 inline-code 渲染成可点开的预览入口
+  const presented = useContext(PresentedFileContext);
   return (
     <div className="text-sm leading-relaxed prose prose-sm max-w-none dark:prose-invert">
       <ReactMarkdown
@@ -958,7 +979,32 @@ function MarkdownContent({ content }: { content: string }) {
         // 代码块配置
         code({ node, inline, className, children, ...props }: any) {
           const match = /language-(\w+)/.exec(className || '');
-          return !inline && match ? (
+          const isBlock = !inline && !!match;
+          // 正文里写成 inline-code 的交付物路径 → 可点击，点开右侧预览面板。
+          // 只认「已在这条消息里被 Present 声明过」的路径，其余 inline-code 原样渲染。
+          if (!isBlock && presented?.open) {
+            // 用**原始** children 判多行：围栏代码块即使没写语言也会带换行，不能当成 inline
+            const rawText = String(children ?? "");
+            const text = rawText.trim();
+            const hit = text && !rawText.includes("\n") ? matchPresentedPath(text, presented.files) : null;
+            if (hit) {
+              return (
+                <button
+                  type="button"
+                  title={`预览 ${hit.path}`}
+                  onClick={() => presented.open?.(hit.path)}
+                  className={cn(
+                    "px-1.5 py-0.5 rounded bg-surface-inset text-text-primary text-[0.875em] font-mono",
+                    "cursor-pointer underline decoration-dotted underline-offset-2 transition-colors duration-fast hover:bg-surface-hover",
+                    className
+                  )}
+                >
+                  {children}
+                </button>
+              );
+            }
+          }
+          return isBlock ? (
             <SyntaxHighlighter
               style={vscDarkPlus}
               language={match[1]}
@@ -1106,6 +1152,7 @@ export default function MessageList({
   onScreenshotSubmit,
   onScreenshotCancel,
   onRetry,
+  onOpenFile,
 }: MessageListProps) {
   // 跟踪哪些折叠区域被展开了
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
@@ -1205,6 +1252,7 @@ export default function MessageList({
                   onScreenshotSubmit={onScreenshotSubmit}
                   onScreenshotCancel={onScreenshotCancel}
                   onRetry={onRetry}
+                  onOpenFile={onOpenFile}
                   isSkipped={true}
                   isLatestUserMessage={message.id === latestUserMessageId}
                 />
@@ -1229,6 +1277,7 @@ export default function MessageList({
             onScreenshotSubmit={onScreenshotSubmit}
             onScreenshotCancel={onScreenshotCancel}
             onRetry={onRetry}
+            onOpenFile={onOpenFile}
             isSkipped={false}
             isLatestUserMessage={message.id === latestUserMessageId}
           />
@@ -1253,6 +1302,7 @@ function MessageItem({
   onScreenshotSubmit,
   onScreenshotCancel,
   onRetry,
+  onOpenFile,
   isSkipped,
   isLatestUserMessage,
 }: {
@@ -1269,13 +1319,22 @@ function MessageItem({
   onScreenshotSubmit?: (messageId: string, sessionId: string, screenshot: string) => void;
   onScreenshotCancel?: (sessionId: string) => void;
   onRetry?: () => void;
+  /** 打开项目内文件预览（交付物卡片 / 正文路径） */
+  onOpenFile?: (path: string) => void;
   isSkipped: boolean;
   isLatestUserMessage?: boolean;
 }) {
   // 判断是否是最后一条消息且正在加载
   const isLastMessage = message.id === messages[messages.length - 1]?.id;
   const isGenerating = isLoading && isLastMessage && message.role === "assistant";
-  
+
+  // 本轮 Present 声明的交付物：卡片与正文 inline-code 点击共用同一份解析结果
+  const presentedFiles = useMemo(() => extractPresentedFiles(message.events), [message.events]);
+  const presentedContext = useMemo(
+    () => (presentedFiles.length > 0 ? { files: presentedFiles, open: onOpenFile } : null),
+    [presentedFiles, onOpenFile]
+  );
+
   // 用户消息
   if (message.role === "user") {
     return (
@@ -1314,6 +1373,8 @@ function MessageItem({
         <span>AI Agent</span>
       </div>
           
+      {/* 交付物上下文：正文 inline-code 命中已交付文件时渲染成可点开的入口 */}
+      <PresentedFileContext.Provider value={presentedContext}>
       <div className={cn("w-full max-w-[92%] py-0.5", message.error && "text-danger-fg")}>
         {/* AI 消息 */}
         {(() => {
@@ -1783,6 +1844,14 @@ function MessageItem({
                     )
                   )}
 
+                  {/* 交付物卡片：本轮 Present 声明过的文件（点一下 → 右侧预览面板）。
+                      放在工具活动块之后、正文之后 —— 解析不到文件时组件自己返回 null。 */}
+                  <PresentedFiles events={message.events} onOpenFile={onOpenFile} />
+
+                  {/* 计划卡片：本轮 ExitPlanMode 提交的计划（计划模式下模型只能交计划，
+                      批准后内核才开始动手）。和交付物卡片同一个位置、同一套样式。 */}
+                  <PlanCard events={message.events} />
+
                   {/* Ask User 内联交互 - 如果没有 events 但有 askUser，单独渲染 */}
                   {message.askUser && (!message.events || message.events.length === 0) && (
                     <AskUserInline
@@ -1884,7 +1953,8 @@ function MessageItem({
               );
             })()}
           </div>
-          
+      </PresentedFileContext.Provider>
+
       {/* 时间戳和费用 - 气泡外部，生成中不显示 */}
       {!(isGenerating) && (
         <div className="text-[10px] text-muted-foreground/60 px-1 flex items-center gap-2 justify-start">

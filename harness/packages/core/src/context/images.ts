@@ -6,11 +6,16 @@
 import { readFileSync, statSync } from "node:fs";
 import { extname } from "node:path";
 import type { ContentBlock } from "../providers/types.ts";
+import { IMAGE_MAX_BYTES, IMAGE_MAX_PER_MESSAGE } from "../constants.ts";
 
-/** 单张图上限：超过就不发（否则一次请求能把上下文撑爆） */
-export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+/**
+ * 单张图上限：超过就不发（否则一次请求能把上下文撑爆）。
+ * ⚠️ 值来自 constants.ts 的**单点定义** —— ReadImage 工具用的是同一个数，
+ *    在这里另写一个字面量就会出现「工具说读到了、装配时被静默跳过」。
+ */
+export const MAX_IMAGE_BYTES = IMAGE_MAX_BYTES;
 /** 一条消息最多带几张图 */
-export const MAX_IMAGES_PER_MESSAGE = 6;
+export const MAX_IMAGES_PER_MESSAGE = IMAGE_MAX_PER_MESSAGE;
 
 const MIME: Record<string, string> = {
   ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",

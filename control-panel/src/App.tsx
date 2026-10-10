@@ -1,7 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { readDraftPermission, type PermissionMode } from "@/lib/permission";
+import { readDraftPermission, readDraftPlanMode, writeDraftPlanMode, type PermissionMode } from "@/lib/permission";
+import { readDraftGoal, clearDraftGoal } from "@/lib/goal";
 import PreviewPanel from "@/components/PreviewPanel";
 import ChatPanel from "@/components/ChatPanel";
 import { useDevToolsBridge } from "@/hooks/useDevToolsBridge";
@@ -22,11 +23,15 @@ import {
   createTask,
   deleteProject,
   setPermissionMode,
+  setPlanMode,
+  postGoal,
   attachFolder,
   chooseFolder,
   checkHealth,
+  getProjectInfo,
   type Project,
 } from "@/lib/api";
+import { normalizeProjectPath } from "@/lib/presented-files";
 
 // 获取 API 主机地址（支持局域网访问）
 const getApiHost = () => typeof window !== "undefined" ? window.location.hostname : "localhost";
@@ -77,6 +82,32 @@ function ControlPanel() {
   const idleTimerRef = useRef<NodeJS.Timeout | null>(null);
   const IDLE_TIMEOUT = 10 * 60 * 1000; // 10 分钟
   
+  /**
+   * 打开项目内文件预览（消息流里的交付物卡片 / 正文里的文件路径）。
+   *
+   * 复用目录面板那条链：setActiveFile → 右侧 FilePeek → readProjectFile(port, path)。
+   * 那条链只认**项目内相对路径**（后端是 join(项目根, path)），所以这里做两件事：
+   *   · 字符串归一化（反斜杠转正斜杠、去掉 "./" 前缀）
+   *   · 万一是绝对路径，按项目根裁成相对路径；拿不到项目根就原样试，
+   *     FilePeek 会显示「文件不存在」，不会静默失败
+   */
+  const handleOpenProjectFile = useCallback(async (path: string) => {
+    const port = projectId;
+    if (!port) return;
+    setAsideCollapsed(false);   // 预览区收起了就先展开，否则点了什么都看不到
+    let target = normalizeProjectPath(path);
+    if (target.startsWith("/")) {
+      try {
+        const info = await getProjectInfo(port);
+        const root = String(info.react_app_path ?? "").replace(/\/+$/, "");
+        if (root && target.startsWith(root + "/")) target = target.slice(root.length + 1);
+      } catch {
+        /* 拿不到项目根：按原样试，让 FilePeek 报错 */
+      }
+    }
+    setActiveFile({ port, path: target });
+  }, [projectId]);
+
   // 处理运行时错误的回调
   const handleRuntimeError = useCallback((error: { message: string; source?: string; lineno?: number; stack?: string }) => {
     // 格式化错误信息
@@ -577,6 +608,23 @@ function ControlPanel() {
         try { await setPermissionMode(port, input.permission); }
         catch { /* 设不上也得继续，别把建项目本身搞挂 */ }
       }
+      // 新会话页选的「计划模式」草稿同样在这里落地：**必须赶在第一条消息之前**，
+      // 否则第一轮就不是硬只读了（内核每轮开始才读线程 metadata）。
+      if (port && readDraftPlanMode()) {
+        try {
+          await setPlanMode(port, true);
+          writeDraftPlanMode(false);   // 用完即清，别让下一个新任务莫名其妙又是计划模式
+        } catch { /* 设不上不影响建项目 */ }
+      }
+      // 新会话页写的「长期目标」草稿也在这里落地 —— 目标在内核里是线程级的，
+      // 所以只能等任务建好再写；同样要赶在第一条消息之前，第一轮就知道自己有目标。
+      const draftGoal = readDraftGoal();
+      if (port && draftGoal) {
+        try {
+          await postGoal(port, { action: "create", objective: draftGoal });
+          clearDraftGoal();
+        } catch { /* 目标没设上不能挡住建任务 */ }
+      }
       await loadProjects(true);
       if (port) {
         await handleProjectSelect(port);
@@ -727,6 +775,7 @@ function ControlPanel() {
             onBuildStart={handleBuildStart}
             enableHotReload={enableHotReload}
             onFileModifying={setIsFileModifying}
+            onOpenFile={(path) => void handleOpenProjectFile(path)}
             onProjectCreated={() => void loadProjects(true)}
             onQuickCreateTask={(text) => void handleQuickCreateTask(text)}
             projects={projects}

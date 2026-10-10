@@ -25,6 +25,12 @@ export interface SubagentOptions {
   execDeps: Omit<ExecDeps, "tools">;
   systemPrompt?: string;
   signal?: AbortSignal;
+  /**
+   * 取出「主代理中途追加的消息」（SendMessage 注入）。
+   * 每个 step 开头取一次：取到的内容以 user 消息追加进对话，子代理下一步就能看到。
+   * 注意：如果它正好在收尾那一步之后，可能来不及读 —— 调用方要在返回值里如实说明。
+   */
+  drainSteering?: () => string[];
   onText?: (delta: string) => void;
   /** 工具调用。**带参数** —— 只给名字的话界面上只能看到「subagent 调用了 Bash」，
    *  看不到它到底在跑什么命令（用户明确要求要看这个）。 */
@@ -74,6 +80,14 @@ export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult
   for (let step = 1; step <= SUBAGENT_MAX_STEPS; step++) {
     steps = step;
     if (opts.signal?.aborted) { endReason = "aborted"; break; }
+
+    // 主代理中途追加的消息（SendMessage）：下一步就能读到。
+    // 放在 step 开头而不是工具执行之后 —— 无论它当时在跑工具还是在思考，下一轮都能拿到。
+    if (opts.drainSteering) {
+      for (const extra of opts.drainSteering()) {
+        if (extra && extra.trim()) messages.push({ role: "user", content: extra });
+      }
+    }
 
     // 最后一步：禁止再调工具，强制写最终答复
     const lastStep = step >= SUBAGENT_MAX_STEPS;

@@ -1,6 +1,7 @@
 import * as React from "react";
-import { useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUp, Loader2, Square, Shield, ShieldOff, Eye, ChevronDown, Check } from "lucide-react";
+import { SlashMenu, filterSlashCommands, slashQuery, type SlashCommand } from "@/components/slash-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { PERM_COPY, usePermissionPresets, presetOf, type PermissionMode, type PermissionPreset } from "@/lib/permission";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -43,6 +44,10 @@ export interface ComposerBoxProps {
   /** 允许输入但禁止发送（比如没选项目） */
   sendDisabled?: boolean;
   sendTitle?: string;
+  /** 斜杠命令表；不传则输入框没有 / 菜单 */
+  commands?: SlashCommand[];
+  /** 选中某条斜杠命令（输入框内容已按 command.insert 替换过） */
+  onSlashCommand?: (cmd: SlashCommand) => void;
 }
 
 export function ComposerBox({
@@ -52,10 +57,71 @@ export function ComposerBox({
   topLeft, leftActions,
   autoFocus, disabled, sending, onStop,
   className, textareaClassName, sendDisabled, sendTitle = "发送",
+  commands, onSlashCommand,
 }: ComposerBoxProps) {
   const canSend = !sendDisabled && !disabled && value.trim().length > 0;
 
+  // ── 输入框高度：默认**一行**，内容换行时往上长（对齐 DSH / codex）──────
+  // textarea 自己不会长高，只会内部滚动；这里每轮先把 height 归零再按
+  // scrollHeight 设回去（归零是为了让删字时也能缩回来），到 MAX 就交给内部滚动。
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  useLayoutEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    const MAX = 220;                  // 和 className 里的 max-h-[220px] 对齐
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, MAX) + "px";
+  }, [value]);
+
+  // ── 斜杠命令 ────────────────────────────────────────────
+  // 只在「第一行、/ 开头、还没打空格」时进入命令模式（见 slashQuery）。
+  const sq = useMemo(() => slashQuery(value), [value]);
+  const matches = useMemo(
+    () => (sq.open && commands ? filterSlashCommands(commands, sq.query) : []),
+    [sq.open, sq.query, commands],
+  );
+  const menuOpen = sq.open && matches.length > 0 && !disabled;
+  const [activeIndex, setActiveIndex] = useState(0);
+  // 查询词变了就把高亮拉回第一条（否则会出现"高亮停在越界位置"）
+  useEffect(() => { setActiveIndex(0); }, [sq.query, menuOpen]);
+
+  const pick = (cmd: SlashCommand) => {
+    onChange(cmd.insert ?? "");
+    onSlashCommand?.(cmd);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (menuOpen) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setActiveIndex((i) => (i + 1) % matches.length); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); setActiveIndex((i) => (i - 1 + matches.length) % matches.length); return; }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        const cmd = matches[activeIndex];
+        if (cmd) { if (e.key === "Enter" && !cmd.insert) pick(cmd); else pick(cmd); }
+        return;
+      }
+      if (e.key === "Escape") { e.preventDefault(); onChange(""); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (canSend) onSubmit();
+    }
+  };
+
   return (
+    <div className="relative">
+      {/* 斜杠菜单浮在输入框**上方**（不把输入框挤下去）—— 对齐 DSH 的 MenuView：
+          absolute + bottom:100% + 高 z-index。⚠️ 外层任何祖先都不能有 overflow-hidden，
+          否则菜单会被裁成半行（新会话页那张卡片就栽过这个，已在那边去掉）。 */}
+      {menuOpen && (
+        <SlashMenu
+          commands={matches}
+          activeIndex={Math.min(activeIndex, matches.length - 1)}
+          onHover={setActiveIndex}
+          onPick={pick}
+          className="z-[100] w-full max-w-none"
+        />
+      )}
     <div
       className={cn(
         "flex flex-col overflow-hidden rounded-2xl border border-border-default bg-surface-raised shadow-xs",
@@ -67,19 +133,18 @@ export function ComposerBox({
       {topLeft && <div className="flex items-center gap-1.5 px-2.5 pt-2">{topLeft}</div>}
 
       <Textarea
+        ref={taRef}
+        rows={1}
         autoFocus={autoFocus}
         value={value}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            if (canSend) onSubmit();
-          }
-        }}
+        onKeyDown={handleKeyDown}
         placeholder={placeholder}
         className={cn(
-          "max-h-[220px] min-h-[72px] resize-none rounded-none border-0 bg-transparent text-sm shadow-none",
+          // rows=1 → 空的时候就是一行（py-2 + 一行文字 ≈ 36px）；
+          // 超过 max-h 之后不再长高，改为内部滚动（见上面的 useLayoutEffect）
+          "min-h-9 max-h-[220px] resize-none rounded-none border-0 bg-transparent text-sm shadow-none",
           "focus-visible:border-transparent focus-visible:ring-0",
           textareaClassName,
         )}
@@ -93,6 +158,7 @@ export function ComposerBox({
 
         <SendButton sending={sending} onSend={onSubmit} onStop={onStop} disabled={!canSend} title={sendTitle} />
       </div>
+    </div>
     </div>
   );
 }
@@ -196,8 +262,9 @@ export function PermissionSelect({
             title={copy.title}
             className={cn(
               "flex h-7 items-center gap-1 rounded-full px-2 text-2xs transition-colors disabled:opacity-40",
+              // 颜色只用中性色（不要黄色）：危险档靠图标（ShieldOff）区分，不靠颜色喊
               dangerous
-                ? "bg-warning/15 text-warning hover:bg-warning/25"
+                ? "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
                 : "text-muted-foreground hover:bg-muted hover:text-foreground",
             )}
           >

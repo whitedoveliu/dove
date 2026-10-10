@@ -14,11 +14,13 @@ import { Watchdog } from "../loop/watchdog.ts";
 import { SteeringQueue } from "../loop/steering.ts";
 import { buildExecDeps } from "./wire.ts";
 import { applyThreadPolicy, renderPolicyNotice } from "./tool-policy.ts";
+import { PLAN_MODE_NOTICE, planAwareMode } from "./plan-mode.ts";
 import { normalizePermissionMode } from "../tools/approval.ts";
 import { runDispatch } from "./dispatch.ts";
 import { SubagentTranscript, makeSubagentThreadId } from "../agents/subagent-store.ts";
 import { currentActiveNames } from "../tools/registry.ts";
 import { hydrateImages } from "../context/images.ts";
+import { attachRunServices } from "./run-services.ts";
 import { RedactStream } from "../security/redact-stream.ts";
 import { toWireHistory } from "./wire-history.ts";
 import type { EventSink, AgentEvent } from "./events.ts";
@@ -69,6 +71,21 @@ export interface AgentServices {
    * → wire 的 WireInput → wire 的 services）。**漏任一处都是静默失败**。
    */
   webSearchKey?: string;
+  /**
+   * MCP 资源能力（ListMcpResources / ReadMcpResource）。
+   * bootstrap 用真实的 McpManager 实现（server/mcp-wiring.ts 的 makeMcpResourcePort）。
+   */
+  mcp?: import("../tools/types.ts").McpResourcePort;
+  /**
+   * 定时任务端口（CronCreate / CronList / CronDelete）。
+   * ⚠️ bootstrap 里 cron 是在 runtime **之后**创建的（它自己要用 runtime.run），
+   *    所以那一处是事后补的：runtime.services.cron = makeCronOps(cron)。
+   *    buildExecDeps 每轮才读这个字段，来得及。
+   */
+  cron?: import("../tools/types.ts").CronOps;
+  goals?: import("../tools/types.ts").GoalPort;   // 长期目标：工具与面板 /goal 共用一张表
+  // 计划批准后放行；实现只能放 server 层（核心层不能 import server），这里只声明形状
+  exitPlanMode?: (threadId: string, plan: string) => Promise<{ ok: boolean; error?: string }>;
 }
 export interface RunOptions {
   threadId: string; userText: string; projectId?: string | null; model?: string;
@@ -169,15 +186,14 @@ export class AgentRuntime {
     let lastUsage: { inputTokens: number; outputTokens: number; cacheReadTokens: number } | undefined;
 
     // ⚠️ 必须在 buildExecDeps **之前**声明 —— const 有 TDZ，声明写后面会直接抛。
-    const permissionMode = normalizePermissionMode(
-      thread.metadata?.readOnly === true ? "read-only" : thread.metadata?.permissionMode,
-    );
+    const { planMode, permissionMode } = planAwareMode(thread.metadata);   // 计划模式 = 硬只读
 
     const execDeps = buildExecDeps({
       runtime: { services: {
         pending, memory: this.#s.memory, projectOps: this.#s.projectOps,
         spawnSubagent: this.#s.spawnSubagent, activity: this.#s.activity,
         webSearchKey: this.#s.webSearchKey,
+        mcp: this.#s.mcp, cron: this.#s.cron,   // P0：这是「四处接线」的第三处，漏了工具只会说「未接入」（wiring.test.ts 盯着）
       } },
       sink: opts.sink as (e: { type: string; [k: string]: unknown }) => void,
       threadId: opts.threadId, projectId, workdir, outputsDir: workdir + "/outputs", signal,
@@ -205,59 +221,23 @@ export class AgentRuntime {
       eventLog.append("policy", { threadKind: thread.kind, reason: policy.reason, blocked: policy.blocked }, { run: runId });
       opts.sink({ type: "policy", reason: policy.reason, blocked: policy.blocked });
     }
-    const effectiveTail = [assembled.tailContext, policyNotice, taskInjection].filter(Boolean).join("\n");
+    const effectiveTail = [assembled.tailContext, planMode ? PLAN_MODE_NOTICE : "", policyNotice, taskInjection].filter(Boolean).join("\n");
 
-    // 子代理接进工具服务
+    // ── 子代理控制面 / 图片挂载 / 上下文统计（P0）──────────────────
+    // ⚠️ services 就是 execDeps.ctxBase.services 的**同一个对象引用**（wire.ts 造完之后不再复制），
+    //    往它上面补字段工具才读得到 —— 「建好没接」栽过三次，接线清单见 run-services.ts 顶部。
     const services = (execDeps.ctxBase.services ?? {}) as import("../tools/types.ts").ToolServices;
-    const tasks = this.#s.tasks;
-
-    const runOneSubagent = async (
-      prompt: string, label: string, bg: { background: boolean; taskId?: string },
-    ): Promise<{ output: string; steps: number; endReason: string; threadId: string }> => {
-      const { runSubagent } = await import("../agents/subagent.ts");
-      const threadId = makeSubagentThreadId(label, bg.taskId);   // 建线程 + 过程记录（A1）
-      const transcript = new SubagentTranscript({
-        store, parentThreadId: opts.threadId, projectId: opts.projectId ?? thread.projectId,
-        label, background: bg.background, taskId: bg.taskId, threadId,
-      });
-      // ⚠️ 带 subagentId（A2）—— 只有 label 时同名并发子代理会串（实测过）。
-      const r = await runSubagent({
-        provider: this.#s.provider, model, prompt, label,
-        tools: policy.tools,
-        execDeps: { ...execDeps, ctxBase: { ...execDeps.ctxBase, services: { ...services, spawnSubagent: undefined, dispatchToProject: undefined } } },
-        signal,
-        onText: (d) => { transcript.text(d); opts.sink({ type: "subagent_text", content: d, label, subagentId: threadId }); },
-        onReasoning: (d) => { transcript.reasoning(d); opts.sink({ type: "subagent_reasoning", content: d, label, subagentId: threadId }); },
-        onToolUse: (name, args) => { transcript.tool(name, args); opts.sink({ type: "subagent_tool", tool: name, args, label, subagentId: threadId }); },
-      });
-      transcript.finish(r.endReason === "error" ? "error" : "done", r.endReason);
-      return { ...r, threadId };
-    };
-
-    services.spawnSubagent = async ({ prompt, label, background }) => {
-      const name = label ?? "子任务";
-      if (!background || !tasks) {
-        const r = await runOneSubagent(prompt, name, { background: false });
-        opts.sink({ type: "subagent_done", label: name, subagentId: r.threadId, steps: r.steps, endReason: r.endReason });
-        return { status: "done" as const, output: r.output };
-      }
-      // 后台：立刻返回 taskId，跑完写进 TaskRegistry（回合边界自动注回）
-      const rec = tasks.create({ threadId: opts.threadId, prompt, kind: name });
-      opts.sink({ type: "task_start", taskId: rec.id, label: name });
-      void runOneSubagent(prompt, name, { background: true, taskId: rec.id }).then((r) => {
-        tasks.finish(rec.id, r.output);
-        opts.sink({ type: "task_done", taskId: rec.id, label: name, subagentId: r.threadId, steps: r.steps });
-      }).catch((e) => {
-        tasks.finish(rec.id, "子代理执行失败：" + (e instanceof Error ? e.message : String(e)), "error");
-      });
-      return { status: "running" as const, taskId: rec.id };
-    };
-
-    services.getTask = (taskId: string) => {
-      const t = tasks?.get(taskId);
-      if (!t) return undefined;
-      return { taskId: t.id, label: t.kind, status: t.status, result: t.result };
-    };
+    /** 最近一次装配给 provider 的 live 消息（GetContextRemaining 估算输入） */ let liveMessages: ChatMessage[] = [];
+    const { images } = attachRunServices({
+      services, store, tasks: this.#s.tasks, provider: this.#s.provider, model,
+      tools: policy.tools, execDeps,
+      parentThreadId: opts.threadId, projectId: opts.projectId ?? thread.projectId,
+      signal, sink: opts.sink as (e: { type: string; [k: string]: unknown }) => void,
+      systemPrompt: assembled.systemPrompt,
+      liveMessages: () => liveMessages,
+      usage: () => lastUsage,
+      planMode, goals: this.#s.goals, exitPlanMode: this.#s.exitPlanMode ? (plan) => this.#s.exitPlanMode!(opts.threadId, plan) : undefined,
+    });
 
     // Home → 项目线程的调度（D8）：在项目线程里完整跑一轮，只把结论带回 Home
     services.dispatchToProject = (projectId, instruction) =>
@@ -280,18 +260,34 @@ export class AgentRuntime {
           stepNo = st.step; wd.touch();
           opts.sink({ type: "step_start", step: st.step });
           eventLog.append("step_start", { step: st.step }, { run: runId, turn: 1, step: st.step });
+          let msgs = st.messages;
+          let changed = false;
+
+          // ReadImage 挂上的图片：在**下一步**注入（user 消息 + image block）。
+          // 为什么不塞进 role:"tool" 的结果里：OpenAI 兼容协议要求它是字符串，
+          // 图片只能走既有的 image part 通道（见 agent/image-attach.ts 的说明）。
+          const pendingImages = images.takePending();
+          if (pendingImages.length > 0) {
+            msgs = [...msgs, ...pendingImages];
+            changed = true;
+            eventLog.append("image_injected", { count: pendingImages.length }, { run: runId, step: st.step });
+            opts.sink({ type: "image_injected", count: pendingImages.length });
+          }
+          liveMessages = msgs;
+
           // AutoCompact：在 step 之间检查
-          if (this.#s.compact && st.step > 1 && st.messages.length > 20) {
+          if (this.#s.compact && st.step > 1 && msgs.length > 20) {
             try {
-              const next = await this.#s.compact(st.messages, st.step, lastUsage);
-              if (next && next.length < st.messages.length) {
+              const next = await this.#s.compact(msgs, st.step, lastUsage);
+              if (next && next.length < msgs.length) {
                 compacted = true;
-                eventLog.append("compaction", { from: st.messages.length, to: next.length }, { run: runId, step: st.step });
-                opts.sink({ type: "compaction", from: st.messages.length, to: next.length });
+                eventLog.append("compaction", { from: msgs.length, to: next.length }, { run: runId, step: st.step });
+                opts.sink({ type: "compaction", from: msgs.length, to: next.length });
                 return { messages: next, compacted: true };
               }
             } catch { /* 压缩失败不影响主流程 */ }
           }
+          if (changed) return { messages: msgs, compacted: false };
         },
         hooks: {
           onUsage: (u) => { lastUsage = u; },
@@ -359,6 +355,10 @@ export class AgentRuntime {
       createdAt: Date.now(), usage: result.usage,
     };
     store.addMessage(assistantMsg);
+    // 图片在**回合末**落库：这样历史顺序是
+    //   [assistant(tool_calls ReadImage)] [tool(结果)] [user(图)]
+    // 而不是图片跑到「要求读图」之前（见 agent/image-attach.ts 顶部说明）。
+    if (images.pendingCount > 0 || images.attachedCount > 0) images.flush();
 
     eventLog.append("turn_end", {
       endReason: result.endReason, steps: result.steps, gates: result.gates,

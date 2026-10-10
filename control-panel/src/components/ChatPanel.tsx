@@ -1,18 +1,23 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Loader2, StopCircle, Settings2, Check, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Trash2, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye } from "lucide-react";
+import { Send, Loader2, StopCircle, Settings2, Check, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Trash2, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye, ClipboardList, XCircle, Target } from "lucide-react";
 import { Hint } from "@/components/ui/tooltip";
 import { IconButton } from "@/components/ui/icon-button";
 import { loadSavedStyle } from "./AIStyleSelector";
 import MessageList from "./MessageList";
 import { SubagentBar, reduceSubagents, type SubagentInfo } from "./subagent-bar";
 import { SubagentView } from "./subagent-view";
-import { ComposerBox, PermissionSelect, SendButton } from "./composer-box";
-import { usePermissionMode } from "@/lib/permission";
-import { Message, sendChatMessage, submitUserInput, stopGeneration, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, clearDoveCloud, listSubagents, type Project } from "@/lib/api";
+import { ComposerBox, PermissionSelect } from "./composer-box";
+import { GoalBar } from "./goal-bar";
+import { usePermissionMode, usePlanMode, readDraftPlanMode, writeDraftPlanMode } from "@/lib/permission";
+import { useGoal, readDraftGoal, writeDraftGoal, clearDraftGoal } from "@/lib/goal";
+import { goalPhaseLabel, goalSummary, parseGoalCommand, truncateGoal } from "@/lib/goal-command";
+import { useToast, type ToastOptions } from "@/components/ui/toast";
+import type { SlashCommand } from "@/components/slash-menu";
+import { isExitPlanModeTool } from "@/lib/plan-mode";
+import { Message, sendChatMessage, submitUserInput, stopGeneration, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, clearDoveCloud, listSubagents, type Project, type Goal, type GoalAction, type GoalPostBody } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
@@ -280,6 +285,8 @@ interface ChatPanelProps {
   onBuildStart?: () => void;  // 开始构建回调（用于静态模式显示 loading）
   enableHotReload?: boolean;  // 热更新开关状态（传给后端）
   onFileModifying?: (isModifying: boolean) => void;  // 文件修改工具调用回调（用于提前展示预览面板）
+  /** 打开项目内文件（消息流里的交付物卡片）—— 由 App 接到右侧预览面板 */
+  onOpenFile?: (path: string) => void;
   onProjectCreated?: () => void;  // 新建项目后的回调（用于刷新目录树）
   asideCollapsed?: boolean;        // 预览区是否已收起
   onToggleAside?: () => void;      // 收起/展开预览区
@@ -292,7 +299,7 @@ interface ChatPanelProps {
   onPendingMessageConsumed?: () => void;
 }
 
-export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
+export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onOpenFile, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   // 子代理状态（顶部状态栏）。内核的 subagent_text 不带 label，
   // 流式文本按「最近一个 running 的」归并 —— 见 reduceSubagents。
@@ -304,6 +311,20 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   //   projectId 为空 → 新会话页，存成「下一个项目的默认值」
   // 以前这两条路各写一份，导致新会话页选了完全访问、进会话又变回工作区。
   const [permission, changePermission] = usePermissionMode(projectId);
+  /**
+   * 计划模式（B5）—— 线程级的第二根权限轴：不改权限档，只让内核把写类工具
+   * 从工具表里裁掉（硬只读）。模型交计划走 ExitPlanMode + 既有审批通道，
+   * 用户批准后**内核自己**把这一位关掉 —— 所以除 change 外还要 refresh。
+   */
+  const [planMode, changePlanMode, refreshPlanMode] = usePlanMode(projectId);
+  /**
+   * 长期目标 —— **线程级**（每线程至多一个）。目标 active 时内核会在每轮结束后
+   * 自动再开一轮，所以面板只给两个入口：输入框上方的状态条、输入框里的 /goal 命令。
+   * 两者共用同一个 apply（见 runGoalCommand / runGoalBarAction）。
+   */
+  const { goal, pending: goalPending, apply: applyGoal, refresh: refreshGoal } = useGoal(projectId);
+  /** 轻量提示（进入/退出计划模式给个明确反馈） */
+  const { toast } = useToast();
   const [input, setInput] = useState("");
   const [isLoadingState, setIsLoadingState] = useState(false);
   /**
@@ -341,12 +362,41 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const messagesRef = useRef<Message[]>([]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
   const [startDraft, setStartDraft] = useState("");
+  // 新会话页的「计划模式」草稿：此时还没有线程，只能先存着，建项目时由 App 落地
+  const [draftPlan, setDraftPlan] = useState(() => readDraftPlanMode());
+  // 新会话页写的目标草稿（还没有线程可挂，建任务时由 App 落地）
+  const [draftGoal, setDraftGoal] = useState<string | null>(() => readDraftGoal());
   const [folderMode, setFolderMode] = useState(false);
   const [folderPath, setFolderPath] = useState("");
 
   const submitStartDraft = () => {
     const text = startDraft.trim();
     if (!text) return;
+
+    // /goal 在新会话页**也能用**：这时还没有线程，所以先记成草稿，
+    // 建好任务后由 App 自动落地（不再是"目标要绑定到任务"那种拒绝）。
+    const cmd = parseGoalCommand(text);
+    if (cmd) {
+      setStartDraft("");
+      if (cmd.kind === "create") {
+        writeDraftGoal(cmd.objective);
+        setDraftGoal(cmd.objective);
+        toast({ title: "已记下长期目标", description: "建好任务后自动生效，每轮结束会接着推进", tone: "info" });
+      } else if (cmd.kind === "status") {
+        toast(draftGoal
+          ? { title: "待生效的目标", description: draftGoal, tone: "info" }
+          : { title: "还没有目标", description: "输入 /goal <目标描述>；建好任务后自动生效", tone: "info" });
+      } else if (cmd.kind === "blocked") {
+        toast({ title: "先有任务才能标阻塞", description: "建好任务后再 /goal blocked <原因>", tone: "warning" });
+      } else if (cmd.action === "clear") {
+        clearDraftGoal(); setDraftGoal(null);
+        toast({ title: "已清掉待生效的目标", tone: "default" });
+      } else {
+        toast({ title: "还没有任务", description: "暂停 / 继续 / 完成要落在具体任务上：先建任务，再在它的输入框里操作", tone: "info" });
+      }
+      return;
+    }
+
     setStartDraft("");
     onQuickCreateTask?.(text);
   };
@@ -701,8 +751,107 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     }
   };
 
+  // ── 长期目标：人类入口 ──────────────────────────────────────────
+  // 目标是内核的状态机，面板只负责把用户的操作翻译成 POST /goal。
+  // 命令（/goal xxx）和状态条按钮**走同一个 runGoalAction** —— 区别只在"打字"还是"点按"。
+
+  /** 操作成功后的文案。轮次只在这里出现：状态条刻意不显示进度（见 goal-bar.tsx） */
+  const toastGoalDone = (action: GoalAction, g: Goal | null): ToastOptions => {
+    switch (action) {
+      case "create":
+        return {
+          title: "已设定长期目标",
+          description: `每轮结束后自动接着推进（最多 ${g?.max_rounds ?? "?"} 轮），随时 /goal pause 暂停`,
+          tone: "success",
+        };
+      case "pause":
+        return { title: "已暂停自动推进", description: "目标还在、进度也在；/goal resume 继续", tone: "default" };
+      case "resume":
+        return { title: "已继续自动推进", description: "内核会在每轮结束后自动再开一轮", tone: "success" };
+      case "complete":
+        return { title: "目标已完成", description: "自动推进已停；要清掉记录就 /goal clear", tone: "success" };
+      case "blocked":
+        return { title: "已标记为阻塞", description: "卡点写清楚了，接手时能直接看懂", tone: "warning" };
+      default:
+        return { title: "已清除目标", description: "可以重新设一个新目标了", tone: "default" };
+    }
+  };
+
+  /**
+   * 执行一次目标操作 + 反馈。**不抛错**：失败按内核的 code 给一句能照做的提示 ——
+   * 409 GOAL_ALREADY_EXISTS = 已有未完成目标（先 clear）；404 = 还没有目标；400 = 状态不允许。
+   */
+  const runGoalAction = async (body: GoalPostBody): Promise<void> => {
+    const res = await applyGoal(body);
+    if (!res.ok) {
+      const already = res.code === "GOAL_ALREADY_EXISTS";
+      toast({
+        title: already ? "已有未完成的目标" : "目标操作没成功",
+        description: already ? "先 /goal clear 清掉它，或 /goal complete 收尾，再设新的" : res.message,
+        tone: "warning",
+      });
+      return;
+    }
+    toast(toastGoalDone(body.action, res.goal));
+  };
+
+  /**
+   * 输入框里的 /goal —— **面板自己处理，不发给模型**。
+   * 返回 true 表示这条输入已经被吃掉（调用方直接 return，不要走发送流程）。
+   */
+  const runGoalCommand = async (raw: string): Promise<boolean> => {
+    const cmd = parseGoalCommand(raw);
+    if (!cmd) return false;
+    setInput("");                       // 命令不进消息流，输入框立刻清空
+
+    // 裸 /goal：拉一次现状，把 phase / objective / 轮次说清楚
+    if (cmd.kind === "status") {
+      const res = await refreshGoal();
+      if (!res.ok) {
+        toast({ title: "读不到目标状态", description: res.message, tone: "warning" });
+        return true;
+      }
+      const g = res.goal;
+      toast(g
+        ? {
+            title: `目标 · ${goalPhaseLabel(g.phase)}`,
+            description: `${truncateGoal(g.objective, 80)} · ${goalSummary(g)}`,
+            tone: "info",
+          }
+        : {
+            title: "还没有长期目标",
+            description: "输入 /goal <目标描述> 设一个：内核会跨多轮自动推进",
+            tone: "default",
+          });
+      return true;
+    }
+
+    if (cmd.kind === "create") {
+      await runGoalAction({ action: "create", objective: cmd.objective });
+      return true;
+    }
+    if (cmd.kind === "blocked") {
+      // 内核也会 400，这里先挡一道 —— 提示能直接告诉用户该怎么写
+      if (!cmd.reason) {
+        toast({ title: "标阻塞要写原因", description: "用法：/goal blocked <是什么具体条件卡住了>", tone: "warning" });
+        return true;
+      }
+      await runGoalAction({ action: "blocked", blocked_reason: cmd.reason });
+      return true;
+    }
+    await runGoalAction({ action: cmd.action });
+    return true;
+  };
+
+  /** 状态条上的按钮 —— 和 /goal 命令走同一条路，只是不用打字 */
+  const runGoalBarAction = (action: GoalAction) => { void runGoalAction({ action }); };
+
   const handleSend = async (messageText?: string, isNewProject: boolean = false) => {
     const textToSend = messageText || input;
+    // /goal … 是**面板命令**，不发模型。刻意放在 isLoading 检查之前：一轮正在跑的时候
+    // 也要能 /goal pause / complete。只拦"手动发送"这条路 —— messageText 是程序自动发的
+    // （重试 / 继续 / 建完任务后的第一条），里面以 /goal 开头也只是普通正文。
+    if (messageText === undefined && (await runGoalCommand(textToSend))) return;
     if (!textToSend.trim() || isLoading) return;
 
     // ⚠️ 这个会话在这次 send 里是哪个 —— 流回调靠它判断「事件还该不该写进当前视图」。
@@ -1090,6 +1239,12 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 return msg;
               })
             );
+
+            // ExitPlanMode 的批准发生在工具内部：用户点「允许」后内核随即把 planMode
+            // 置回 false。面板不知道那一刻，只能等工具结果回来重读 —— chip 才会消失。
+            if (isExitPlanModeTool(event.tool)) {
+              void refreshPlanMode();
+            }
           } else if (event.type === "todo_update") {
             // 更新当前消息的 todo 列表
             const newTodos = event.todos || [];
@@ -1209,6 +1364,14 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             
             // 刷新语音缓冲区，朗读剩余的文本
             speechSynthesis.flushBuffer();
+            
+            // 一轮结束顺手对齐一次计划模式：批准 / 拒绝 / 用户手点都可能在这一轮里发生，
+            // 面板本地状态和线程 metadata 不该有分歧
+            void refreshPlanMode();
+
+            // 目标也一样：模型有 UpdateGoal 工具，它可能在这一轮里自己把目标标完成 / 标阻塞，
+            // 状态条不重读就会一直挂着"进行中"（轮次也是每轮变的）
+            void refreshGoal();
             
             // 注意：现在预览刷新由 preview_ready 事件触发，这里不再需要刷新
             
@@ -1403,13 +1566,6 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   /** 发新消息前：保留还在跑的子代理，清掉上一轮的已完成项 */
   const pruneSubagents = () => {
     setSubagents((prev) => (prev.length === 0 ? prev : prev.filter((a) => a.status === "running")));
-  };
-
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
   };
 
   const handleActionClick = (action: string) => {
@@ -1692,23 +1848,124 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   // 判断是否需要居中内容（有消息但无版本，内容不要撑太开）
   const shouldCenterContent = latestVersion === 0 && messages.length > 0;
 
+  // ── 斜杠命令：/plan 开关 + /goal ────────────────────────
+  // 斜杠菜单只认「第一行、以 / 开头、还没打空格」的查询词（见 slash-menu.tsx 的 slashQuery），
+  // 所以带参数的写法**匹配不到**：
+  //   · /plan  → **一条命令做开关**：不在计划模式时叫「计划模式」，在的时候叫「退出计划模式」
+  //   · /goal  → 没目标时"接着写"（insert "/goal "，用户补描述）；已有目标时只报现状。
+  //             带参数的那半边（/goal pause、/goal clear…）走发送路径的 runGoalCommand ——
+  //             菜单和提交本来就是两段，别指望菜单能匹配到空格后面的内容。
+  const slashCommands = useMemo<SlashCommand[]>(() => [
+    planMode
+      ? {
+          name: "plan",
+          title: "退出计划模式",
+          description: "关掉硬只读，写类工具恢复可用",
+          hint: "Enter 执行",
+          keywords: ["plan", "jihua", "exit"],
+        }
+      : {
+          name: "plan",
+          title: "计划模式",
+          description: "先调研、出计划、等你批准再动手",
+          hint: "Enter 执行",
+          keywords: ["plan", "jihua"],
+        },
+    goal
+      ? {
+          name: "goal",
+          title: `目标：${truncateGoal(goal.objective, 24)}`,
+          description: goal.phase === "active"
+            ? "再次输入 /goal <新目标> 不会覆盖，先 /goal clear"
+            : `${goalPhaseLabel(goal.phase)} · /goal resume 继续，/goal clear 清除`,
+          hint: "查看",
+          keywords: ["goal", "mubiao", "目标"],
+        }
+      : {
+          name: "goal",
+          title: "设定长期目标",
+          description: "跨多轮自动推进；做完/卡住由它来管",
+          hint: "继续输入",
+          insert: "/goal ",
+          keywords: ["goal", "mubiao", "目标"],
+        },
+  ], [planMode, goal]);
+
+  // ── 新会话页的斜杠命令 ──────────────────────────────────
+  // 那里还没有线程：/plan 只能存**草稿**（建项目时由 App 落地），
+  // /goal 必须先有任务 —— 直接说清楚，不假装能设。
+  const toggleDraftPlan = () => {
+    const next = !draftPlan;
+    setDraftPlan(next);
+    writeDraftPlanMode(next);
+    toast(next
+      ? { title: "新任务将以计划模式开始", description: "先调研、出计划，等你批准再动手", tone: "info" }
+      : { title: "已取消计划模式", description: "新任务直接动手", tone: "default" });
+  };
+
+  const startCommands = useMemo<SlashCommand[]>(() => [
+    draftPlan
+      ? { name: "plan", title: "取消计划模式（新任务）", description: "新任务将直接动手，不再先出计划", hint: "Enter 执行", keywords: ["plan", "jihua"] }
+      : { name: "plan", title: "计划模式（新任务）", description: "新任务先调研、出计划、等你批准再动手", hint: "Enter 执行", keywords: ["plan", "jihua"] },
+    { name: "goal", title: "设定长期目标", description: "跨多轮自动推进；建好任务后自动生效", hint: "继续输入", insert: "/goal ", keywords: ["goal", "mubiao", "目标"] },
+  ], [draftPlan]);
+
+  const handleStartSlashCommand = (cmd: SlashCommand) => {
+    if (cmd.name === "plan") { toggleDraftPlan(); return; }
+    // /goal 只把输入框置成 "/goal "（命令的 insert），接着写目标描述即可：
+    // 落地分两步 —— submitStartDraft 存草稿，App.handleCreateProject 建任务时写进内核。
+  };
+
+  /** 开 / 关计划模式（就是 POST /permission 的 planMode 位），并给一句明确反馈 */
+  const applyPlanMode = (on: boolean) => {
+    void changePlanMode(on);
+    toast(on
+      ? { title: "已进入计划模式", description: "描述你的任务，我会先给计划", tone: "info" }
+      : { title: "已退出计划模式", description: "写类工具已恢复，可以直接动手", tone: "default" });
+  };
+
+  const handleSlashCommand = (cmd: SlashCommand) => {
+    if (cmd.name === "plan") { applyPlanMode(!planMode); return; }
+    if (cmd.name === "goal") {
+      // 没目标时不用做事：输入框已经被置成 "/goal "（命令的 insert），用户接着写描述就行。
+      // 已有目标时只把现状说清楚 —— 选中一条命令不该顺手改掉别人的目标，改要显式 /goal clear。
+      if (goal) {
+        toast({
+          title: `目标 · ${goalPhaseLabel(goal.phase)}`,
+          description: `${truncateGoal(goal.objective, 80)} · ${goalSummary(goal)}`,
+          tone: "info",
+        });
+      }
+      return;
+    }
+  };
+
+  /** 左下角 chip 的「点击退出」和斜杠命令走同一条路 */
+  const exitPlanMode = () => applyPlanMode(false);
+
   // 没选任务时的起始页：居中一个输入框，直接说话就开工（对齐 codex / DSH）
   if (!projectId) {
     return (
       <div className="flex h-full flex-col bg-surface-raised">
+        {/* 欢迎语占满剩余空间并居中；输入框**贴底** —— 对齐 DSH / codex 的形态 */}
         <div className="flex flex-1 items-center justify-center px-6">
-          <div className="w-full max-w-[560px]">
-            <div className="mb-5 text-center">
-              <img
-                src="/dove-icon.png"
-                alt="Dove"
-                className="mx-auto size-10 rounded-md"
-                draggable={false}
-              />
-              <h1 className="mt-3 text-sm font-bold text-text-primary">开始一个新任务</h1>
-            </div>
+          <div className="text-center">
+            <img
+              src="/dove-icon.png"
+              alt="Dove"
+              className="mx-auto size-10 rounded-md"
+              draggable={false}
+            />
+            <h1 className="mt-3 text-sm font-bold text-text-primary">开始一个新任务</h1>
+          </div>
+        </div>
 
-            <div className="flex flex-col overflow-hidden rounded-2xl border border-border-default bg-surface-raised shadow-sm transition-[border-color,box-shadow] duration-fast focus-within:border-accent-ring focus-within:shadow-focus">
+        {/* 输入区：贴底（留出和侧栏一致的下边距） */}
+        <div className="px-6 pb-6">
+          <div className="mx-auto w-full max-w-[640px]">
+            {/* ⚠️ 这张卡片**不能加 overflow-hidden**：斜杠菜单浮在输入框上方，
+                一旦被裁就只剩半行（实测踩过）。圆角靠子元素自身不需要裁剪。 */}
+            <div className="flex flex-col rounded-2xl border border-border-default bg-surface-raised shadow-sm transition-[border-color,box-shadow] duration-fast focus-within:border-accent-ring focus-within:shadow-focus">
               {/* 左上角：项目 / 文件夹选择 */}
               <div className="flex items-center gap-1.5 px-2.5 pt-2">
                 <DropdownMenu>
@@ -1762,17 +2019,50 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 sendTitle="创建任务并开始"
                 placeholder={NEW_TASK_PLACEHOLDER}
                 hint="Enter 开始 · Shift+Enter 换行"
+                commands={startCommands}
+                onSlashCommand={handleStartSlashCommand}
                 leftActions={
-                  // 新会话页还没有项目，所以这里配的是**新项目的默认权限**，
-                  // 存 localStorage，建项目时写进线程 metadata。
-                  <PermissionSelect
-                    surface="defaults"
-                    value={permission}
-                    onChange={(m) => void changePermission(m)}
-                  />
+                  <>
+                    {/* 新会话页还没有项目，所以这里配的是**新项目的默认权限**，
+                        存 localStorage，建项目时写进线程 metadata。 */}
+                    <PermissionSelect
+                      surface="defaults"
+                      value={permission}
+                      onChange={(m) => void changePermission(m)}
+                    />
+                    {/* 计划模式草稿：点一下取消；建项目时落地，见 App.handleCreateProject */}
+                    {draftPlan && (
+                      <button
+                        type="button"
+                        title="取消：新任务不再以计划模式开始"
+                        aria-label="取消计划模式"
+                        onClick={toggleDraftPlan}
+                        className="group flex h-7 items-center gap-1 rounded-full bg-surface-inset px-2 text-2xs text-text-secondary transition-colors duration-fast hover:bg-surface-hover hover:text-text-primary"
+                      >
+                        <ClipboardList className="size-3 group-hover:hidden" />
+                        <XCircle className="hidden size-3 group-hover:block" />
+                        <span>计划模式（新任务）</span>
+                      </button>
+                    )}
+                    {/* 目标草稿：建好任务后会自动落地，这里只显示它存在 + 一个图标式清除 */}
+                    {draftGoal && (
+                      <span className="flex h-7 min-w-0 items-center gap-1 rounded-full bg-surface-inset px-2 text-2xs text-text-secondary">
+                        <Target className="size-3 shrink-0 text-text-tertiary" />
+                        <span className="max-w-[12rem] truncate" title={"目标：" + draftGoal}>目标：{draftGoal}</span>
+                        <button
+                          type="button"
+                          title="取消这个目标"
+                          aria-label="取消这个目标"
+                          onClick={() => { clearDraftGoal(); setDraftGoal(null); }}
+                          className="ml-0.5 flex size-4 shrink-0 items-center justify-center rounded-full text-text-tertiary transition-colors duration-fast hover:bg-surface-hover hover:text-text-primary"
+                        >
+                          <X className="size-3" />
+                        </button>
+                      </span>
+                    )}
+                  </>
                 }
                 className="rounded-none border-0 bg-transparent shadow-none focus-within:border-transparent focus-within:shadow-none"
-                textareaClassName="min-h-[96px]"
               />
             </div>
 
@@ -1864,6 +2154,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 onScreenshotSubmit={handleScreenshotSubmitInline}
                 onScreenshotCancel={handleScreenshotCancelInline}
                 onRetry={handleRetry}
+                onOpenFile={onOpenFile}
               />
             </div>
             <div ref={messagesEndRef} />
@@ -1997,17 +2288,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         )}
         
         <div className={`relative ${isCompactMode ? 'flex flex-1 flex-col' : ''}`}>
-          {/* 输入卡片：聚焦时整卡高亮 */}
-          <div className="mx-auto w-full max-w-[880px] flex flex-col overflow-hidden rounded-xl border border-border-default bg-surface-raised shadow-xs transition-[border-color,box-shadow] duration-fast ease-standard focus-within:border-accent-ring focus-within:shadow-focus">
-          <Textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyPress}
-            placeholder={COMPOSER_PLACEHOLDER}
-            className={`resize-none rounded-none border-0 bg-transparent text-sm shadow-none focus-visible:border-transparent focus-visible:ring-0 ${isCompactMode ? 'min-h-0 flex-1' : 'max-h-[220px] min-h-[72px]'}`}
-          />
-          
-          {/* 隐藏的文件输入 */}
+          {/* 隐藏的文件输入（附件按钮在 ComposerBox 的 leftActions 插槽里） */}
           <input
             ref={fileInputRef}
             type="file"
@@ -2015,11 +2296,43 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             className="hidden"
             onChange={handleFileSelect}
           />
-          
-          {/* 底部工具条 */}
-          <div className="flex items-center justify-between gap-2 px-1.5 pb-1.5">
-          {/* 左下角按钮区域 */}
-          <div className="flex items-center gap-1">
+
+          {/* 输入卡片 —— 和起始页**同一个 ComposerBox**（结构 / 发送按钮 / 斜杠菜单只有一份）。
+              项目页多出来的东西（附件 / 权限 / 计划模式 / 设置 / 朗读）全走 leftActions 插槽，
+              长期目标状态条走 topLeft 插槽 —— 没有目标时 GoalBar 自己返回 null，不占位置。 */}
+          <ComposerBox
+            value={input}
+            onChange={setInput}
+            onSubmit={() => handleSend()}
+            placeholder={COMPOSER_PLACEHOLDER}
+            hint="Enter 发送 · Shift+Enter 换行"
+            sending={isLoading}
+            onStop={handleStop}
+            commands={slashCommands}
+            onSlashCommand={handleSlashCommand}
+            topLeft={goal ? <GoalBar goal={goal} pending={goalPending} onAction={runGoalBarAction} /> : undefined}
+            className="mx-auto w-full max-w-[880px] rounded-xl"
+            textareaClassName={isCompactMode ? 'min-h-0 flex-1' : undefined}
+            leftActions={
+              <>
+                {/* 计划模式 chip：只在开启时出现；点一下 = POST planMode:false */}
+                {planMode && (
+                  <button
+                    type="button"
+                    title="退出计划模式"
+                    aria-label="退出计划模式"
+                    onClick={exitPlanMode}
+                    className="group flex h-7 items-center gap-1 rounded-full bg-surface-inset px-2 text-2xs text-text-secondary transition-colors duration-fast hover:bg-surface-hover hover:text-text-primary"
+                  >
+                    {/* 常态是计划图标，悬停换成"取消"圈 —— 对齐 DSH 的 PlanChip（rest / hover 两个 glyph），
+                        文字只说状态，不写"点击退出" */}
+                    <ClipboardList className="size-3 group-hover:hidden" />
+                    <XCircle className="hidden size-3 group-hover:block" />
+                    <span>计划模式</span>
+                  </button>
+                )}
+
+
             {/* 附件上传按钮 */}
             <button
               type="button"
@@ -2228,19 +2541,9 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 </button>
               </div>
             )}
-          </div>
-
-          {/* 右下角：发送/停止 —— 和新会话页**同一个组件**，不再各写一份 */}
-          <div className="flex items-center gap-1.5">
-            <SendButton
-              sending={isLoading}
-              onSend={() => handleSend()}
-              onStop={handleStop}
-              disabled={!input.trim()}
-            />
-          </div>
-          </div>{/* 底部工具条闭合 */}
-          </div>{/* 输入卡片闭合 */}
+              </>
+            }
+          />
         </div>
         </div>{/* shouldCenterContent 内部容器闭合 */}
       </div>

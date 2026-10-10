@@ -9,7 +9,11 @@
  * 拿不到时用本地兜底（离线也不能没有权限选择器）。
  */
 import { useCallback, useEffect, useState } from "react";
-import { getPermissionMode, setPermissionMode, getPermissionPresets, type PermissionMode, type PermissionPreset } from "@/lib/api";
+import {
+  getPermissionMode, setPermissionMode, getPermissionPresets,
+  getPlanMode, setPlanMode,
+  type PermissionMode, type PermissionPreset,
+} from "@/lib/api";
 
 export type { PermissionMode, PermissionPreset };
 
@@ -84,6 +88,24 @@ function writeDraftPermission(m: PermissionMode): void {
   try { localStorage.setItem(DRAFT_KEY, m); } catch { /* 隐私模式等，忽略 */ }
 }
 
+const DRAFT_PLAN_KEY = "dove_new_plan_mode";
+
+/**
+ * 新会话页的「计划模式」草稿 —— 和权限草稿同一个套路：
+ * 那时**还没有线程**，没有东西可以 POST，所以先存在 localStorage，
+ * 建项目时由 App 读走、落到线程 metadata（见 App.handleCreateProject）。
+ */
+export function readDraftPlanMode(): boolean {
+  try { return localStorage.getItem(DRAFT_PLAN_KEY) === "1"; } catch { return false; }
+}
+
+export function writeDraftPlanMode(on: boolean): void {
+  try {
+    if (on) localStorage.setItem(DRAFT_PLAN_KEY, "1");
+    else localStorage.removeItem(DRAFT_PLAN_KEY);
+  } catch { /* 隐私模式等，忽略 */ }
+}
+
 /**
  * 权限模式的读写。key 为项目标识（端口或 id），为空表示「还没有项目」。
  *
@@ -112,4 +134,46 @@ export function usePermissionMode(key: string | null | undefined) {
   }, [key, mode]);
 
   return [mode, change] as const;
+}
+
+/**
+ * 计划模式（B5）—— 线程级的**第二根权限轴**。
+ *
+ * 和权限档存同一个接口、同一份线程 metadata，但语义完全不同：开关它**不改档位**，
+ * 只让内核把写类工具从工具表里裁掉（硬只读）。模型调研完用 ExitPlanMode 交计划，
+ * 走既有审批通道；用户批准后**内核自己**把这一位关掉 —— 那一刻面板不知道，
+ * 所以这里多给一个 refresh()，由 ChatPanel 在工具结果 / 一轮结束时重读。
+ *
+ * key 为空（还没进项目）时不做任何请求：计划模式是线程级的，没有线程就没有它。
+ */
+export function usePlanMode(key: string | null | undefined) {
+  const [planMode, setPlanModeState] = useState(false);
+
+  useEffect(() => {
+    if (!key) { setPlanModeState(false); return; }
+    let alive = true;
+    getPlanMode(key)
+      .then((on) => { if (alive) setPlanModeState(on); })
+      // 读不到就保持现值：可能是项目刚建好、内核还没落库
+      .catch(() => { /* noop */ });
+    return () => { alive = false; };
+  }, [key]);
+
+  /** 开关是**乐观**的：先改界面，失败再回滚（和权限档一致） */
+  const change = useCallback(async (on: boolean) => {
+    const prev = planMode;
+    setPlanModeState(on);
+    if (!key) { setPlanModeState(prev); return; }
+    try { await setPlanMode(key, on); }
+    catch { setPlanModeState(prev); }   // 失败回滚
+  }, [key, planMode]);
+
+  /** 从后端重读（批准计划后内核会自己关掉） */
+  const refresh = useCallback(async () => {
+    if (!key) { setPlanModeState(false); return; }
+    try { setPlanModeState(await getPlanMode(key)); }
+    catch { /* 读不到就保持现值 */ }
+  }, [key]);
+
+  return [planMode, change, refresh] as const;
 }

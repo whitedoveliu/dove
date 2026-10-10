@@ -16,6 +16,10 @@ export interface WireInput {
     activity?: { searchScreen(q: string, o?: { limit?: number }): import("../tools/types.ts").ScreenHit[] };
     /** 搜索 API 的 key（Tavily）—— 见下面 services 里的转发，漏了 WebSearch 会静默退回抓 Bing */
     webSearchKey?: string;
+    /** MCP 资源能力（ListMcpResources / ReadMcpResource）—— server 层接真实客户端 */
+    mcp?: import("../tools/types.ts").McpResourcePort;
+    /** 定时任务端口（CronCreate / CronList / CronDelete）—— bootstrap 接 CronScheduler */
+    cron?: import("../tools/types.ts").CronOps;
   } };
   sink: (e: { type: string; [k: string]: unknown }) => void;
   threadId: string;
@@ -70,6 +74,10 @@ export function buildExecDeps(input: WireInput): Omit<ExecDeps, "tools"> {
     // WebSearch 静默退回抓 Bing，而代码上完全看不出问题（不报错、不打日志）。
     // 表现是模型抱怨「Bing 把 VST 认成卓佳」，查了半天才发现 key 根本没到工具手上。
     webSearchKey: svc.webSearchKey,
+    // P0：MCP 资源与定时任务。同样要「bootstrap → AgentServices → runtime 转发 → 这里」四处齐全，
+    // 少任何一处都是静默失效：工具会返回「服务未接入」，而代码上完全看不出问题。
+    mcp: svc.mcp,
+    cron: svc.cron,
   };
 
   const ctxBase: Omit<ToolContext, "toolCallId" | "requestApproval"> = {
