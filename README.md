@@ -1,175 +1,158 @@
-# Dove
+<h1 align="center">
+  <img src="control-panel/public/dove-icon-512.png" alt="Dove" width="76">
+  <br>
+  Dove
+</h1>
 
-**一个有屏幕记忆的编码 agent。** 常驻 HTTP 内核 + 可换的界面 —— 工具、记忆、子代理、权限都在内核里。
+<p align="center"><strong>A coding agent with screen memory</strong> — resident HTTP kernel, swappable UI.</p>
+
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-3_steps-blue?style=for-the-badge" alt="Quick Start"></a>
+  <a href="#-tools-42"><img src="https://img.shields.io/badge/Tools-42-green?style=for-the-badge" alt="Tools"></a>
+  <a href="#-verification"><img src="https://img.shields.io/badge/Tests-47_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Node-%E2%89%A524-339933?logo=node.js&logoColor=white" alt="Node">
+  <img src="https://img.shields.io/badge/TypeScript-zero--build-3178C6?logo=typescript&logoColor=white" alt="TypeScript">
+  <img src="https://img.shields.io/badge/macOS-Swift_helpers-000000?logo=apple&logoColor=white" alt="macOS">
+  <img src="https://img.shields.io/badge/UI-React_19_+_Tauri-61DAFB?logo=react&logoColor=white" alt="UI">
+</p>
+
+Dove is not a chat box wrapped around a model. It runs as a **resident process**: it watches your screen and turns
+what it saw into searchable memory, delegates work to subagents, and snapshots every change into git.
 
 ```
-改代码 → 构建自证 → 看效果 → 不满意就回滚
+change code  →  prove it builds  →  look at the result  →  roll back if you do not like it
 ```
 
-Dove 不是"聊天框包一层模型"。跑起来它是一个常驻进程：定时看屏幕，把看到的内容变成可检索的记忆；
-能派子代理去并行干活；每轮改完文件自动打一个 git 快照。界面只是它的一张脸，换界面不用动内核。
+## ✨ What makes it different
 
-## 特色
-
-| 特色 | 一句话 |
+| | |
 |---|---|
-| 🧠 **截图 OCR 记忆** | 截屏 → 三级判重 → 本地 OCR → 脱敏 → 落库建索引。「我上午在看什么」是真的能检索回来的 |
-| 🤖 **子代理运行时** | 独立上下文 + 工具白名单 + 步数上限；过程落盘成一条**可点进去看**的子线程，不是黑盒 |
-| 🧰 **双层工具表** | 16 个常驻 + 7 个按需（模型先检索再激活）；检索描述**从工具列表生成**，加删工具不会漏 |
-| 🔐 **分级权限** | 只读 / 工作区内可写 / 完全放行，外加实验档 `auto`；审批看命令链的**每一段** |
-| 🧩 **事件溯源** | 模型可见 ⟺ 已落盘；崩溃后未配对的 tool_call 写「结果未知」，不重放 |
-| 🎛️ **内核 / 界面解耦** | 内核是常驻 HTTP 服务，界面只通过 HTTP + SSE 说话 |
+| 🧠 **Screen memory** | screenshot → 3-level dedupe → local OCR → redaction → inverted index → retrieval into the current turn |
+| 🤖 **Subagents** | isolated context + tool whitelist + step cap; the run is persisted as a sub-thread you can click into |
+| 📋 **Plan mode & goals** | `/plan` explores and proposes, and may only write after you approve; `/goal` keeps working across rounds |
+| 🖥️ **Persistent terminal** | one shell stays alive, so `cd` / `export` survive; zero dependencies (no node-pty) |
+| 🛡️ **Capability-based permissions** | read-only does not ask the model to behave — the write tools are removed from its tool table |
+| 🧩 **Event-sourced** | what the model saw is what is on disk; unpaired tool calls become "unknown result", never replayed |
 
-## 一、截图 OCR 记忆：把「看到过」变成「想得起来」
+## 🔍 Screen memory
 
 ```
-screencapture ─► 三级判重 ─► 落盘 + activity_snapshots
-                               │
-                               └─► OCR（Swift/Vision，每 3 帧）─► 脱敏 ─► activity_ocr_frames
-                                                                           │
-                                                                 中文 2-gram 倒排索引
-                                                                           │
-当前回合的提问 ──────────────────────────► 检索（向量 0.40 / 词袋 0.25）──┘
-                                              │
-                                              └─► 注入尾部上下文（350ms 超时，不进系统提示词）
+screencapture ─► dedupe (hash → histogram → pixel diff) ─► snapshots + SQLite
+                          │
+                          └─► OCR (Swift/Vision, every 3rd frame) ─► redact ─► ocr_frames
+                                                                            │
+                                                              CJK 2-gram inverted index
+                                                                            │
+current question ─────────────────────────► search (vector 0.40 / lexical 0.25) ─┘
+                                                └─► injected into the tail context only (350ms budget)
 ```
 
-- **什么时候截**：心跳 120s、画面变化 12s、切应用 / 点击（事件驱动）、停手 1.2s；全局 4s debounce，
-  空闲时指数降频（上限 5 分钟）。
-- **三级判重**：FNV-1a 像素哈希（完全相同直接丢）→ 32 桶直方图（欧氏距离 < 0.05）→
-  逐像素差分（差异 < 2%）。位图用 `sips` 转 BMP 自己解析；解码失败还有原始字节哈希兜底，
-  判重不会因为解码问题而崩。
-- **OCR 中文优先**：语言表是 `zh-Hans, zh-Hant, ja, en-US`，**顺序有语义** —— 反过来（en 优先）时
-  Vision 对整屏中文只会回 `iX` 这类垃圾。
-- **零安装**：Swift helper 用 `swiftc` 运行时编译，按源码 sha256 缓存到 `~/.dove/cache/ocr-<hash>`，
-  首次几秒，之后直接复用。
-- **中文 2-gram 倒排索引**：`node:sqlite` 的 FTS5 实测对中文无效（查「飞书」0 行），所以自己切词建索引。
-- **检索两条腿**：装了 ONNX 模型走向量（阈值 0.40，用真实屏幕内容标定）；没装自动退化成词袋（0.25）。
-- **存储自己轮转**：hot（1 天）→ warm（7 天，1280×720）→ cold（30 天，640×360）→ 删除，总量 10GB 上限。
-- **日报 / 周报**：确定性骨架 + 模型叙事；骨架里没有的事实一律不许编。
-- **没有屏幕录制权限时不静默失败**：明确告诉你，判重 / 脱敏 / 分析 / 报表照常可用。
+- **Capture**: heartbeat 120s, visual change 12s, app focus / click, typing pause 1.2s; 4s global debounce, idle backoff up to 5 min.
+- **OCR is Chinese-first** (`zh-Hans` before `en-US`). Reversed, Vision returns garbage such as `iX` for a screen full of Chinese.
+- **FTS5 is useless for Chinese** (measured: 0 hits for 飞书), so the index is a self-built CJK 2-gram inverted index.
+- **Retrieval has two legs**: local ONNX vectors (threshold 0.40) or bag-of-words (0.25). It never touches the system prompt.
+- Snapshots rotate hot → warm → cold → deleted, capped at 10 GB.
 
-> 长期记忆是同一套骨架的另一半：本地向量（bge-small-zh-v1.5）+ 词法 + 屏幕通道三路检索。
-> 注入通道的阈值按后端分档（真向量 0.44 / 降级 0.12）—— **换模型必须重新标定**，
-> 照抄别的项目的阈值（比如 0.75）会全部漏掉。
+## 🤖 Subagents
 
-## 二、子代理：可导航的线程，不是黑盒
+- The main agent only sees the **final answer**, so subagents must return self-contained conclusions.
+- 10-tool whitelist, 100-step cap, and the last step is forced to answer (`tool_choice=none`).
+- The run is persisted as a `kind='subagent'` thread: its reasoning and every tool call (with arguments) are replayable.
+- `ListAgents` / `SendMessage` / `InterruptAgent`. Recursion is deliberately blocked — one clean level.
 
-- **独立上下文**：主代理只看得到子代理的**最终答复**，所以子代理被要求写自包含结论
-  （做了什么、发现什么、还差什么）。
-- **工具白名单 + 步数上限**：默认 10 个工具（Bash / Read / Write / Edit / Glob / Grep /
-  WebSearch / WebFetch / Skill / TodoWrite），上限 100 步；**最后一步强制作答**（`tool_choice=none`），
-  不会无限跑下去。
-- **过程落盘**：运行时写成一条 `kind='subagent'` 的子线程，界面复用主对话的历史回放路径 ——
-  点进去能看到它的推理、每一次工具调用**和参数**。
-- **前台 / 后台**：`Task run_in_background` 配合 `TaskOutput` 取结果；结果注回原线程用状态机防重复。
-- **递归是故意挡住的**：子代理的工具白名单里没有 `Task`，现在是干净的**一层**。
+## 🏗️ Architecture
 
-## 三、还有这些
+```
+harness/                TS kernel (zero build: Node runs .ts natively, type-stripping only)
+  packages/core/          agent loop · tools · memory · subagents · permissions · screen perception
+  packages/server/        resident HTTP + SSE · legacy compat layer on 8008 (used by control-panel)
+  packages/prompts/       11 system-prompt slots (s01–s11, one file each)
+  packages/embedding/     local vector search (bge-small-zh-v1.5)
+  scripts/                smoke tests (they really run things, not just pure functions)
+control-panel/          UI (React 19 + Vite + Tailwind)
+apps/desktop/           desktop shell (Tauri; resolves the kernel at runtime via DOVE_REPO → ~/.dove/repo → upward search)
+```
 
-- **双层工具表**：工具描述每轮都要发给模型 —— 所以常驻 16 个，另外 7 个检索后才激活。
-- **审批链**：本地规则先过，拿不准才交给模型；命令按 `&& || ; |` 切段，只读要求**每一段**都只读。
-- **事件溯源**：模型可见 ⟺ 已落盘，同一份事件日志同时喂前端和模型。
-- **前缀缓存友好**：静态段在前，易变内容（时间 / 情绪 / 记忆切片）走尾部注入 —— 实测命中 88–95%。
-- **主动性**：cron（at / every / 5 段）+ heartbeat（30 分钟一次，`HEARTBEAT_OK` 抑制）。
-- **生成与解析**：图片（fal.ai）、PPT、真 MP4（Swift + AVFoundation，**不需要 ffmpeg**）；
-  文档走 PDFKit / `textutil`，PDF / docx / doc / rtf / odt / html 都能读。
-- **MCP**：外部服务器的工具桥接后直接进工具表（`mcp__<server>__<tool>`），只追加在尾部。
-- **版本**：每轮改过文件就自动 `git commit`；回滚入口在右侧「版本历史」，直接读 git 列表。
+One-way dependencies, enforced by `harness/tools/lint-layering.mjs`; files stay ≤ 400 lines (`lint-file-size.mjs`).
 
-## 四、快速开始
+## 🚀 Quick start
 
-需要 **Node 24+**（实测 25）。Swift 相关能力（屏幕 OCR / 视频 / PDF）需要 macOS + Xcode Command Line Tools。
+Requires **Node 24+**. The Swift-backed abilities (screen OCR, video, PDF) need macOS + Xcode Command Line Tools.
 
 ```bash
-git clone https://github.com/whitedoveliu/dove.git
-cd dove
+git clone https://github.com/whitedoveliu/dove.git && cd dove
 
-# 1) 密钥：在仓库根建一个 env（.gitignore 已挡住，不会提交）
-#    变量名是历史遗留，实际放 OpenAI 兼容接口的 key
-echo 'ANTHROPIC_API_KEY=你的key' > env
+# 1) API key — create a file named env at the repo root (.gitignore already blocks it)
+echo 'ANTHROPIC_API_KEY=your-key' > env    # the var name is legacy; the value is an OpenAI-compatible key
 
-# 2) 构建界面（内核会托管 control-panel/dist）
+# 2) build the UI (the kernel serves control-panel/dist)
 cd control-panel && pnpm install && pnpm build && cd ..
 
-# 3) 起内核并打开浏览器
+# 3) start the kernel and open the browser
 ./Dove.command          # → http://127.0.0.1:8790/
 ```
 
-不想用启动器就手动起：
-
-```bash
-cd harness && npm start
-```
-
-**可选：向量模型**（不装的话记忆检索自动退化成字面匹配，阈值也换成降级档）
+Prefer manual start: `cd harness && npm start`. Optional local embedding model:
 
 ```bash
 node --no-warnings harness/packages/embedding/scripts/fetch-model.mjs
 ```
 
-## 五、架构
+## ⚙️ Configuration
 
-```
-harness/                TS 内核（零构建：Node 原生跑 .ts，只做类型擦除）
-  packages/core/          agent 循环 · 工具 · 记忆 · 子代理 · 权限 · 感知
-  packages/server/        常驻 HTTP + SSE · 8008 老契约兼容层（control-panel 用）
-  packages/prompts/       系统提示词的 11 个槽位（s01–s11，各自独立文件）
-  packages/embedding/     本地向量检索（bge-small-zh-v1.5）
-  scripts/                冒烟测试
-control-panel/          界面（React 19 + Vite + Tailwind）
-apps/desktop/           桌面壳（Tauri：内核作为 sidecar，窗口加载 8790）
-```
-
-依赖方向单向：`security → media → docs → embedding → providers → session → tools → memory →
-context → activity → projects → loop → agent`，由 `harness/tools/lint-layering.mjs` 检查。
-
-## 六、配置
-
-| 变量 | 默认 | 说明 |
+| Variable | Default | Meaning |
 |---|---|---|
-| `DOVE_API_KEY` | 回退读仓库根 `env` 的 `ANTHROPIC_API_KEY` | 模型 key |
-| `DOVE_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI 兼容端点 |
-| `DOVE_MODEL` / `DOVE_TOOL_MODEL` | `deepseek-flash` | 主模型 / 工具模型（审批分类、记忆抽取、查询改写、压缩摘要） |
-| `DOVE_PORT` | `8790` | 内核端口 |
-| `DOVE_WORKSPACE` | `~/DoveProjects` | 项目根目录 |
-| `DOVE_CONFIG` | `~/.dove` | 记忆 / 会话 / 感知数据 / 缓存 |
-| `DOVE_DB` | `harness/.data/dove.db` | SQLite |
-| `DOVE_APPROVE` | `ask` | `ask` / `auto` / `deny`（CLI 与无人值守用 `auto`） |
-| `DOVE_ACTIVITY` | 开 | 设 `off` 关掉屏幕感知 |
-| `DOVE_OCR_EVERY` | `3` | 每 N 帧 OCR 一次（`1` 仅供联调，CPU 吃不消） |
-| `TAVILY_API_KEY` | — | 配了 WebSearch 优先走它，没配退回抓 HTML |
-| `FAL_KEY` | — | 配了才用 fal.ai 生图，否则出本地占位图并如实说明 |
-| `DOVE_LEGACY_PORT` | `8008` | control-panel 写死的后端端口（兼容层） |
+| `DOVE_API_KEY` | falls back to `ANTHROPIC_API_KEY` in `env` | model key |
+| `DOVE_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI-compatible endpoint |
+| `DOVE_MODEL` / `DOVE_TOOL_MODEL` | `deepseek-flash` | main model / tool model (classifier, memory, compaction) |
+| `DOVE_PORT` | `8790` | kernel port |
+| `DOVE_WORKSPACE` | `~/DoveProjects` | projects root |
+| `DOVE_CONFIG` | `~/.dove` | memory, sessions, screen data, cache |
+| `DOVE_DB` | `harness/.data/dove.db` | SQLite file |
+| `DOVE_APPROVE` | `ask` | `ask` / `auto` / `deny` |
+| `DOVE_ACTIVITY` | on | set `off` to disable screen perception |
+| `DOVE_OCR_EVERY` | `3` | OCR one frame out of N |
+| `DOVE_REPO` | — | kernel repo for the desktop shell (or write one line to `~/.dove/repo`) |
+| `TAVILY_API_KEY` | — | preferred WebSearch backend |
 
-## 七、开发与验证
+## 🧰 Tools (42)
+
+| Layer | Count | Contents |
+|---|---|---|
+| CORE (always) | 15 | Read · Write · Edit · Glob · Grep · Bash · BashOutput · KillShell · Recall · Remember · Sleep · CurrentTime · ReadImage · GetContextRemaining · Present |
+| SYSTEM (meta) | 10 | AttemptCompletion · AskUserQuestion · TodoWrite · ToolSearch · Skill · DispatchToProject · ExitPlanMode · CreateGoal · GetGoal · UpdateGoal |
+| ON_DEMAND (retrieved) | 17 | WebSearch · WebFetch · Task · TaskOutput · ListAgents · SendMessage · InterruptAgent · ListMcpResources · ReadMcpResource · CronCreate · CronList · CronDelete · TerminalOpen · TerminalSend · TerminalRead · TerminalClose · TerminalList |
+
+Every on-demand tool must declare a `discoverable` line — the `ToolSearch` description is **generated from that table**, and a test fails if one is missing.
+
+## ✅ Verification
 
 ```bash
-./verify.sh                # 全量：lint + 单测 + 冒烟 + 服务健康 + E2E
-./verify.sh --quick        # 跳过 E2E
-
-cd harness
-npm run lint                                        # 文件大小 + 依赖方向
-node --no-warnings --test packages/core/test/*.test.ts
-node --no-warnings scripts/smoke-turn.ts            # 真调模型跑一轮对话
-node --no-warnings scripts/smoke-screen-memory.ts   # OCR → SQLite → 索引 → 检索
-node --no-warnings scripts/smoke-subagent.ts        # 子代理运行时
+./verify.sh              # 15 checks: lint + 3 test suites + 7 smoke scripts + health + E2E
+cd harness && npm test   # 47 tests: 38 core + 1 goal + 8 P0/wiring
 ```
 
-两个环境前提：`smoke-routes` 需要 **8790 空闲**，而 `verify.sh` 的健康检查和 E2E 需要内核**正在跑** ——
-所以内核开着跑 `./verify.sh` 时，路由冒烟会以 `EADDRINUSE` 失败，那不是回归。
+Two environment prerequisites, not regressions: E2E needs an existing project; `smoke-routes` needs the kernel running on 8790.
 
-## 八、几个取舍
+## 🆚 Dove vs other agents
 
-| 问题 | 选择 | 代价 / 放弃 |
-|---|---|---|
-| 工具描述每轮都要重发 | 常驻 16 + 按需 7，检索后才激活 | 模型天生不知道有什么可搜 —— `ToolSearch` 的描述必须**从工具列表生成**（手写过一版，漏了子代理，模型再没派过子代理） |
-| 子代理跑很久又看不见 | 过程落盘成子线程，界面复用历史回放 | 多一层线程数据；过程不能塞进父消息的 parts，否则会被当成父代理自己的输出重新喂给模型 |
-| 屏幕文本要能回忆 | 自建中文 2-gram 倒排索引 | FTS5 对中文实测无效，切词和折行合并都得自己处理 |
-| 审批不能只看命令开头 | 按 `&& \|\| ; \|` 切段，逐段判定 | 只读白名单与危险黑名单两套规则都要维护，还得先剥离无害重定向 |
-| 截屏很贵（CPU + 磁盘） | 三级判重 + hot/warm/cold 轮转 + 10GB 上限 | 判重要解位图（`sips` → BMP 自解析），好在失败还有字节哈希兜底 |
-| 模型可见的必须可追溯 | 事件溯源：模型可见 ⟺ 已落盘 | 每轮多一次写库；崩溃修复要区分「结果未知」和「没执行」 |
+| Capability | Claude Code | Codex | DeepSeek Harness | Dove |
+|---|---|---|---|---|
+| Plan mode | Enter/ExitPlanMode | update_plan | plan mode | ✅ hard read-only: write tools are cut |
+| Subagents | Agent + TaskStop | 9 control tools | subagent + fork | ✅ navigable sub-thread + control plane |
+| Persistent terminal | TerminalCapture | write_stdin | terminal_* (node-pty) | ✅ zero-dependency PTY |
+| Image input | ✅ multimodal Read | view_image | read_image | ✅ ReadImage (attached into the conversation) |
+| Long-term memory | LocalMemoryRecall | — | — | ✅ local vectors + **screen memory** |
+| Screen perception | — | — | — | ✅ unique to Dove |
 
-## License
+## 📄 License
 
 MIT
