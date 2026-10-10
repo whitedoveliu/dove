@@ -45,7 +45,6 @@ cd apps/panel && npm run build     # 产物在 apps/panel/dist，内核会自动
 | `DOVE_API_KEY` | 回退读仓库根的 `env` 里的 `ANTHROPIC_API_KEY` | API key |
 | `DOVE_APPROVE` | `ask` | 审批策略：`ask` 弹窗 / `auto` 自动放行（CLI、无人值守）/ `deny` 一律拒绝 |
 | `DOVE_PANEL_DIR` | `apps/panel/dist` | 面板产物目录 |
-| `FAL_KEY` | — | 配了才用 fal.ai 生图，否则 GenerateImage 出一张本地占位图并如实说明 |
 
 ---
 
@@ -65,7 +64,7 @@ packages/
     providers/  OpenAI 兼容 provider（手写 SSE + tool_call 归并）
     loop/       step 循环 · turn 闸门 · 看门狗 · steering · 工具执行管线
     context/    分段装配 · mt 尾部注入 · 记忆切片 · token 估算 · AutoCompact
-    tools/      注册表 · 输出预算 · 调用修复 · 审批链 · 23 个内置工具
+    tools/      注册表 · 输出预算 · 调用修复 · 审批链 · 42 个内置工具（分层见下）
     memory/     文件层 · 向量层 · 检索 · 写入 · 睡眠合并
     agents/     子代理运行时 · 后台任务注册表
     projects/   构建 · 预览 · 版本（git）
@@ -74,6 +73,16 @@ packages/
 apps/panel/     React 19 面板
 fixtures/       回归夹具与场景卡
 ```
+
+**工具分层**（共 42 个；CORE 只往尾部追加，顺序 = wire 顺序 = 前缀缓存）
+
+| 层 | 数量 | 内容 |
+|---|---|---|
+| CORE | 15 | Read · Write · Edit · Glob · Grep · Bash · BashOutput · KillShell · Recall · Remember · Sleep · CurrentTime · ReadImage · GetContextRemaining · Present |
+| SYSTEM | 10 | AttemptCompletion · AskUserQuestion · TodoWrite · ToolSearch · Skill · DispatchToProject · ExitPlanMode · CreateGoal · GetGoal · UpdateGoal |
+| ON_DEMAND | 17 | WebSearch · WebFetch · Task · TaskOutput · ListAgents · SendMessage · InterruptAgent · ListMcpResources · ReadMcpResource · CronCreate · CronList · CronDelete · TerminalOpen · TerminalSend · TerminalRead · TerminalClose · TerminalList |
+
+ON_DEMAND 的每个工具**必须写 `discoverable`**（`ToolSearch` 的描述由这张表生成，漏一个测试就红）。
 
 ---
 

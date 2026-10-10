@@ -629,6 +629,115 @@ export async function setPermissionMode(port: string, mode: PermissionMode): Pro
 }
 
 /**
+ * 计划模式（B5）—— 和权限档**同一个接口、同一份线程 metadata**，但它是独立的一位：
+ * 开关计划模式不改权限档，只让内核把写类工具从工具表里裁掉（硬只读）。模型调研完
+ * 用 ExitPlanMode 提交计划、走审批；批准后内核自己把这一位关掉 —— 所以面板要能重读。
+ *
+ * key 可以是端口 / 项目 id / 目录名（后端三键查找）。
+ */
+export async function getPlanMode(port: string): Promise<boolean> {
+  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
+  if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
+  const d = (await r.json()) as { planMode?: boolean };
+  return d.planMode === true;
+}
+
+/** 打开 / 关闭计划模式，返回后端确认后的值 */
+export async function setPlanMode(port: string, planMode: boolean): Promise<boolean> {
+  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ planMode }),
+  });
+  if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
+  const d = (await r.json()) as { planMode?: boolean };
+  return d.planMode === true;
+}
+
+/* ============================ 长期目标（Goal） ============================ */
+
+/**
+ * 长期目标 —— 每个线程至多一个，存在内核里。目标 active 时**内核会在每轮结束后
+ * 自动再开一轮**（受 max_rounds 限制），所以面板只负责展示 + 人类操作入口：
+ * 建 / 暂停 / 继续 / 完成 / 标阻塞 / 清除。模型侧走的是 CreateGoal / GetGoal /
+ * UpdateGoal 三个工具，两边共用同一个 GoalStore。
+ *
+ * key 可以是端口 / 项目 id / 目录名（后端三键查找，和权限接口完全一致）。
+ */
+export type GoalPhase = "active" | "paused" | "blocked" | "complete";
+
+/** 内核 goalView 的形状（字段名就是线上的下划线命名，别改成驼峰） */
+export interface Goal {
+  id: string;
+  revision: number;
+  objective: string;
+  phase: GoalPhase;
+  rounds_started: number;
+  max_rounds: number;
+  /** 只有 blocked 才有 */
+  blocked_reason?: string;
+}
+
+/** 面板能发的动作（内核 ACTIONS 全集） */
+export type GoalAction = "create" | "pause" | "resume" | "complete" | "blocked" | "clear";
+
+export interface GoalPostBody {
+  action: GoalAction;
+  /** create 必填 */
+  objective?: string;
+  max_rounds?: number;
+  /** blocked 必填 */
+  blocked_reason?: string;
+}
+
+export interface GoalPayload {
+  goal: Goal | null;
+  /** 内核附的一句话说明（为什么没有 / 现在什么状态） */
+  note?: string;
+}
+
+/**
+ * 目标接口的错误 —— **带上内核的 code**，调用方要按它分支：
+ *   404 GOAL_NOT_FOUND       还没有目标（pause/resume/complete/blocked 时）
+ *   409 GOAL_ALREADY_EXISTS  已有未完成的目标（create 时）→ 提示"先 /goal clear"
+ * 只抛 `HTTP error! status: 409` 的话，这些提示一句都写不出来。
+ */
+export class GoalApiError extends Error {
+  status: number;
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = "GoalApiError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function readGoalPayload(r: Response): Promise<GoalPayload> {
+  const d = (await r.json().catch(() => ({}))) as {
+    goal?: Goal | null; note?: string; code?: string; message?: string;
+  };
+  if (!r.ok) throw new GoalApiError(d.message || `HTTP error! status: ${r.status}`, r.status, d.code);
+  return { goal: d.goal ?? null, note: d.note };
+}
+
+/** 读当前目标。没有目标不是错误：内核返回 { goal: null, note } */
+export async function getGoal(key: string): Promise<GoalPayload> {
+  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`);
+  return readGoalPayload(r);
+}
+
+/** 建 / 暂停 / 继续 / 完成 / 标阻塞 / 清除，返回内核确认后的状态（权威） */
+export async function postGoal(key: string, body: GoalPostBody): Promise<GoalPayload> {
+  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return readGoalPayload(r);
+}
+
+/**
  * 彻底删除一个任务：项目目录 + 数据库记录。**不可恢复。**
  *
  * @param key 优先传项目的 **id**（Project.id）。传 port 只在有端口的项目上有效 ——

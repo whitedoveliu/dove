@@ -18,6 +18,8 @@ import { installRuntimeLog } from "../../core/src/session/runtime-log.ts";
 import type { Config, Services } from "./bootstrap-types.ts";
 import { getProvider } from "../../core/src/providers/index.ts";
 import { makeClassifier } from "./classifier.ts";
+import { GoalStore } from "../../core/src/agents/goal-store.ts";
+import { makeExitPlanMode } from "./plan-mode-wiring.ts";
 import { allTools } from "../../core/src/tools/index.ts";
 import type { Tool } from "../../core/src/tools/types.ts";
 import { PreviewManager } from "../../core/src/projects/preview.ts";
@@ -25,7 +27,7 @@ import { ProjectManager } from "../../core/src/projects/manager.ts";
 import { MemoryService } from "../../core/src/memory/index.ts";
 import { TaskRegistry } from "../../core/src/agents/task-registry.ts";
 import { EmotionService, FatigueService } from "../../core/src/emotion/index.ts";
-import { CronScheduler, Heartbeat } from "../../core/src/scheduler/index.ts";
+import { CronScheduler, Heartbeat, makeCronOps } from "../../core/src/scheduler/index.ts";
 import { ActivityRecorder } from "../../core/src/activity/index.ts";
 import { makeTailState } from "./tail-state.ts";
 import { attachInputMonitor, detachInputMonitor } from "../../core/src/activity/focus.ts";
@@ -226,6 +228,10 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     memory: memoryPort,
     compact,
     projectOps: (id) => projects.ops(id),
+    // MCP 资源能力（ListMcpResources / ReadMcpResource）。
+    // ⚠️ 这个值要穿过四处：bootstrap（这里）→ AgentServices 声明 → wire.ts 的转发 → ToolServices.mcp。
+    //    漏了 wire.ts 那一处 = 工具永远返回「MCP 未接入」，而且不报错。
+    mcp: mcpWiring?.resources,
     // 屏幕记忆：Recall 的「我屏幕上看到过什么」那条通道。
     // ⚠️ activity 是在这个 runtime **之后**才创建的（它自己要用 runtime 派活），
     //    所以这里必须惰性取值 —— 直接写 activity?.xxx 会命中 TDZ。
@@ -235,6 +241,12 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     // 审批分类器（auto 模式用）。⚠️ 这个值以前**根本没提供** —— 只在类型里声明过，
     // 于是 auto 模式表面说「每次调用前审一遍」、实际全部放行。实现见 classifier.ts。
     classifier: makeClassifier(provider),
+    // 长期目标：模型侧三个工具与面板的 /api/projects/{key}/goal **共用这一张表**，
+    // 所以人在面板上改了目标，模型手里的旧 revision 会被拒（GOAL_STALE_REVISION）。
+    goals: new GoalStore(db),
+    // 计划模式：批准之后把线程从计划模式里放出来（改 metadata）。
+    // 实现放 server 层是因为核心层不能 import server —— 见 plan-mode-wiring.ts。
+    exitPlanMode: makeExitPlanMode({ store, sink: (e) => emit(e) }),
   });
 
   // cron / heartbeat 需要 runtime，放在 runtime 之后建
@@ -252,6 +264,12 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       return text;
     },
   });
+
+  // cron 工具（CronCreate / CronList / CronDelete）走端口注入。
+  // ⚠️ cron 是在 runtime **之后**建的（它自己要用 runtime.run），所以是**事后补注入**：
+  //    buildExecDeps 每轮才读 runtime.services.cron，来得及。
+  //    接线仍是四处：bootstrap（这里）→ AgentServices 声明 → wire.ts 转发 → ToolServices.cron。
+  runtime.services.cron = makeCronOps(cron);
 
   const heartbeat = new Heartbeat({
     configDir: cfg.configDir,

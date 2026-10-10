@@ -144,15 +144,25 @@ export async function executeOne(
   const ctx: ToolContext = { ...deps.ctxBase, toolCallId: call.id, requestApproval: deps.resolveApproval };
   const timeout = tool.timeoutMs ?? deps.timeoutMs ?? TOOL_TIMEOUT_MS;
   let raw: unknown; let ok = true; let errorText: string | undefined;
+  // ⚠️ 超时定时器**必须**在工具结束时清掉。
+  //    原来只有一个 Promise.race 里的裸 setTimeout：定时器活着但没人清，
+  //    每次工具调用都给事件循环留一个最长 10 分钟（TOOL_TIMEOUT_MS）的把手 ——
+  //    常驻服务看不出来，`node --test` / CLI 跑完却退不掉（实测：新测试挂到超时才发现）。
+  //    注意不能改成 unref()：那会让「只等工具超时」的进程提前退出，超时就不再兜底了。
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     raw = await Promise.race([
       tool.execute(args, ctx),
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`工具 ${name} 超时（${timeout}ms）`)), timeout)),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error(`工具 ${name} 超时（${timeout}ms）`)), timeout);
+      }),
     ]);
   } catch (e) {
     ok = false;
     errorText = e instanceof Error ? e.message : String(e);
     raw = { error: errorText };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 
   // 输出预算

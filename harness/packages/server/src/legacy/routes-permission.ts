@@ -71,16 +71,27 @@ export async function handlePermissionRoutes(
 
   if (req.method === "POST") {
     const b = await readBody(req);
-    const raw = String(b.mode ?? "");
-    const mode = ALIAS[raw] ?? raw;            // 旧前端传 full 也认
-    if (!MODES.has(mode)) {
-      json(res, 400, { success: false, message: "mode 必须是 danger-full-access / workspace-write / read-only / auto" });
+    const patch: Record<string, unknown> = {};
+    if (b.mode !== undefined) {
+      const raw = String(b.mode ?? "");
+      const mode = ALIAS[raw] ?? raw;            // 旧前端传 full 也认
+      if (!MODES.has(mode)) {
+        json(res, 400, { success: false, message: "mode 必须是 danger-full-access / workspace-write / read-only / auto" });
+        return true;
+      }
+      // readOnly 是老布尔字段，一起写保持兼容（runtime 两处都认）
+      patch.permissionMode = mode;
+      patch.readOnly = mode === "read-only";
+    }
+    // ── 计划模式（B5）────────────────────────────────
+    // 人类在输入框打 /plan → 面板调这里。它**不改权限档**，只让运行时
+    // 把写类工具从工具表里裁掉（照 Dove 的原则：计划模式是硬只读，不是软提示）。
+    if (typeof b.planMode === "boolean") patch.planMode = b.planMode;
+    if (Object.keys(patch).length === 0) {
+      json(res, 400, { success: false, message: "至少给 mode 或 planMode 之一" });
       return true;
     }
-    // readOnly 是老布尔字段，一起写保持兼容（runtime 两处都认）
-    svc.store.updateThread(thread.id, {
-      metadata: { ...thread.metadata, permissionMode: mode, readOnly: mode === "read-only" },
-    });
+    svc.store.updateThread(thread.id, { metadata: { ...thread.metadata, ...patch } });
   }
 
   const cur = svc.store.getThread(thread.id)?.metadata ?? {};
@@ -88,6 +99,6 @@ export async function handlePermissionRoutes(
   const mode = cur.readOnly === true
     ? "read-only"
     : (ALIAS[String(cur.permissionMode ?? "")] ?? cur.permissionMode ?? "workspace-write");
-  json(res, 200, { success: true, mode });
+  json(res, 200, { success: true, mode, planMode: cur.planMode === true });
   return true;
 }

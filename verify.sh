@@ -19,9 +19,11 @@ if (cd "$H" && npm run lint >/dev/null 2>&1); then ok "lint（文件大小 + 依
 
 echo "== 2. 单元测试 =="
 if (cd "$H" && node --no-warnings --test packages/core/test/core.test.ts >/dev/null 2>&1); then ok "核心单测"; else bad "核心单测失败"; fi
+if (cd "$H" && node --no-warnings --test packages/core/test/goal.test.ts >/dev/null 2>&1); then ok "目标（Goal）单测"; else bad "目标单测失败"; fi
+if (cd "$H" && node --no-warnings --test packages/core/test/p0.test.ts packages/core/test/wiring.test.ts >/dev/null 2>&1); then ok "P0 能力单测（看图 / MCP / 子代理 / 定时 / 上下文）"; else bad "P0 单测失败"; fi
 
 echo "== 3. 冒烟（真实执行，不是纯函数）=="
-for s in smoke-turn smoke-subagent smoke-memory; do
+for s in smoke-turn smoke-subagent smoke-memory smoke-terminal smoke-mcp-resources; do
   if (cd "$H" && node --no-warnings "scripts/$s.ts" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
 done
 for s in smoke-routes.mjs smoke-cli-exit.mjs; do

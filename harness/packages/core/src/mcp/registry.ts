@@ -184,6 +184,19 @@ export class McpManager {
     return { connected, failed, skipped };
   }
 
+  /**
+   * 已连接的客户端（资源工具用）：顺序 = 配置顺序，只回**真正连上**的。
+   * 为什么需要它：资源（resources/*）不在工具桥的覆盖范围里，
+   * ListMcpResources / ReadMcpResource 必须拿到 client 本体才能发请求。
+   */
+  connectedClients(): { name: string; client: McpClient }[] {
+    const out: { name: string; client: McpClient }[] = [];
+    for (const st of this.#servers.values()) {
+      if (st.status === "connected" && st.client?.alive) out.push({ name: st.name, client: st.client });
+    }
+    return out;
+  }
+
   /** 当前所有 MCP 工具（Dove Tool 形态）；顺序稳定：配置顺序 × 工具名排序 */
   tools(): Tool[] {
     const out: Tool[] = [];

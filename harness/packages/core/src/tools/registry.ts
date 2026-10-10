@@ -23,6 +23,13 @@ import { KillShellTool } from "./builtin/kill-shell.ts";
 
 import { RecallTool } from "./builtin/recall.ts";
 import { RememberTool } from "./builtin/remember.ts";
+import { SleepTool } from "./builtin/sleep.ts";
+import { CurrentTimeTool } from "./builtin/current-time.ts";
+// P0 能力：看图 / 自己的上下文余量（常驻：模型必须知道「我能看图」「我快满了」）
+import { ReadImageTool } from "./builtin/read-image.ts";
+import { GetContextRemainingTool } from "./builtin/context-remaining.ts";
+// 交付物：把「已经写完的文件」声明给界面（渲染成卡片，可点开预览）
+import { PresentTool } from "./builtin/present.ts";
 
 // ── SYSTEM：元工具，永远在，不参与激活 ─────────────────
 import { AttemptCompletionTool } from "./builtin/attempt-completion.ts";
@@ -30,39 +37,68 @@ import { AskUserQuestionTool } from "./builtin/ask-user.ts";
 import { TodoWriteTool } from "./builtin/todo-write.ts";
 import { ToolSearchTool } from "./builtin/tool-search.ts";
 import { SkillTool } from "./builtin/skill.ts";
+// 计划模式 / 长期目标：元能力，永远在（各自只在对应状态下真正生效）
+import { ExitPlanModeTool } from "./builtin/exit-plan-mode.ts";
+import { CreateGoalTool } from "./builtin/goal-create.ts";
+import { GetGoalTool } from "./builtin/goal-get.ts";
+import { UpdateGoalTool } from "./builtin/goal-update.ts";
 
 // ── ON_DEMAND：检索后追加激活 ──────────────────────────
 import { WebSearchTool } from "./builtin/web-search.ts";
 import { WebFetchTool } from "./builtin/web-fetch.ts";
-import { GenerateImageTool } from "./builtin/generate-image.ts";
-import { generatePptTool } from "./builtin/generate-ppt.ts";
-import { generateVideoTool } from "./builtin/generate-video.ts";
 import { TaskTool } from "./builtin/task.ts";
 import { DispatchToProjectTool } from "./builtin/dispatch.ts";
 import { TaskOutputTool } from "./builtin/task-output.ts";
+// 持久终端（保持 cwd/环境）：先 ToolSearch 激活再上表
+import { TerminalOpenTool } from "./builtin/terminal-open.ts";
+import { TerminalSendTool } from "./builtin/terminal-send.ts";
+import { TerminalReadTool } from "./builtin/terminal-read.ts";
+import { TerminalCloseTool } from "./builtin/terminal-close.ts";
+import { TerminalListTool } from "./builtin/terminal-list.ts";
+import { ListAgentsTool } from "./builtin/list-agents.ts";
+import { SendMessageTool } from "./builtin/send-message.ts";
+import { InterruptAgentTool } from "./builtin/interrupt-agent.ts";
+import { ListMcpResourcesTool } from "./builtin/list-mcp-resources.ts";
+import { ReadMcpResourceTool } from "./builtin/read-mcp-resource.ts";
+import { CronCreateTool } from "./builtin/cron-create.ts";
+import { CronListTool } from "./builtin/cron-list.ts";
+import { CronDeleteTool } from "./builtin/cron-delete.ts";
 
 export const CORE_TOOLS: Tool[] = [
   ReadTool, WriteTool, EditTool, GlobTool, GrepTool,
   BashTool, BashOutputTool, KillShellTool,
 
   RecallTool, RememberTool,
+  // 只追加在 CORE 尾部：既有工具的 wire 顺序不变（缓存纪律）
+  SleepTool, CurrentTimeTool,
+  ReadImageTool, GetContextRemainingTool,
+  PresentTool,
 ];
 
 export const SYSTEM_TOOLS: Tool[] = [
   AttemptCompletionTool, AskUserQuestionTool, TodoWriteTool, ToolSearchTool, SkillTool,
   // Home 线程的调度能力；项目线程里也用得上（派活给别的项目）
   DispatchToProjectTool,
+  // 计划模式 / 目标：常驻，不进检索（模型必须知道「有计划模式这回事」「我有目标」）
+  ExitPlanModeTool, CreateGoalTool, GetGoalTool, UpdateGoalTool,
 ];
 
 export const ON_DEMAND_TOOLS: Tool[] = [
-  WebSearchTool, WebFetchTool, GenerateImageTool, generatePptTool, TaskTool, TaskOutputTool,
-  // 只追加，不动既有顺序（缓存纪律）
-  generateVideoTool,
+  WebSearchTool, WebFetchTool, TaskTool, TaskOutputTool,
+  // P0：子代理控制面 / MCP 资源 / 定时任务 —— 都要先 ToolSearch 激活（顺序只追加）
+  ListAgentsTool, SendMessageTool, InterruptAgentTool,
+  ListMcpResourcesTool, ReadMcpResourceTool,
+  CronCreateTool, CronListTool, CronDeleteTool,
+  TerminalOpenTool, TerminalSendTool, TerminalReadTool, TerminalCloseTool, TerminalListTool,
 ];
 
 /** 依赖闭包：激活左边的工具时，右边必须一起激活 */
 export const DEPENDENCY_CLOSURE: Record<string, string[]> = {
   Bash: ["BashOutput", "KillShell"],
+  // 会派子代理，就一并给出「看/追加/中断」的控制面（否则模型只能干等）
+  Task: ["TaskOutput", "ListAgents", "SendMessage", "InterruptAgent"],
+  // 终端四件套：激活 send 的必然也要 open/read/close，否则拿到 id 也没用
+  TerminalSend: ["TerminalOpen", "TerminalRead", "TerminalClose", "TerminalList"],
 };
 
 /** 必带补充集：任何情况下都不能被裁掉 */
@@ -199,11 +235,22 @@ export function systemTools(): Tool[] { return SYSTEM_TOOLS; }
 export const TOOL_KEYWORDS: Record<string, string[]> = {
   WebSearch: ["搜索", "网页", "联网", "查资料", "最新", "百度", "google", "搜一下"],
   WebFetch: ["抓取", "网页", "链接", "文档", "打开网址", "url", "读取网页"],
-  GenerateImage: ["图片", "配图", "生成图", "插画", "海报", "生图", "画一"],
-  GeneratePPT: ["ppt", "幻灯片", "演示", "大纲", "汇报", "课件", "提案"],
-  GenerateVideo: ["视频", "mp4", "短片", "轮播", "动画", "movie", "video"],
+  // GenerateImage / GeneratePPT / GenerateVideo 已移除 —— 生成类需求走技能（office-* / 图像技能）
   Task: ["子代理", "子任务", "派一个", "独立完成", "subagent"],
   TaskOutput: ["子代理", "后台任务", "进度", "task"],
+  ListAgents: ["子代理", "后台任务", "列表", "有哪些", "agent", "进度"],
+  SendMessage: ["子代理", "追加", "补充", "续跑", "消息", "send"],
+  InterruptAgent: ["中断", "停止", "取消", "掐掉", "子代理", "interrupt"],
+  ListMcpResources: ["mcp", "资源", "外部", "服务器", "resource"],
+  ReadMcpResource: ["mcp", "资源", "读取", "uri", "resource"],
+  CronCreate: ["定时", "计划", "cron", "提醒", "每天", "每隔", "schedule"],
+  CronList: ["定时", "计划", "cron", "任务列表", "什么时候跑"],
+  CronDelete: ["定时", "删除", "取消", "cron", "别跑了"],
+  TerminalOpen: ["终端", "shell", "命令行", "常驻", "持久", "pty", "terminal"],
+  TerminalSend: ["终端", "shell", "命令", "执行", "发命令", "terminal"],
+  TerminalRead: ["终端", "输出", "看结果", "回显", "terminal"],
+  TerminalClose: ["终端", "关闭", "杀掉", "结束会话", "terminal"],
+  TerminalList: ["终端", "会话列表", "有哪些终端", "terminal"],
 };
 
 /** CJK 2-gram：把无空格中文长词切成二元组，提升召回 */

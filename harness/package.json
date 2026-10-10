@@ -11,6 +11,7 @@
     "test": "node --no-warnings --test packages/core/test/*.test.ts",
     "smoke:routes": "node --no-warnings scripts/smoke-routes.mjs",
     "smoke:screen": "node --no-warnings scripts/smoke-screen-memory.ts",
+    "smoke:mcp-resources": "node --no-warnings scripts/smoke-mcp-resources.ts",
     "lint:size": "node tools/lint-file-size.mjs",
     "lint:layers": "node tools/lint-layering.mjs",
     "lint": "npm run lint:size && npm run lint:layers"
