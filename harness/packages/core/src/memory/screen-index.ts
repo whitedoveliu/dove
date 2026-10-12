@@ -12,21 +12,6 @@
  */
 import type { Db } from "../session/db.ts";
 
-/** 索引表（SCHEMA_VERSION 3 加进来的） */
-export const SCREEN_INDEX_SCHEMA = `
-CREATE TABLE IF NOT EXISTS activity_ocr_terms (
-  term        TEXT NOT NULL,
-  frame_id    TEXT NOT NULL,
-  snapshot_id TEXT NOT NULL,
-  session_id  TEXT,
-  occurrences INTEGER NOT NULL DEFAULT 1,
-  at          INTEGER NOT NULL,
-  PRIMARY KEY (term, frame_id)
-);
-CREATE INDEX IF NOT EXISTS idx_ocr_terms_term ON activity_ocr_terms(term);
-CREATE INDEX IF NOT EXISTS idx_ocr_terms_at ON activity_ocr_terms(at DESC);
-`;
-
 const CJK = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]/;
 const LATIN = /[a-z0-9]/;
 
@@ -113,6 +98,11 @@ export class ScreenIndex {
   /** 删帧时同步清索引 */
   unindex(frameId: string): void {
     this.#db.run("DELETE FROM activity_ocr_terms WHERE frame_id = ?", frameId);
+  }
+
+  /** 删快照时同步清索引：一快照一帧，按 snapshot_id 一把删干净（不留孤儿词条） */
+  unindexSnapshot(snapshotId: string): void {
+    this.#db.run("DELETE FROM activity_ocr_terms WHERE snapshot_id = ?", snapshotId);
   }
 
   /** 索引覆盖的帧数 */

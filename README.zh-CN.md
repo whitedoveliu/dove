@@ -79,11 +79,18 @@ dove run "修一下挂掉的测试" --thread <id>   # 跑一轮，流式打到 s
 dove approve --allow                        # 无人值守时批量表态待审批
 ```
 
-可选的本地向量模型（不装则记忆退化成字面匹配）：
+可选的本地向量模型。不装的话，记忆退化成字面匹配，屏幕记忆的向量腿也会关掉（词法腿照常）。
+**两步都要做**——只下模型是不够的：
 
 ```bash
+# 1) 装唯一那个外部依赖（隔离在这个包里；真正加载 ONNX 运行时的是它）
+cd harness/packages/embedding && npm install && cd -
+
+# 2) 下模型（约 24MB）
 node --no-warnings harness/packages/embedding/scripts/fetch-model.mjs
 ```
+
+内核每次启动都会报当前用的是哪个后端（`向量后端: onnx:bge-small-zh-v1.5` 或 `hash-1024`）。
 
 ## ⌨️ CLI
 

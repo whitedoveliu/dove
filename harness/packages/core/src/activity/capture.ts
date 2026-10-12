@@ -114,6 +114,9 @@ async function compress(raw: string, opts: CaptureOptions): Promise<{ ok: boolea
     renameSync(raw, out);
     return { ok: true, warning: `压缩失败，已保留原图：${r.error ?? ""}` };
   } catch (e) {
+    // 连搬都搬不过去时，raw 不能留在目录里：DB 不认识 `.raw-*.jpg`，
+    // 总量裁剪也扫不到它 —— 会一直占着磁盘（Fix 3）
+    try { unlinkSync(raw); } catch { /* ignore */ }
     return { ok: false, warning: `${r.error ?? ""}；原图保留失败：${String(e)}` };
   }
 }

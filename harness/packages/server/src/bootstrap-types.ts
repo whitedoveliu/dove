@@ -15,6 +15,7 @@ import type { EmotionService, FatigueService } from "../../core/src/emotion/inde
 import type { CronScheduler } from "../../core/src/scheduler/index.ts";
 import type { SchedulerHeartbeat } from "../../core/src/scheduler/index.ts";
 import type { ActivityRecorder } from "../../core/src/activity/index.ts";
+import type { CaptureHealthSnapshot } from "../../core/src/activity/health.ts";
 import type { McpPort } from "./mcp-wiring.ts";
 
 export interface Config {
@@ -91,6 +92,10 @@ export interface ActivityPort {
   init(): Promise<{ ok: boolean; screenPermission: boolean; note?: string }>;
   start(): void; stop(): void;
   captureNow(reason?: string): Promise<{ snapshotId?: string; skipped?: string }>;
+  /** 手动点火一批会话分析（POST /api/activity/analyze），返回处理条数 */
+  analyzePending(limit?: number): Promise<number>;
+  /** 库存统计 + 采集健康度（lastOkAt / lastError / counters，字段只增不改） */
+  stats(): { snapshots: number; bytes: number; lastCaptureAt?: number } & CaptureHealthSnapshot;
   listSnapshots(date?: string, limit?: number): unknown[];
   dailyReport(date: string): Promise<string>;
   weeklyReport(): Promise<string>;

@@ -139,7 +139,13 @@ export class ActivityStore {
     );
   }
 
+  /**
+   * 删快照（轮转/总量裁剪的唯一出口）：帧、索引、快照行一起删。
+   * 索引行必须跟着走 —— 否则检索还能在 activity_ocr_terms 里命中这一帧，
+   * 但元信息 join 不到（帧和快照都没了）→ 注入里出现一条正文为空、snapshotId 为空的僵尸条目。
+   */
   deleteSnapshot(id: string): void {
+    this.#index.unindexSnapshot(id);
     this.#db.run("DELETE FROM activity_ocr_frames WHERE snapshot_id = ?", id);
     this.#db.run("DELETE FROM activity_snapshots WHERE id = ?", id);
   }
@@ -165,7 +171,9 @@ export class ActivityStore {
    */
   insertOcrFrame(input: { snapshotId: string; sessionId?: string | null; text: string }): string {
     const id = `ocr_${randomUUID().slice(0, 12)}`;
-    const at = Date.now();
+    // 用快照自己的采集时间，不用 Date.now()：补写/轮转后写帧时，
+    // 时间戳必须是「屏幕上看到它的那一刻」，否则 24h 窗口与日报时段全错位。
+    const at = this.getSnapshot(input.snapshotId)?.timestamp ?? Date.now();
     this.#db.run(
       "INSERT OR REPLACE INTO activity_ocr_frames(id, snapshot_id, session_id, text, char_count, created_at) VALUES (?,?,?,?,?,?)",
       id, input.snapshotId, input.sessionId ?? null, input.text, input.text.length, at,

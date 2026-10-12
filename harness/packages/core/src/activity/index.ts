@@ -10,21 +10,20 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Db } from "../session/db.ts";
-import { SessionAnalyzer } from "./analyzer.ts";
+import { SessionAnalyzer, analyzeAndPersist } from "./analyzer.ts";
 import {
   CAPTURE_MAX_WIDTH, CAPTURE_QUALITY, PROBE_MAX_WIDTH, PROBE_QUALITY,
   SCREEN_PERMISSION_HINT, capture, isScreenRecordingAllowed, openPermissionSettings, screenIsLocked,
 } from "./capture.ts";
 import { DEDUPE_THUMB_WIDTH, Deduper, type DedupeResult, toBitmap } from "./dedupe.ts";
-import { OCR_EVERY_N, ocrImage } from "./ocr.ts";
-import { redact } from "./redact.ts";
+import { CaptureHealth, captureFailed, type CaptureHealthSnapshot } from "./health.ts";
+import { OCR_EVERY_N, ocrIntoStore } from "./ocr.ts";
 import { buildRangeSkeleton, buildSkeleton, collectDays, collectSessions, narrate } from "./report.ts";
 import { ActivityStore, dateKey, dayRange, DAY_MS } from "./store.ts";
 import { ActivityStorage, snapshotPath, startStorageSweeper, safeRead, safeUnlink } from "./storage.ts";
 import { TriggerEngine } from "./triggers.ts";
 import { ensureScreenPermission, screenPermissionNote } from "./permission.ts";
 import type { ActivityLlm, AnalysisResult, SnapshotRow, TriggerKind, TriggerMeta } from "./types.ts";
-import { emptyAnalysis } from "./types.ts";
 
 export const SESSION_GAP_MS = 30 * 60 * 1000;   // 超过 30 分钟没采 → 开新活动会话
 export const LOCK_POLL_MS = 15_000;             // 锁屏状态轮询间隔
@@ -80,6 +79,8 @@ export class ActivityRecorder {
   #screenPermission = false;
   #inited = false;
   #busy = false;
+  #analyzing = false;               // 分析重入守卫：一批分析要调 LLM，不能并发跑
+  #health = new CaptureHealth();    // 采集健康度（Fix 5：失败计数 + lastOkAt/lastError）
   #frameCount = 0;
   #sessionId: string | null = null;
   #lastCaptureAt = 0;
@@ -96,7 +97,9 @@ export class ActivityRecorder {
     this.#appInfo = opts.appInfo;
     this.#triggerIntervals = opts.triggerIntervals;
     this.#sweepIntervalMs = opts.sweepIntervalMs;
-    this.#ocrEvery = opts.ocrEvery ?? OCR_EVERY_N;
+    // 兜底再守一道：NaN / 0 / 负数都会让 `帧号 % every === 0` 永远不成立 → OCR 静默停摆
+    const every = opts.ocrEvery ?? OCR_EVERY_N;
+    this.#ocrEvery = Number.isFinite(every) && every > 0 ? every : OCR_EVERY_N;
     this.#sessionGapMs = opts.sessionGapMs ?? SESSION_GAP_MS;
     this.#now = opts.now ?? (() => Date.now());
     this.#store = new ActivityStore(this.#db);
@@ -113,6 +116,8 @@ export class ActivityRecorder {
   get enabled(): boolean { return this.#enabled; }
   get running(): boolean { return !!this.#triggers?.running; }
   get sessionId(): string | null { return this.#sessionId; }
+  /** 生效的 OCR 间隔（脏值已在构造时回退到 OCR_EVERY_N） */
+  get ocrEvery(): number { return this.#ocrEvery; }
 
   /** 初始化：建目录、探测屏幕录制权限、从库里恢复判重指纹 */
   async init(): Promise<{ ok: boolean; screenPermission: boolean; note?: string }> {
@@ -155,7 +160,10 @@ export class ActivityRecorder {
     this.#lockTimer.unref?.();
     this.#sweeper = startStorageSweeper(this.#storage, {
       ...(this.#sweepIntervalMs ? { intervalMs: this.#sweepIntervalMs } : {}),
-      onSweep: (stats) => this.#log("info", "存储巡检完成", { ...stats }),
+      onSweep: (stats) => {
+        this.#log("info", "存储巡检完成", { ...stats });
+        void this.analyzePending();     // 同一条 30 分钟节拍上点火分析（重入由 analyzePending 守卫）
+      },
     });
     void this.#sweeper.runNow();
   }
@@ -201,28 +209,26 @@ export class ActivityRecorder {
 
   /** 会话分析（会话关闭后调用；结果落 activity_sessions.summary） */
   async analyze(sessionId: string): Promise<AnalysisResult> {
-    try {
-      const session = this.#store.getSession(sessionId);
-      if (!session) return emptyAnalysis(`会话不存在：${sessionId}`);
-      const result = await this.#analyzer.analyze(session);
-      this.#store.saveAnalysis(sessionId, result);
-      this.#store.closeSession(sessionId, session.endedAt ?? this.#now());
-      await this.#pushMemories(result);
-      return result;
-    } catch (e) {
-      return emptyAnalysis(`分析异常：${String(e).slice(0, 200)}`);
-    }
+    return analyzeAndPersist(this.#store, this.#analyzer, sessionId, { remember: this.#remember, now: this.#now });
   }
 
-  /** 分析所有已结束但未分析的会话，返回处理条数 */
+  /**
+   * 分析所有已结束但未分析的会话，返回处理条数。
+   * 点火方：① #ensureSession 关闭会话时 ② 30 分钟存储巡检 ③ POST /api/activity/analyze。
+   * 这个方法以前**没有任何调用方** —— 88 个会话 0 个 analyzed_at，activity_summaries 一直空着。
+   * 当前正在采集的会话（#sessionId）跳过：它的内容还没写完，analyzed_at 一落就再也不会补。
+   */
   async analyzePending(limit = 20): Promise<number> {
+    if (this.#stopped || this.#analyzing) return 0;     // 关机竞态 + 重入守卫（分析要调 LLM，不能并发）
+    this.#analyzing = true;
     let done = 0;
     try {
       const rows = this.#store.sessionsBetween(0, this.#now(), 500)
-        .filter((s) => !s.analyzedAt && (s.snapshotCount ?? 0) > 0)
+        .filter((s) => !s.analyzedAt && s.id !== this.#sessionId && (s.snapshotCount ?? 0) > 0)
         .slice(0, limit);
       for (const s of rows) { await this.analyze(s.id); done++; }
-    } catch { /* ignore */ }
+    } catch (e) { this.#log("warn", "会话分析失败", { error: String(e).slice(0, 200) }); }
+    finally { this.#analyzing = false; }
     return done;
   }
 
@@ -265,9 +271,10 @@ export class ActivityRecorder {
     }
   }
 
-  stats(): { snapshots: number; bytes: number; lastCaptureAt?: number } {
-    try { return this.#store.snapshotStats(); }
-    catch { return { snapshots: 0, bytes: 0 }; }
+  /** 库存统计 + 采集健康度（Fix 5：只有 available:true 分不出「在采」和「采不动了」） */
+  stats(): { snapshots: number; bytes: number; lastCaptureAt?: number } & CaptureHealthSnapshot {
+    try { return { ...this.#store.snapshotStats(), ...this.#health.snapshot() }; }
+    catch { return { snapshots: 0, bytes: 0, ...this.#health.snapshot() }; }
   }
 
   // ── 内部 ───────────────────────────────────────────────
@@ -288,13 +295,15 @@ export class ActivityRecorder {
     // ① 判重专用低质量图（640/q40），只为算指纹
     const probePath = join(tmpdir(), `dove-probe-${process.pid}-${ts}.jpg`);
     const probe = await capture({ out: probePath, maxWidth: PROBE_MAX_WIDTH, quality: PROBE_QUALITY });
-    if (!probe.ok) return { skipped: `探测截图失败：${probe.error ?? "未知错误"}` };
+    this.#health.probe();
+    if (!probe.ok) return captureFailed(this.#health, ts, "探测截图失败", probe.error, this.#log.bind(this));
     const bitmap = await toBitmap(probePath, `${probePath}.bmp`, DEDUPE_THUMB_WIDTH);
     let verdict: DedupeResult;
     if (bitmap) verdict = this.#deduper.check(bitmap);
     else verdict = this.#deduper.checkRaw(safeRead(probePath));
     safeUnlink(probePath);
     if (verdict.duplicate) {
+      this.#health.dedupe();
       this.#log("info", "判重丢弃", { reason: verdict.reason });
       return { skipped: `判重丢弃（${verdict.reason}）` };
     }
@@ -308,7 +317,7 @@ export class ActivityRecorder {
       this.#deduper.reset();
       const last = this.#store.latestSnapshot();
       if (last?.hashHex) this.#deduper.seed(last.hashHex, last.histogram);
-      return { skipped: `截图失败：${full.error ?? "未知错误"}` };
+      return captureFailed(this.#health, ts, "截图失败", full.error, this.#log.bind(this));
     }
 
     // ③ 落库（指纹来自判重位图，保证同尺度可比）
@@ -321,6 +330,7 @@ export class ActivityRecorder {
         hashHex: fp?.hashHex ?? null, histogram: fp?.histogram ?? null,
         diffPct: verdict.diffPct ?? null, storageTier: "hot",
       });
+      this.#health.stored(ts);
     } catch (e) {
       const msg = String(e);
       // 关闭竞态不是真错误，降级成 debug，别在日志里刷红
@@ -328,36 +338,24 @@ export class ActivityRecorder {
         this.#log("debug" as never, "采集器已停止，本次快照丢弃", {});
         return { skipped: "采集器已停止" };
       }
+      this.#health.fail(ts, msg);
       this.#log("error", "快照入库失败", { error: msg.slice(0, 200) });
     }
     this.#lastCaptureAt = ts;
 
-    // ④ OCR：每 N 张跑一次，文本脱敏后入库
+    // ④ OCR：每 N 张跑一次，识别 → 脱敏 → 落库（含倒排索引）
     this.#frameCount++;
     if (this.#ocrEvery > 0 && this.#frameCount % this.#ocrEvery === 0) {
-      await this.#runOcr(id, sessionId, filePath);
+      await ocrIntoStore(this.#store, id, sessionId, filePath, this.#log.bind(this));
     }
     return { snapshotId: id };
-  }
-
-  async #runOcr(snapshotId: string, sessionId: string | null, filePath: string): Promise<string | null> {
-    try {
-      const r = await ocrImage(filePath);
-      if (r.error) { this.#log("warn", "OCR 降级", { error: r.error.slice(0, 200) }); return null; }
-      const clean = redact(r.text).text.trim();
-      if (!clean) return null;
-      this.#store.insertOcrFrame({ snapshotId, sessionId, text: clean });
-      return clean;
-    } catch (e) {
-      this.#log("warn", "OCR 异常", { error: String(e).slice(0, 200) });
-      return null;
-    }
   }
 
   #ensureSession(ts: number): string {
     if (this.#sessionId && ts - this.#lastCaptureAt <= this.#sessionGapMs) return this.#sessionId;
     if (this.#sessionId) {
       try { this.#store.closeSession(this.#sessionId, this.#lastCaptureAt || ts); } catch { /* ignore */ }
+      void this.analyzePending();     // 会话一关就点火分析（重入与异常都由 analyzePending 兜住）
     }
     const row = this.#store.openSession("heartbeat", ts);
     this.#sessionId = row.id;
@@ -368,14 +366,6 @@ export class ActivityRecorder {
     if (this.#lastMeta) return this.#lastMeta;
     if (!this.#appInfo) return undefined;
     try { return await this.#appInfo(); } catch { return undefined; }
-  }
-
-  async #pushMemories(result: AnalysisResult): Promise<void> {
-    if (!this.#remember || !result.memoryCandidates.length) return;
-    for (const candidate of result.memoryCandidates) {
-      try { await this.#remember(candidate.content, candidate.kind, "global"); }
-      catch { /* 单条失败不影响其他 */ }
-    }
   }
 
   #knownProjects(): string[] {

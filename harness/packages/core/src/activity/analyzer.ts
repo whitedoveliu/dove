@@ -208,3 +208,34 @@ export async function analyzeSession(
 ): Promise<AnalysisResult> {
   return new SessionAnalyzer(store, { ...opts, llm }).analyze(session);
 }
+
+/**
+ * 分析一个会话 → 落库 → 汇入记忆写入管线（T7.9）。
+ * 即 ActivityRecorder.analyze() 的实体（放在这里是因为那个文件顶着 400 行上限）；
+ * 任何失败都返回空结果，绝不抛。
+ */
+export async function analyzeAndPersist(
+  store: ActivityStore, analyzer: SessionAnalyzer, sessionId: string,
+  opts: {
+    remember?: (content: string, kind?: string, scope?: string) => Promise<string>;
+    now?: () => number;
+  } = {},
+): Promise<AnalysisResult> {
+  const now = opts.now ?? ((): number => Date.now());
+  try {
+    const session = store.getSession(sessionId);
+    if (!session) return emptyAnalysis(`会话不存在：${sessionId}`);
+    const result = await analyzer.analyze(session);
+    store.saveAnalysis(sessionId, result);
+    store.closeSession(sessionId, session.endedAt ?? now());
+    if (opts.remember) {
+      for (const candidate of result.memoryCandidates) {
+        try { await opts.remember(candidate.content, candidate.kind, "global"); }
+        catch { /* 单条失败不影响其他 */ }
+      }
+    }
+    return result;
+  } catch (e) {
+    return emptyAnalysis(`分析异常：${String(e).slice(0, 200)}`);
+  }
+}

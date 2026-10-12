@@ -33,6 +33,20 @@ for s in smoke-ptc smoke-jobs smoke-loop-audit smoke-goal-eval smoke-goal-events
   if (cd "$H" && node --no-warnings "scripts/$s.ts" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
 done
 
+# 屏幕记忆（真实截屏 + Vision OCR）。这类能力依赖「屏幕录制」权限：
+# 没权限时脚本自己降级成「⚠️ 跳过」并 exit 0 —— 这里把它显示出来，不当失败，
+# 否则没授权的机器上 verify 永远红，反而教人忽略它。
+echo "== 3c. 屏幕记忆冒烟（真实截屏 + OCR；无屏幕录制权限时降级为跳过）=="
+SMEM="$(cd "$H" && node --no-warnings scripts/smoke-screen-memory.ts 2>&1)"; SMEM_RC=$?
+if [ "$SMEM_RC" != "0" ]; then
+  bad "smoke-screen-memory 失败"; printf '%s\n' "$SMEM" | tail -6
+elif printf '%s' "$SMEM" | grep -q "跳过"; then
+  ok "smoke-screen-memory（无屏幕录制权限，已按降级跳过）"
+  printf '%s\n' "$SMEM" | grep "跳过"
+else
+  ok "smoke-screen-memory"
+fi
+
 echo "== 4. 服务健康 =="
 curl -s -m 5 http://localhost:8790/api/health | grep -q '"ok":true' && ok "内核 8790 健康" || bad "内核 8790 不健康（App 没在跑？）"
 curl -s -m 5 -o /dev/null -w "%{http_code}" http://localhost:8008/api/projects | grep -q 200 && ok "兼容层 8008 可访问" || bad "兼容层 8008 不可访问"

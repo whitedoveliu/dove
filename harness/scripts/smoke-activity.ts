@@ -6,7 +6,7 @@
  *      → 存储统计与轮转 → OCR（swiftc 编译 + 识别 + 降级）→ 会话分析 → 日报骨架 → 触发/降频
  * 环境相关能力（屏幕录制权限 / swiftc）缺失时按「降级说明」跳过，不影响整体 exit 0。
  */
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ActivityRecorder } from "../packages/core/src/activity/index.ts";
@@ -17,7 +17,7 @@ import { buildSkeleton, narrate } from "../packages/core/src/activity/report.ts"
 import { luhn, redact } from "../packages/core/src/activity/redact.ts";
 import { Deduper, fnv1a, histogram } from "../packages/core/src/activity/dedupe.ts";
 import { SCREEN_PERMISSION_HINT, isScreenRecordingAllowed, screenIsLocked } from "../packages/core/src/activity/capture.ts";
-import { OCR_EVERY_N, SWIFTC, ensureHelper, ocrImage, renderTextImage } from "../packages/core/src/activity/ocr.ts";
+import { OCR_EVERY_N, SWIFTC, ensureHelper, ocrEveryFromEnv, ocrImage, renderTextImage } from "../packages/core/src/activity/ocr.ts";
 import { TriggerEngine } from "../packages/core/src/activity/triggers.ts";
 import { Db } from "../packages/core/src/session/db.ts";
 
@@ -139,6 +139,11 @@ check("普通长数字不被误伤", !redact("订单号 1234567890123456").hits.
 section("5. 存储统计与轮转");
 const stats = recorder.stats();
 check("stats() 可运行", typeof stats.snapshots === "number" && typeof stats.bytes === "number", JSON.stringify(stats));
+// Fix 5：状态里必须能看出「在采」还是「采不动了」——只加字段，不动原有字段
+check("stats() 暴露 lastOkAt / lastError / 采集计数",
+  "lastOkAt" in stats && "lastError" in stats && typeof stats.counters?.probes === "number" &&
+  typeof stats.counters?.stored === "number" && typeof stats.counters?.deduped === "number" && typeof stats.counters?.failed === "number",
+  JSON.stringify({ lastOkAt: stats.lastOkAt, lastError: stats.lastError, counters: stats.counters }));
 const storage = new ActivityStorage(store, { configDir: CONFIG_DIR });
 const oldId = "snap_expired_smoke";
 const oldPath = join(CONFIG_DIR, "activity", "snapshots", "2000-01-01", `${oldId}.jpg`);
@@ -152,10 +157,35 @@ check("sweep() 返回结构化统计", typeof sweep.scanned === "number" && Arra
 check("超过 30 天的快照被删除（行）", !store.getSnapshot(oldId));
 check("超过 30 天的快照被删除（文件）", !existsSync(oldPath));
 check("统计随轮转更新", recorder.stats().snapshots <= stats.snapshots + 1);
+// Fix 3(ii)：压缩失败残留的 `.raw-*.jpg`（DB 没行、总量裁剪看不见）要由巡检清掉
+{
+  const rawDir = join(CONFIG_DIR, "activity", "snapshots", dateKey(Date.now()));
+  mkdirSync(rawDir, { recursive: true });
+  const rawFile = join(rawDir, "snap_leak.raw-999-1.jpg");
+  writeFileSync(rawFile, "stale raw leftover\n");
+  const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000);
+  utimesSync(rawFile, twoDaysAgo, twoDaysAgo);          // 装作是两天前残留的
+  const sweep2 = await storage.sweep();
+  check("残留 .raw-* 被巡检清掉（rawCleaned 计数）", !existsSync(rawFile) && sweep2.rawCleaned >= 1,
+    JSON.stringify({ rawCleaned: sweep2.rawCleaned, stillThere: existsSync(rawFile) }));
+}
 
 // ── 6. OCR ─────────────────────────────────────────────────
 section("6. OCR（Vision helper 运行时编译 + 识别 + 落库链路）");
 check("默认每 3 张跑一次 OCR", OCR_EVERY_N === 3, `OCR_EVERY_N=${OCR_EVERY_N}`);
+// Fix 6：脏值不能把 OCR 静默关死 —— `帧号 % NaN === 0` 永远不成立，OCR 就再也不跑了
+const ocrGate = (frame: number, every: number): boolean => every > 0 && frame % every === 0;
+const dirtyEvery = new ActivityRecorder({ db, configDir: CONFIG_DIR, enabled: true, ocrEvery: NaN, logger: quietLogger });
+check("ocrEvery=NaN 回退到 OCR_EVERY_N", dirtyEvery.ocrEvery === OCR_EVERY_N, `effective=${dirtyEvery.ocrEvery}`);
+const dirtyEveryStr = new ActivityRecorder({ db, configDir: CONFIG_DIR, enabled: true, ocrEvery: "abc" as unknown as number, logger: quietLogger });
+check("ocrEvery 传字符串（环境变量脏值）同样回退", dirtyEveryStr.ocrEvery === OCR_EVERY_N, `effective=${dirtyEveryStr.ocrEvery}`);
+check("回退后的闸门照常在第 3 帧命中（OCR 还在跑）", ocrGate(OCR_EVERY_N, dirtyEvery.ocrEvery) && ocrGate(3 * OCR_EVERY_N, dirtyEvery.ocrEvery));
+check("对照：NaN 原样传下去闸门永远打不开（就是要修的静默停摆）", !ocrGate(OCR_EVERY_N, NaN) && !ocrGate(3 * OCR_EVERY_N, NaN));
+check("DOVE_OCR_EVERY 脏值在解析层就被丢弃",
+  [ocrEveryFromEnv("abc"), ocrEveryFromEnv("0"), ocrEveryFromEnv("-2"), ocrEveryFromEnv("2.5"), ocrEveryFromEnv(" ")]
+    .every((o) => o.ocrEvery === undefined));
+check("DOVE_OCR_EVERY 合法值照常生效 / 没设就不覆盖",
+  ocrEveryFromEnv("1").ocrEvery === 1 && ocrEveryFromEnv("8").ocrEvery === 8 && ocrEveryFromEnv(undefined).ocrEvery === undefined);
 const hasSwiftc = existsSync(SWIFTC);
 if (!hasSwiftc) {
   const r = await ocrImage(join(TMP, "none.png"));
@@ -234,6 +264,43 @@ section("7. 会话分析与日报");
   const viaFacade = await rec2.analyze(sid);
   check("门面 analyze() 写回 activity_sessions.summary", !!store.getSession(sid)?.summary && viaFacade.worth);
   check("memoryCandidates 汇入记忆写入管线", remembered.length === 1 && remembered[0]!.includes("判重阈值"), remembered[0] ?? "");
+  // Fix 2：给 analyzePending 点火 —— 这个方法以前**没有任何调用方**（88 个会话 0 个 analyzed_at）
+  const seed = store.openSession("heartbeat", Date.now() - 60_000);
+  store.closeSession(seed.id, Date.now() - 30_000);
+  store.insertSnapshot({
+    id: "snap_pending", sessionId: seed.id, timestamp: Date.now() - 50_000, filePath: join(TMP, "pending.jpg"),
+    width: 1, height: 1, sizeBytes: 1, trigger: "heartbeat", appName: null, windowTitle: null,
+    hashHex: null, histogram: null, diffPct: 0, storageTier: "hot",
+  });
+  store.insertOcrFrame({ snapshotId: "snap_pending", sessionId: seed.id, text: "点火测试：会话关闭后必须有人把它分析掉。" });
+  await rec2.analyzePending();      // 先把存量清干净（包括采集器自己开的会话）
+  const pend = store.openSession("heartbeat", Date.now() - 60_000);
+  store.closeSession(pend.id, Date.now() - 30_000);
+  store.insertSnapshot({
+    id: "snap_pending2", sessionId: pend.id, timestamp: Date.now() - 50_000, filePath: join(TMP, "pending2.jpg"),
+    width: 1, height: 1, sizeBytes: 1, trigger: "heartbeat", appName: null, windowTitle: null,
+    hashHex: null, histogram: null, diffPct: 0, storageTier: "hot",
+  });
+  store.insertOcrFrame({ snapshotId: "snap_pending2", sessionId: pend.id, text: "重入守卫：同一时刻只允许一批分析在跑，并发两次不能都跑。" });
+  const [r1, r2] = await Promise.all([rec2.analyzePending(), rec2.analyzePending()]);
+  check("analyzePending 把已关闭会话分析掉（analyzed_at 落库）",
+    !!store.getSession(pend.id)?.analyzedAt && r1 + r2 >= 1,
+    `r1=${r1} r2=${r2} analyzed_at=${store.getSession(pend.id)?.analyzedAt}`);
+  check("重入守卫：并发两次只有一批真的跑", r1 === 0 || r2 === 0, `r1=${r1} r2=${r2}`);
+  // 手动触发路由：POST /api/activity/analyze 必须真的点到 analyzePending
+  const { handleServiceRoutes } = await import("../packages/server/src/routes-services.ts");
+  let routeLimit: number | undefined;
+  let routeBody = "";
+  const routeHandled = await handleServiceRoutes(
+    "/api/activity/analyze", new URL("http://smoke.local/api/activity/analyze?limit=5"),
+    { method: "POST" } as never, {} as never,
+    { activity: { analyzePending: async (limit?: number) => { routeLimit = limit; return 3; } } } as never,
+    (_res: unknown, _code: number, data: unknown) => { routeBody = JSON.stringify(data); },
+    async () => ({}),
+  );
+  check("POST /api/activity/analyze 可达 analyzePending 并回条数",
+    routeHandled === true && routeLimit === 5 && routeBody.includes('"analyzed":3'),
+    `handled=${routeHandled} limit=${routeLimit} body=${routeBody}`);
   const sessions = store.listSessions(dateKey(Date.now())).map((s) => ({
     id: s.id, project: s.summary?.project ?? "未归属项目", title: s.summary?.title ?? "活动片段（未分析）",
     description: s.summary?.description ?? "", topics: s.summary?.topics ?? [], highlights: s.summary?.highlights ?? [],
@@ -272,6 +339,47 @@ section("8. 触发与 debounce");
   const dInit = await disabled.init();
   check("enabled=false 时 ok=false + note", dInit.ok === false && !!dInit.note, dInit.note ?? "");
   check("enabled=false 时不截图（结构化 skipped）", !!(await disabled.captureNow()).skipped);
+}
+
+// ── 9. 采集失败不再静默（Fix 5）─────────────────────────────
+section("9. 采集健康度：失败要被记数 + 打日志 + 进状态");
+{
+  const s = recorder.stats();
+  if (allowed) {
+    check("成功采帧后 lastOkAt / probes / stored 都在动", s.lastOkAt !== null && s.counters.probes > 0 && s.counters.stored > 0,
+      JSON.stringify({ lastOkAt: s.lastOkAt, counters: s.counters }));
+  } else skip("成功路径计数", "无屏幕录制权限");
+  if (!allowed) {
+    skip("失败路径的实测", "无屏幕录制权限（probe 之前就返回了）");
+  } else {
+    // 把 configDir 指到一个**文件**上：探测图（落在 /tmp）照样能出，常规图一定写不进去 → 一次真实失败
+    const blocker = join(TMP, "config-not-a-dir");
+    writeFileSync(blocker, "not a directory\n");
+    const warnings: string[] = [];
+    const bad = new ActivityRecorder({
+      db, configDir: blocker, enabled: true,
+      logger: (lv: string, msg: string) => { if (lv === "warn") warnings.push(msg); },
+    });
+    const out = await bad.captureNow("manual");
+    const sb = bad.stats();
+    check("失败时仍返回结构化 skipped（不抛）", typeof out.skipped === "string" && out.skipped.length > 0, out.skipped ?? "");
+    check("counters.failed 记下这次失败（以前一直是 0）", sb.counters.failed >= 1, JSON.stringify(sb.counters));
+    check("lastError 带时间 + 原因", !!sb.lastError && sb.lastError.at > 0 && sb.lastError.message.length > 0, JSON.stringify(sb.lastError));
+    check("warn 日志真的发到 logger（以前完全静默）", warnings.length > 0, JSON.stringify(warnings.slice(0, 2)));
+  }
+  // 状态路由：/api/activity/status 必须把健康度摊出来（只加字段，不动原有字段）
+  const { handleServiceRoutes } = await import("../packages/server/src/routes-services.ts");
+  let statusBody = "";
+  const handled = await handleServiceRoutes(
+    "/api/activity/status", new URL("http://smoke.local/api/activity/status"),
+    { method: "GET" } as never, {} as never,
+    { activity: { stats: () => recorder.stats() } } as never,
+    (_res: unknown, _code: number, data: unknown) => { statusBody = JSON.stringify(data); },
+    async () => ({}),
+  );
+  check("GET /api/activity/status 里有 lastOkAt / counters（原有字段也在）",
+    handled === true && statusBody.includes('"lastOkAt"') && statusBody.includes('"counters"') &&
+    statusBody.includes('"snapshots"') && statusBody.includes('"available":true'), statusBody);
 }
 
 // ── 收尾 ────────────────────────────────────────────────────

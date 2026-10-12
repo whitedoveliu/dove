@@ -94,6 +94,13 @@ export async function handleServiceRoutes(
     json(res, 200, svc.activity ? await svc.activity.captureNow("manual") : { skipped: "未接入" });
     return true;
   }
+  // 手动点火会话分析（analyzePending 平时由「会话关闭」和「30 分钟巡检」两条路自动触发）
+  if (path === "/api/activity/analyze" && req.method === "POST") {
+    if (!svc.activity) { json(res, 200, { ok: false, analyzed: 0, note: "感知服务未接入" }); return true; }
+    const limit = Number(url.searchParams.get("limit") ?? 20);
+    json(res, 200, { ok: true, analyzed: await svc.activity.analyzePending(Number.isInteger(limit) && limit > 0 ? limit : 20) });
+    return true;
+  }
   if (path === "/api/activity/snapshots" && req.method === "GET") {
     json(res, 200, svc.activity ? svc.activity.listSnapshots(url.searchParams.get("date") ?? undefined, Number(url.searchParams.get("limit") ?? 50)) : []);
     return true;
