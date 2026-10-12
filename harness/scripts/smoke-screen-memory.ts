@@ -23,8 +23,9 @@ rmSync(TMP, { recursive: true, force: true }); mkdirSync(TMP, { recursive: true 
 
 const SENTINEL = "紫水晶协议";
 const SENTINEL2 = "海豚座第七码头";
-let pass = 0, fail = 0; const fails = [];
+let pass = 0, fail = 0, skipped = 0; const fails = [];
 const check = (n, ok, d = "") => { if (ok) { pass++; console.log("  ✓ " + n); } else { fail++; fails.push(n); console.log("  ✗ " + n + (d ? " — " + d : "")); } };
+const skip = (n, why) => { skipped++; console.log("  ⚠️  跳过 " + n + " — " + why); };
 
 // ── 1. 造一张内容已知的图（走 OCR helper 自己的渲染，不依赖窗口）─────
 console.log("1) 造一张内容已知的图");
@@ -110,18 +111,47 @@ db.run("DELETE FROM activity_ocr_terms");
 const rb = store.rebuildScreenIndex();
 check("rebuild 把索引补回来了", rb.frames > 0 && store.searchScreen(SENTINEL, { limit: 3 }).length > 0, JSON.stringify(rb));
 
-// ── 7. 真实截屏（只验「能截能 OCR」，不断言内容）────────
-console.log("\n7) 真实截屏（不断言屏幕上有什么 —— 那是焦点决定的，不是代码决定的）");
-const shot = `${TMP}/real.png`;
-execFileSync("/usr/sbin/screencapture", ["-x", "-t", "png", shot]);
-const realSize = Number(execFileSync("/usr/bin/stat", ["-f", "%z", shot], { encoding: "utf8" }).trim());
-check("screencapture 能出图（>100KB）", realSize > 100_000, (realSize / 1024).toFixed(0) + "KB");
-const real = await ocrImage(shot);
-check("真实截图 OCR 有输出（>50 字符）", (real.text ?? "").length > 50, (real.text ?? "").length + " 字符");
-const realFrame = store.insertOcrFrame({ snapshotId: snapId, sessionId: "s_real", text: real.text ?? "" });
-check("真实截图也进了索引", !!realFrame && store.screenIndexStats().frames >= 2);
+// ── 7. 轮转删快照 → 倒排索引一起删（Fix 3）──────────────
+console.log("\n7) 删快照要连 activity_ocr_terms 一起删（轮转走的就是这条路）");
+{
+  const { ActivityStorage } = await import("../packages/core/src/activity/storage.ts");
+  const goneId = "snap_rotated_" + Date.now().toString(36);
+  const goneText = "海运提单号 MSCU-7745211 已放行";
+  const goneAt = Date.now() - 40 * 86_400_000;
+  store.insertSnapshot({
+    id: goneId, sessionId: "s_rot", timestamp: goneAt, filePath: `${TMP}/gone.jpg`,
+    width: 10, height: 10, sizeBytes: 1, trigger: "heartbeat", appName: null, windowTitle: null,
+    hashHex: null, histogram: null, diffPct: 0, storageTier: "cold",
+  });
+  store.insertOcrFrame({ snapshotId: goneId, sessionId: "s_rot", text: goneText });
+  const goneFrame = store.listOcrFrames("s_rot", 5)[0];
+  check("OCR 帧的时间戳 = 快照的采集时间（不再写 Date.now()）", goneFrame?.createdAt === goneAt,
+    `frame=${goneFrame?.createdAt} 快照=${goneAt}`);
+  check("删除前：这帧能被检索到", store.searchScreen("海运提单号", { limit: 5 }).length > 0);
+  const sweep = await new ActivityStorage(store, { configDir: TMP }).sweep();
+  check("轮转把过期快照删掉了", !store.getSnapshot(goneId), JSON.stringify({ deleted: sweep.deleted }));
+  const left = Number(db.get("SELECT COUNT(1) AS n FROM activity_ocr_terms WHERE snapshot_id = ?", goneId)?.n ?? -1);
+  check("activity_ocr_terms 里 0 行（以前会留下孤儿词条）", left === 0, `剩 ${left} 行`);
+  check("检索不再命中（以前命中会带着空正文 + 空 snapshotId 回来）", store.searchScreen("海运提单号", { limit: 5 }).length === 0);
+}
+
+// ── 8. 真实截屏（只验「能截能 OCR」，不断言内容）────────
+console.log("\n8) 真实截屏（不断言屏幕上有什么 —— 那是焦点决定的，不是代码决定的）");
+const { isScreenRecordingAllowed } = await import("../packages/core/src/activity/capture.ts");
+if (!(await isScreenRecordingAllowed())) {
+  skip("真实截屏 OCR", "没有屏幕录制权限（探针截图不可用）—— 环境问题，不是代码问题");
+} else {
+  const shot = `${TMP}/real.png`;
+  execFileSync("/usr/sbin/screencapture", ["-x", "-t", "png", shot]);
+  const realSize = Number(execFileSync("/usr/bin/stat", ["-f", "%z", shot], { encoding: "utf8" }).trim());
+  check("screencapture 能出图（>100KB）", realSize > 100_000, (realSize / 1024).toFixed(0) + "KB");
+  const real = await ocrImage(shot);
+  check("真实截图 OCR 有输出（>50 字符）", (real.text ?? "").length > 50, (real.text ?? "").length + " 字符");
+  const realFrame = store.insertOcrFrame({ snapshotId: snapId, sessionId: "s_real", text: real.text ?? "" });
+  check("真实截图也进了索引", !!realFrame && store.screenIndexStats().frames >= 2);
+}
 
 console.log("\n" + "=".repeat(48));
-console.log(`结果：${pass} 通过 / ${fail} 失败`);
+console.log(`结果：${pass} 通过 / ${fail} 失败${skipped ? ` / ${skipped} 跳过` : ""}`);
 if (fails.length) { console.log("失败："); for (const f of fails) console.log("  - " + f); }
 process.exit(fail === 0 ? 0 : 1);

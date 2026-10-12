@@ -4,7 +4,7 @@
  * 分级：hot（1 天内）→ warm（7 天内，重压 1280×720 q40）→ cold（30 天内，640×360 q30）→ 删除
  * 总量：上限 10GB，超限从最老删到 7.5GB；30 分钟巡检一次。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { convert, imageSize } from "./capture.ts";
 import { DAY_MS, dateKey, type ActivityStore } from "./store.ts";
@@ -29,6 +29,8 @@ export interface SweepStats {
   tiered: number;
   deleted: number;
   freedBytes: number;
+  /** 压缩失败残留的 `.raw-*.jpg` 清理数（DB 不认识它们，总量裁剪管不到） */
+  rawCleaned: number;
   errors: string[];
 }
 
@@ -72,7 +74,7 @@ export class ActivityStorage {
 
   /** 一次巡检：分级重压 + 过期删除 + 总量收敛 */
   async sweep(): Promise<SweepStats> {
-    const stats: SweepStats = { scanned: 0, tiered: 0, deleted: 0, freedBytes: 0, errors: [] };
+    const stats: SweepStats = { scanned: 0, tiered: 0, deleted: 0, freedBytes: 0, rawCleaned: 0, errors: [] };
     const now = this.#now();
     for (const row of this.#store.tierRows()) {
       stats.scanned++;
@@ -103,7 +105,34 @@ export class ActivityStorage {
     const trim = await this.trimToLimit();
     stats.deleted += trim.deleted;
     stats.freedBytes += trim.freed;
+    const raw = this.#cleanRawLeftovers(now);
+    stats.rawCleaned = raw.cleaned;
+    stats.freedBytes += raw.freed;
     return stats;
+  }
+
+  /**
+   * 清掉压缩失败残留的 `.raw-<pid>-<ts>.jpg`：它们不是快照（DB 里没有行），
+   * 所以分级/总量裁剪都看不见 —— 不扫一遍就会永远躺在磁盘上。
+   * 只碰 mtime 超过一天的：正在采的那张 raw 还热着，不能误删。
+   */
+  #cleanRawLeftovers(now: number): { cleaned: number; freed: number } {
+    const out = { cleaned: 0, freed: 0 };
+    try {
+      const root = join(this.#configDir, "activity", "snapshots");
+      if (!existsSync(root)) return out;
+      for (const day of readdirSync(root, { withFileTypes: true })) {
+        if (!day.isDirectory()) continue;
+        for (const f of readdirSync(join(root, day.name), { withFileTypes: true })) {
+          if (!f.isFile() || !f.name.includes(".raw-")) continue;
+          const p = join(root, day.name, f.name);
+          try { if (now - statSync(p).mtimeMs < DAY_MS) continue; } catch { continue; }
+          const size = this.#removeFile(p);
+          if (size > 0) { out.cleaned++; out.freed += size; }
+        }
+      }
+    } catch { /* 清理失败不影响分级/裁剪 */ }
+    return out;
   }
 
   /** 超总量上限：从最老删到 7.5GB */

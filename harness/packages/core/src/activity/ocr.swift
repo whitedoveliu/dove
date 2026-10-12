@@ -1,7 +1,7 @@
 // dove-ocr —— Vision 文字识别 helper（M7 / T7.5）
 //
 // 用法：
-//   dove-ocr <image>                     识别图片文字，逐行写 stdout
+//   dove-ocr <image> [lang,lang,...]     识别图片文字，逐行写 stdout（语言表默认中文优先）
 //   dove-ocr --render <out.png> <text>   自测用：CoreText 渲染一张白底黑字图片
 //
 // 约束：只依赖 Vision / ImageIO / CoreGraphics / CoreText，不 import AppKit。
@@ -14,8 +14,11 @@ import CoreGraphics
 import CoreText
 import UniformTypeIdentifiers
 
-// 语言与识别精度（照抄规格：accurate + 语言校正 + en/zh-Hans/zh-Hant/ja）
-let OCR_LANGUAGES = ["en-US", "zh-Hans", "zh-Hant", "ja"]
+// 识别精度（照抄规格：accurate + 语言校正）。
+// ⚠️ 语言表的**顺序决定识别结果**，中文必须在前（实测记录见 recognize()）。
+// 这里是**兜底默认值**：正常路径下 TS 侧（ocr.ts 的 OCR_LANGUAGES）会把顺序经 argv[2] 传进来，
+// 只有参数缺失/为空时才用它。
+let DEFAULT_OCR_LANGUAGES = ["zh-Hans", "zh-Hant", "ja", "en-US"]
 
 func fail(_ code: Int32, _ message: String) -> Never {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
@@ -23,7 +26,7 @@ func fail(_ code: Int32, _ message: String) -> Never {
 }
 
 // ── OCR ───────────────────────────────────────────────────
-func recognize(path: String) -> [String] {
+func recognize(path: String, languages: [String]) -> [String] {
     let url = URL(fileURLWithPath: path)
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
         fail(3, "无法打开图片：\(path)")
@@ -37,8 +40,8 @@ func recognize(path: String) -> [String] {
     // ⚠️ 语言表的**顺序决定识别结果**，不是提示而是硬约束：
     //    实测 ["en-US","zh-Hans",...] 对纯中文画面只吐 "iX"（Vision 锁死在拉丁字母上），
     //    换成 ["zh-Hans",...] 才能读出「紫水晶协议」。
-    //    OCR_LANGUAGES 由 TS 侧传入，那里已经保证中文在前。
-    request.recognitionLanguages = OCR_LANGUAGES
+    //    顺序由 TS 侧（ocr.ts 的 OCR_LANGUAGES）经 argv[2] 传入，是这个顺序的唯一来源。
+    request.recognitionLanguages = languages
     // 让 Vision 自己也做一次语种判断（macOS 13+）。两条一起上更稳。
     if #available(macOS 13.0, *) { request.automaticallyDetectsLanguage = true }
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
@@ -90,6 +93,10 @@ if args.count >= 4 && args[1] == "--render" {
     exit(0)
 }
 guard args.count >= 2 else {
-    fail(2, "用法：dove-ocr <image> 或 dove-ocr --render <out.png> <text>")
+    fail(2, "用法：dove-ocr <image> [lang,lang,...] 或 dove-ocr --render <out.png> <text>")
 }
-print(recognize(path: args[1]).joined(separator: "\n"))
+// argv[2] 是逗号分隔的语言表（TS 侧传，中文在前）；缺失或为空则用中文优先的默认值
+let langs = args.count >= 3 && !args[2].isEmpty
+    ? args[2].components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    : []
+print(recognize(path: args[1], languages: langs.isEmpty ? DEFAULT_OCR_LANGUAGES : langs).joined(separator: "\n"))

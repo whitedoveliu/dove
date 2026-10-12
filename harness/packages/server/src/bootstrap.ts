@@ -29,6 +29,7 @@ import { TaskRegistry } from "../../core/src/agents/task-registry.ts";
 import { EmotionService, FatigueService } from "../../core/src/emotion/index.ts";
 import { CronScheduler, Heartbeat, makeCronOps } from "../../core/src/scheduler/index.ts";
 import { ActivityRecorder } from "../../core/src/activity/index.ts";
+import { ocrEveryFromEnv } from "../../core/src/activity/ocr.ts";
 import { makeTailState } from "./tail-state.ts";
 import { attachInputMonitor, detachInputMonitor } from "../../core/src/activity/focus.ts";
 import { providerLlm } from "../../core/src/memory/index.ts";
@@ -142,6 +143,8 @@ export async function bootstrap(cfg: Config): Promise<Services> {
   console.log(`[dove] 搜索后端: ${cfg.tavilyApiKey ? "tavily（已配 key）" : "抓取 Bing/DDG/百度（未配 TAVILY_API_KEY，质量较差）"}`);
   // 屏幕语义通道只在真向量上开：hash 降级是字面匹配，0.40 那个阈值是按 BGE 标定的尺度
   const screenEmbedder = embedder.note ? undefined : embedder.provider;
+  // 关掉是**有意为之**（不是故障），但要留一条说明：否则用户只会看到「屏幕记忆搜不到语义相似的内容」
+  if (!screenEmbedder) console.warn(`[dove] 屏幕向量腿已禁用（向量后端降级为 ${embedder.note}），只用词法腿`);
 
   let memory: MemoryService | null = null;
   try {
@@ -300,7 +303,8 @@ export async function bootstrap(cfg: Config): Promise<Services> {
         db, configDir: cfg.configDir,
         // OCR 很贵，默认每 3 帧一次。DOVE_OCR_EVERY=1 可以每帧都 OCR
         // （调参/联调时用；生产别设 1，CPU 吃不消）
-        ...(process.env.DOVE_OCR_EVERY ? { ocrEvery: Number(process.env.DOVE_OCR_EVERY) } : {}),
+        // 脏值（NaN / 0 / 负数 / 文字）在 ocrEveryFromEnv 里就告警丢弃了：NaN 会让 OCR 永久静默
+        ...ocrEveryFromEnv(process.env.DOVE_OCR_EVERY),
         llm: providerLlm(provider, cfg.toolModel),
         logger: (level, msg, data) => {
           if (level === "error" || level === "warn") console.log("[activity]", level, msg, data ?? "");
@@ -384,6 +388,7 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       start: () => activity!.start(),
       stop: () => activity!.stop(),
       captureNow: (reason?: string) => activity!.captureNow(reason),
+      analyzePending: (limit?: number) => activity!.analyzePending(limit),
       listSnapshots: (date?: string, limit?: number) => activity!.listSnapshots(date, limit) as never,
       dailyReport: (date: string) => activity!.dailyReport(date),
       weeklyReport: () => activity!.weeklyReport(),

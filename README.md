@@ -81,11 +81,18 @@ dove run "fix the failing test" --thread <id>   # one turn, streamed to stdout
 dove approve --allow                            # answer pending approvals headlessly
 ```
 
-Optional local embedding model (without it, memory falls back to literal matching):
+Optional local embedding model. Without it, memory falls back to literal matching and the screen-memory
+vector leg stays off (lexical matching still works). Both steps are needed — the model alone is not enough:
 
 ```bash
+# 1) the one external dependency, isolated in that package (this is what loads the ONNX runtime)
+cd harness/packages/embedding && npm install && cd -
+
+# 2) the model itself (~24 MB)
 node --no-warnings harness/packages/embedding/scripts/fetch-model.mjs
 ```
+
+The kernel reports which backend it got on every start (`向量后端: onnx:bge-small-zh-v1.5` vs `hash-1024`).
 
 ## ⌨️ CLI
 

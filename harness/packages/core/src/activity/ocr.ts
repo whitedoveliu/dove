@@ -3,7 +3,8 @@
  * - 源码是同目录的 ocr.swift；按内容 sha256 命名，缓存到 ~/.dove/cache/ocr-<hash>
  * - 首次数秒编译，之后直接复用（同内容只编译一次，进程内并发也只编译一次）
  * - 无 swiftc / 编译失败 / 识别失败 → { text: "", error }，绝不抛
- * - 「每 3 张跑一次」由上层按 OCR_EVERY_N 控制
+ * - 「每 3 张跑一次」由上层按 OCR_EVERY_N 控制；DOVE_OCR_EVERY 的解析收在 ocrEveryFromEnv()
+ * - 采集路径上的收尾（识别 → 脱敏 → 落库 + 建索引）收在 ocrIntoStore()
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
@@ -11,6 +12,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "./capture.ts";
+import { redact } from "./redact.ts";
+import type { ActivityStore } from "./store.ts";
 
 export const SWIFTC = "/usr/bin/swiftc";
 export const OCR_EVERY_N = 3;
@@ -23,6 +26,7 @@ export const OCR_EVERY_N = 3;
  *   en 优先 → "Chrome X1 448 / EX1E1 / KHET"
  *   zh 优先 → "Chrome 文件 编辑 / 显示 / 历史记录 书签 个人资料 标签页 窗口帮助"
  * 中文用户占多数，所以把中文放最前。
+ * 这里是顺序的**唯一来源**：ocrImage() 把它作为 argv[2] 传给 helper（helper 里只留兜底默认值）。
  */
 export const OCR_LANGUAGES = ["zh-Hans", "zh-Hant", "ja", "en-US"] as const;
 export const OCR_COMPILE_TIMEOUT_MS = 180_000;
@@ -94,12 +98,46 @@ export async function ocrImage(path: string): Promise<OcrResult> {
   if (!path || !existsSync(path)) return { text: "", error: `图片不存在：${path}` };
   const helper = await ensureHelper();
   if (!helper.ok || !helper.path) return { text: "", error: helper.error ?? "OCR helper 不可用" };
-  const r = await run(helper.path, [path], { timeoutMs: OCR_RUN_TIMEOUT_MS });
+  // argv[2]：语言表（中文在前，见 OCR_LANGUAGES 的注释）—— helper 以前硬编码了相反的顺序
+  const r = await run(helper.path, [path, OCR_LANGUAGES.join(",")], { timeoutMs: OCR_RUN_TIMEOUT_MS });
   if (r.code !== 0) {
     const detail = (r.stderr || r.error || "").trim().slice(0, 300);
     return { text: "", error: `OCR 执行失败（code=${r.code}）：${detail}` };
   }
   return { text: r.stdout.trim() };
+}
+
+/**
+ * 识别 → 脱敏 → 落库（含倒排索引）—— 采集路径上的 OCR 收尾。
+ * 任何失败都只 warn 并返回 null，绝不抛：OCR 坏了不能影响采集本身。
+ */
+export async function ocrIntoStore(
+  store: ActivityStore, snapshotId: string, sessionId: string | null, filePath: string,
+  log?: (level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) => void,
+): Promise<string | null> {
+  try {
+    const r = await ocrImage(filePath);
+    if (r.error) { log?.("warn", "OCR 降级", { error: r.error.slice(0, 200) }); return null; }
+    const clean = redact(r.text).text.trim();
+    if (!clean) return null;
+    store.insertOcrFrame({ snapshotId, sessionId, text: clean });
+    return clean;
+  } catch (e) {
+    log?.("warn", "OCR 异常", { error: String(e).slice(0, 200) });
+    return null;
+  }
+}
+
+/**
+ * DOVE_OCR_EVERY 的解析片段：合法 → { ocrEvery: n }；脏值 → 告警后丢弃。
+ * 为什么必须丢：`帧号 % NaN` 永远不等于 0 —— 把 NaN 传进记录器 = OCR 静默停摆到进程结束。
+ */
+export function ocrEveryFromEnv(raw: string | undefined): { ocrEvery?: number } {
+  if (!raw) return {};
+  const n = Number(raw);
+  if (Number.isInteger(n) && n > 0) return { ocrEvery: n };
+  console.warn(`[ocr] 忽略无效的 DOVE_OCR_EVERY="${raw}"（只接受正整数；NaN 会让 OCR 永久停摆）`);
+  return {};
 }
 
 /** 自测用：用同一个 helper 渲染一张含文字的 PNG */
