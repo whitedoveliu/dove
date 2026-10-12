@@ -1,7 +1,7 @@
 "use client";
 
-import { useRef, useState, useEffect } from "react";
-import { RefreshCw, CirclePower, Loader2, Settings2, History, Play, Plus, ChevronDown, Check, PanelRight, Globe, FolderTree, ScrollText } from "lucide-react";
+import { useRef, useState, useEffect, useMemo } from "react";
+import { RefreshCw, CirclePower, Loader2, Settings2, History, Play, Plus, ChevronDown, Check, PanelRight, Globe, FolderTree, ScrollText, TriangleAlert } from "lucide-react";
 import { resetProject, createProject, checkProjectExists, getVersionList, switchVersion, setPreviewVersion, VersionInfo, restartProjectServer } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -21,14 +21,21 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { PreviewFilesPane } from "@/components/preview-files-pane";
+import { normalizeProjectPath } from "@/lib/presented-files";
+import {
+  addressOf, filePreviewUrl, fileRelOf, frameSrcFor, isProxied, normalizePreviewInput,
+  type PreviewContext,
+} from "@/lib/preview-url";
 import { SessionLogView } from "@/components/session-log-view";
 import { cn } from "@/lib/utils";
 
 type PreviewTab = "files" | "browser" | "log";
 
-/** 裸域名（example.com / example.com:5173/path）也能当外部网址访问 */
-const BARE_HOST_RE =
-  /^[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|cn|org|net|io|dev|app|ai|co|me|xyz|top|info|gov|edu|sh|site|tech|cloud|live|fun|store|wiki|moe)(:\d+)?([/?#].*)?$/i;
+/** 刷新按钮用的 _dove=<n>：只加在 iframe 的 src 上，不动真实 URL / 代理参数 */
+function withNonce(src: string, nonce: number): string {
+  if (!src || !nonce) return src;
+  try { const u = new URL(src); u.searchParams.set("_dove", String(nonce)); return u.href; } catch { return src; }
+}
 
 interface PreviewPanelProps {
   url: string;
@@ -52,18 +59,27 @@ interface PreviewPanelProps {
   onStartDevServer?: () => void;  // 启动开发服务器（浏览器空态里的按钮）
   asideCollapsed?: boolean;  // 右侧对话区是否已折叠
   onToggleAside?: () => void;  // 折叠/展开右侧对话区
+  /** agent 产出的网页：直接在浏览器标签打开（force = 用户自己点的交付物卡片） */
+  openTarget?: { path: string; token: number; force?: boolean } | null;
+  /** 内核说「预览就绪」（preview_ready）→ 每次自增，把右侧切回浏览器标签 */
+  focusToken?: number;
 }
 
-export default function PreviewPanel({ url, iframeRef, historyVersion, latestVersion, onBackToLatest, projectId, onProjectSelect, onVersionChange, onRefreshPreview, isGenerating, isStartingServer, isSwitchingToCache, isRefreshingPreview, onBuildError, isSwitchingVersion: externalSwitching, onSwitchingVersionChange, devServerPort, onDevServerPortChange, onStartDevServer, asideCollapsed, onToggleAside }: PreviewPanelProps) {
+export default function PreviewPanel({ url, iframeRef, historyVersion, latestVersion, onBackToLatest, projectId, onProjectSelect, onVersionChange, onRefreshPreview, isGenerating, isStartingServer, isSwitchingToCache, isRefreshingPreview, onBuildError, isSwitchingVersion: externalSwitching, onSwitchingVersionChange, devServerPort, onDevServerPortChange, onStartDevServer, asideCollapsed, onToggleAside, openTarget, focusToken }: PreviewPanelProps) {
   const [tab, setTab] = useState<PreviewTab>("browser");
-    // 浏览器标签默认停在空态：用户点「运行开发服务器」或自己输网址后才接管
+  // 浏览器标签默认停在空态：用户点「运行开发服务器」或自己输网址后才接管
   const [currentUrl, setCurrentUrl] = useState("");
-  const wantRunRef = useRef(false);
-  // 无依赖数组：用户表达过"要运行"后，一旦 App 产出 url 就接管
-  useEffect(() => {
-    if (wantRunRef.current && url && url !== currentUrl) setCurrentUrl(url);
-  });
   const [inputUrl, setInputUrl] = useState(url);
+  const [addressError, setAddressError] = useState<string | null>(null);
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  /** 刷新计数：只影响 iframe 的 src（_dove=<n>），不破坏真实 URL / 代理参数 */
+  const [frameNonce, setFrameNonce] = useState(0);
+  /** 用户手动在地址栏输过 → 之后不再自动抢他的画面 */
+  const manualNavRef = useRef(false);
+  /** 当前画面是某个具体文件（agent 产出 / 用户点卡片）→ 不被项目预览顶掉 */
+  const pinnedFileRef = useRef(false);
+  /** 用户表达过「要运行」→ App 一产出预览地址就接管 */
+  const wantRunRef = useRef(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
   
@@ -82,40 +98,85 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
   // 服务器重启状态
   const [isRestartingServer, setIsRestartingServer] = useState(false);
   
-  // 从完整 URL 中提取路径部分（去掉 host、query 参数等）
-  const extractPath = (fullUrl: string): string => {
-    if (!fullUrl) return '/';
-    try {
-      const urlObj = new URL(fullUrl);
-      // 去掉 /preview/{projectId} 前缀（静态预览的情况）
-      let path = urlObj.pathname;
-      const previewPrefix = `/preview/${projectId}`;
-      if (path.startsWith(previewPrefix)) {
-        path = path.slice(previewPrefix.length) || '/';
-      }
-      return path || '/';
-    } catch {
-      // 如果不是有效的 URL，直接返回
-      return fullUrl.startsWith('/') ? fullUrl : '/';
-    }
-  };
+  // 地址归一化 / 代理判定用的上下文（面板里 projectId 就是端口号字符串）
+  const previewCtx: PreviewContext = useMemo(() => ({
+    projectId: projectId ?? null,
+    currentUrl,
+    devServerPort: devServerPort ?? null,
+    origin: typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:8790",
+    panelHost: typeof window !== "undefined" ? window.location.hostname : "127.0.0.1",
+  }), [projectId, currentUrl, devServerPort]);
+  const ctxRef = useRef(previewCtx);
+  ctxRef.current = previewCtx;
 
-  // 站内 URL 只显示路径，外部网址原样显示，方便再编辑
-  const formatAddress = (fullUrl: string): string => {
-    if (!fullUrl) return "";
-    try {
-      const urlObj = new URL(fullUrl);
-      const sameHost = typeof window === "undefined" || urlObj.hostname === window.location.hostname;
-      return sameHost ? extractPath(fullUrl) : fullUrl;
-    } catch {
-      return extractPath(fullUrl);
-    }
-  };
+  /** iframe 真正加载的地址：外站走同源代理，本机 / 项目预览直连 */
+  const frameSrc = useMemo(
+    () => withNonce(frameSrcFor(currentUrl, previewCtx), frameNonce),
+    [currentUrl, previewCtx, frameNonce],
+  );
+  const proxied = isProxied(currentUrl, previewCtx);
+  const staticPreview = /:8008\/preview\//.test(currentUrl) || fileRelOf(currentUrl, previewCtx) !== null;
 
+  // 切换项目：接管标志复位，重新跟随新项目的预览
   useEffect(() => {
+    manualNavRef.current = false;
+    pinnedFileRef.current = false;
+    setAddressError(null);
+  }, [projectId]);
+
+  // App / 内核给的项目预览地址 —— 自动跟随并切到浏览器标签；用户接管过就不抢
+  useEffect(() => {
+    if (!url) {
+      if (!manualNavRef.current && !pinnedFileRef.current) { setCurrentUrl(""); setInputUrl(""); }
+      return;
+    }
+    // 「用户点了运行」优先于接管标志：跑起来的开发服务器就是要接管画面
+    if (!wantRunRef.current && (manualNavRef.current || pinnedFileRef.current)) return;
+    wantRunRef.current = false;
     setCurrentUrl(url);
-    setInputUrl(formatAddress(url));
+    setInputUrl(addressOf(url, ctxRef.current));
+    setProxyError(null);
+    setTab("browser");
   }, [url, projectId]);
+
+  // agent 产出的网页（Present 的 .html / 用户点交付物卡片）→ 浏览器标签直接打开它
+  useEffect(() => {
+    if (!openTarget || !openTarget.path) return;
+    if (!openTarget.force && manualNavRef.current) return;   // 用户自己输过地址 → 不抢
+    const rel = normalizeProjectPath(openTarget.path);
+    pinnedFileRef.current = true;
+    setCurrentUrl(filePreviewUrl(rel, ctxRef.current));
+    setInputUrl(rel);
+    setAddressError(null);
+    setProxyError(null);
+    setFrameNonce((n) => n + 1);
+    setTab("browser");
+  }, [openTarget?.token]);
+
+  // 收到 preview_ready（focusToken 自增）→ 切回浏览器标签，让用户直接看到刚产出的页面
+  useEffect(() => {
+    if (!focusToken) return;
+    if (manualNavRef.current) return;   // 用户接管过地址栏 → 不抢
+    setTab("browser");
+  }, [focusToken]);
+
+  // 外站代理探针：只取状态与可读原因（不下载 body）；失败就在面板里显示原因
+  useEffect(() => {
+    if (!currentUrl || !isProxied(currentUrl, ctxRef.current)) { setProxyError(null); return; }
+    const probeUrl = frameSrcFor(currentUrl, ctxRef.current) + "&probe=1";
+    const ac = new AbortController();
+    let alive = true;
+    fetch(probeUrl, { signal: ac.signal, cache: "no-store", headers: { Accept: "application/json" } })
+      .then(async (r) => {
+        const data = await r.json().catch(() => null) as { ok?: boolean; message?: string } | null;
+        if (!alive) return;
+        // 老内核没有这个路由 → 返回的不是代理 JSON，此时保持安静，交给 iframe 自己显示
+        if (data && data.ok === false) setProxyError(data.message ?? `代理返回 ${r.status}`);
+        else setProxyError(null);
+      })
+      .catch(() => { /* 探针失败不打扰：iframe 里还有代理渲染的错误页 */ });
+    return () => { alive = false; ac.abort(); };
+  }, [currentUrl, frameNonce]);
 
   // 监听 iframe 内部导航，更新地址栏显示
   // 通过 postMessage 接收 iframe 发送的 URL 变化通知（解决跨域问题）
@@ -123,7 +184,7 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     const handleMessage = (event: MessageEvent) => {
       // 验证消息类型
       if (event.data?.type === 'IFRAME_URL_CHANGE' && event.data?.url) {
-        setInputUrl(extractPath(event.data.url));
+        setInputUrl(addressOf(String(event.data.url), ctxRef.current));
       }
     };
 
@@ -185,6 +246,9 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
       // 切换代码版本
       await switchVersion(version.commit_hash, projectId);
       onVersionChange?.(version.version_number);
+      // 用户主动切版本 = 主动看这个项目的预览 → 解除接管，让 url 跟着更新
+      manualNavRef.current = false;
+      pinnedFileRef.current = false;
       setShowVersionPopover(false);
       // 刷新预览
       onRefreshPreview?.();
@@ -250,8 +314,10 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
       setPortInput("");
       
       // 刷新预览
+      manualNavRef.current = false;
+      pinnedFileRef.current = false;
       const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
-      setCurrentUrl(`http://${host}:8008/preview/${port}/?_refresh=${Date.now()}`);
+      openUrl(`http://${host}:8008/preview/${port}/`, false);
     } catch (error) {
       console.error("进入项目失败:", error);
       alert(`进入项目失败: ${error}`);
@@ -260,59 +326,51 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     }
   };
 
-  // 根据输入的路径构建完整 URL
-  const buildFullUrl = (path: string): string => {
-    if (!projectId) return path;
-    
-    // 确保路径以 / 开头
-    const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-    
-    // 根据当前 URL 判断使用哪个 base
-    const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
-    try {
-      const urlObj = new URL(currentUrl);
-      if (urlObj.port && urlObj.port !== "8008") {
-        return `http://${host}:${urlObj.port}${normalizedPath}`;
-      }
-    } catch {
-      // ignore and fall through to default routing
-    }
-
-    if (devServerPort) {
-      return `http://${host}:${devServerPort}${normalizedPath}`;
-    }
-
-    return `http://${host}:8008/preview/${projectId}${normalizedPath}`;
-  };
-
-  // 把地址栏里的输入解析成可访问的完整 URL
-  const resolveInput = (raw: string): string => {
-    if (/^\/\//.test(raw)) return `https:${raw}`;
-    if (/^https?:\/\//i.test(raw)) return raw;   // 完整网址（含外部站点）直接访问
-    if (BARE_HOST_RE.test(raw)) return `https://${raw}`;  // example.com 这类裸域名
-    return buildFullUrl(raw);                     // 站内路径沿用原有规则
+  /** 打开一个地址：地址栏显示人话，iframe 用真实 URL（外站会自动走代理） */
+  const openUrl = (target: string, pinned?: boolean) => {
+    setCurrentUrl(target);
+    setInputUrl(addressOf(target, ctxRef.current));
+    if (pinned !== undefined) pinnedFileRef.current = pinned;
+    setAddressError(null);
+    setProxyError(null);
+    setFrameNonce((n) => n + 1);
   };
 
   const handleUrlChange = (e: React.FormEvent) => {
     e.preventDefault();
     const raw = inputUrl.trim();
     if (!raw) {
-      // 清空地址栏回车 → 回到「随时可以浏览」空态
+      // 清空地址栏回车 → 回到「随时可以浏览」空态，并把自动接管权交回去
+      manualNavRef.current = false;
+      pinnedFileRef.current = false;
       setCurrentUrl("");
       setInputUrl("");
+      setAddressError(null);
+      setProxyError(null);
       return;
     }
-    const next = resolveInput(raw);
-    setCurrentUrl(next);
-    setInputUrl(formatAddress(next));
+    const next = normalizePreviewInput(raw, ctxRef.current);
+    if (!next.ok) {
+      // 非法输入给明确提示，不静默变空白
+      setAddressError(next.message);
+      return;
+    }
+    manualNavRef.current = true;   // 用户接管：之后的项目预览 / 自动打开都不再抢
+    openUrl(next.url, next.kind === "file");
+  };
+
+  /** 空态里的「运行开发服务器」：先解除接管，再让 App 去启动 */
+  const handleStartDevServer = () => {
+    manualNavRef.current = false;
+    pinnedFileRef.current = false;
+    wantRunRef.current = true;
+    onStartDevServer?.();
   };
 
   const handleRefresh = () => {
     if (!currentUrl) return;
-    const timestamp = new Date().getTime();
-    // 在当前 URL 基础上添加刷新参数
-    const baseUrl = currentUrl.split('?')[0];
-    setCurrentUrl(`${baseUrl}?_refresh=${timestamp}`);
+    // 只换 iframe src 上的 _dove=<n>：代理参数、项目文件路径都不受影响
+    setFrameNonce((n) => n + 1);
   };
 
   const handleRestartServer = async () => {
@@ -325,10 +383,10 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
         console.log(`✅ 服务器重启成功: ${result.message}`);
         if (result.actual_port) {
           const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
-          const path = extractPath(currentUrl);
-          const nextUrl = `http://${host}:${result.actual_port}${path}`;
-          setCurrentUrl(nextUrl);
-          setInputUrl(path);
+          const path = addressOf(currentUrl, ctxRef.current);
+          manualNavRef.current = false;
+          pinnedFileRef.current = false;
+          openUrl(`http://${host}:${result.actual_port}${path}`);
           onDevServerPortChange?.(result.actual_port);
         }
         // 等待服务器启动后刷新预览
@@ -373,7 +431,8 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     setShowResetConfirm(false);
   };
 
-  const isStaticPreview = currentUrl.includes(':8008/preview/');
+  // 状态标签：静态（老预览 / 项目文件）/ 实时（dev server）/ 外站（走代理）
+  const previewKind: "static" | "live" | "external" = proxied ? "external" : (staticPreview ? "static" : "live");
 
   return (
     <div className="flex h-full flex-col overflow-hidden border-l border-border-subtle bg-surface-raised">
@@ -476,16 +535,18 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
                 placeholder="输入 URL 或路径，回车访问"
                 aria-label="地址栏"
               />
-              {/* 静态/实时状态标签（只读指示器） */}
+              {/* 静态 / 实时 / 外站 状态标签（只读指示器） */}
               {currentUrl && (
                 <span
                   className={cn(
                     "shrink-0 cursor-default rounded-sm px-1.5 py-0.5 font-mono text-2xs uppercase tracking-wide",
-                    isStaticPreview ? "bg-info-subtle text-info-fg" : "bg-success-subtle text-success-fg"
+                    previewKind === "static" && "bg-info-subtle text-info-fg",
+                    previewKind === "live" && "bg-success-subtle text-success-fg",
+                    previewKind === "external" && "bg-warning-subtle text-warning-fg",
                   )}
-                  title={currentUrl}
+                  title={proxied ? currentUrl + "（经同源代理）" : currentUrl}
                 >
-                  {isStaticPreview ? '静态' : '实时'}
+                  {previewKind === "static" ? "静态" : previewKind === "live" ? "实时" : "外站"}
                 </span>
               )}
               {/* 版本显示 - 点击展开版本列表 */}
@@ -615,6 +676,14 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
             </form>
           </div>
 
+          {/* 地址栏错误提示（非法输入 / 不支持的协议）—— 明确说出来，不静默变空白 */}
+          {addressError && (
+            <div className="mx-2 mb-1 flex items-start gap-1.5 rounded-md bg-danger-subtle px-2 py-1 text-2xs text-danger-fg">
+              <TriangleAlert className="mt-px size-3 shrink-0" />
+              <span className="min-w-0 flex-1 break-words">{addressError}</span>
+            </div>
+          )}
+
           {/* iframe 预览区域 */}
           <div className="relative min-h-0 flex-1 overflow-hidden bg-surface-inset">
             {/* 服务器启动提示 Toast + 遮罩 */}
@@ -656,10 +725,22 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
               </>
             )}
 
-            {currentUrl ? (
+            {currentUrl && proxyError ? (
+              /* 外站打不开：把代理给的结构化原因直接显示出来（而不是白屏） */
+              <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center">
+                <TriangleAlert className="size-6 text-danger" />
+                <p className="text-sm font-medium text-text-primary">打不开这个页面</p>
+                <p className="max-w-full break-words text-xs leading-relaxed text-text-tertiary">{proxyError}</p>
+                <p className="max-w-full break-all font-mono text-2xs text-text-disabled">{currentUrl}</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <Button size="sm" variant="outline" onClick={() => { setProxyError(null); setFrameNonce((n) => n + 1); }}>重试</Button>
+                  <Button size="sm" variant="ghost" onClick={() => { manualNavRef.current = false; pinnedFileRef.current = false; setProxyError(null); setCurrentUrl(""); setInputUrl(""); }}>清空</Button>
+                </div>
+              </div>
+            ) : currentUrl ? (
               <iframe
                 ref={iframeRef as React.LegacyRef<HTMLIFrameElement>}
-                src={currentUrl}
+                src={frameSrc}
                 className="w-full h-full border-0"
                 title="Preview"
               />
@@ -672,7 +753,7 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
                   action={
                     <Button
                       size="sm"
-                      onClick={() => onStartDevServer?.()}
+                      onClick={handleStartDevServer}
                       disabled={!projectId || !onStartDevServer || isStartingServer}
                       title={projectId ? "启动开发服务器" : "请先选择或新建任务"}
                     >

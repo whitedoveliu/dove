@@ -1,12 +1,11 @@
 /**
- * 老契约兼容层（8008 端口）
+ * 面板兼容层（8008 端口）
  *
- * 背景：control-panel 是已经调好的界面，**用户明确要求 UI 不要变**。
- * 它写死了 `http://<host>:8008` 这个后端地址，消费的是老 Python 后端那套 API 与事件词表。
- * 内核换成 TS 之后，我们不改界面，而是**在内核上重新实现这套契约** ——
- * 这样 UI 一行都不动，但背后已经是新内核。
+ * 背景：control-panel 写死了 `http://<host>:8008` 这个后端地址，
+ * 消费的是这一套 API 与事件词表。为了不动界面，这套契约在内核上重新实现了一遍 ——
+ * UI 一行都不动，背后就是内核本身。
  *
- * 老契约的权威来源：python/api_server.py（路由）与 python/agent_core.py（SSE 事件）。
+ * 老契约由本目录定义：HTTP 路由见各 routes-*.ts，SSE 事件词表见 sse-compat.ts。
  */
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -69,6 +68,24 @@ export function projectIdToPort(svc: Services, projectId: string): number | null
 
 export function portToProject(svc: Services, port: number): { id: string; name: string; path: string; port?: number } | null {
   const hit = svc.projects.list().find((p) => p.port === port);
+  return hit ? { id: hit.id, name: hit.name, path: hit.path, port: hit.port } : null;
+}
+
+/**
+ * 三键查找（端口 → 项目 id → 目录名）—— 权限 / 目标 / 插话等路由**共用同一份**。
+ *
+ * ⚠️ 只认端口不够：前端拿到的可能是 project.id，Number("pmuxxx") = NaN → 404 → 静默失败，
+ *    表现出来就是「选了权限但没生效」「插话没反应」。目录名也要认（dir_name 不一定等于 id）。
+ */
+export function findProjectByKey(
+  svc: Services, key: string,
+): { id: string; name: string; path: string; port?: number } | null {
+  const raw = String(key ?? "").trim();
+  if (!raw) return null;
+  const byPort = portToProject(svc, Number(raw));
+  if (byPort) return byPort;
+  const hit = svc.projects.get(raw)
+    ?? svc.projects.list().find((p) => p.path.split("/").filter(Boolean).pop() === raw);
   return hit ? { id: hit.id, name: hit.name, path: hit.path, port: hit.port } : null;
 }
 

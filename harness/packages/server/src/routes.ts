@@ -7,9 +7,12 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, extname } from "node:path";
 import type { Services } from "./bootstrap.ts";
+import { answerWithText } from "../../core/src/tools/builtin/ask-user.ts";
 import { SseHub } from "./sse.ts";
 import { handleServiceRoutes } from "./routes-services.ts";
+import { handlePreviewRoutes } from "./routes-preview.ts";
 import { handleThreadRoutes } from "./routes-threads.ts";
+import { handleToolRoutes } from "./routes-tools.ts";
 import { readRuntimeLog, listRuntimeFiles } from "../../core/src/session/runtime-log.ts";
 import { requestScreenPermission, resetAskedMarker } from "../../core/src/activity/permission.ts";
 
@@ -43,8 +46,6 @@ export interface RouteDeps {
   hub: SseHub;
   /** 产品界面：control-panel 的构建产物 */
   controlPanelDir: string;
-  /** 调试面板：harness/apps/panel 的构建产物（挂在 /debug） */
-  panelDir: string;
   running: Map<string, AbortController>;
 }
 
@@ -53,15 +54,10 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
   const path = url.pathname;
   const { svc, hub, running } = deps;
 
-  // 静态资源：
-  //   /          → control-panel（**产品的界面**，用户明确要求保留它）
-  //   /debug/*   → 新写的深色面板（记忆 / 定时 / 感知这些 control-panel 没有的视图）
+  // 静态资源：/ → control-panel（产品界面）
   if (!path.startsWith("/api/")) {
-    if (path === "/" || path.startsWith("/assets/") || path === "/logo.jpg" || path === "/favicon.ico") {
+    if (path === "/" || path.startsWith("/assets/") || path === "/dove-icon.png" || path === "/favicon.ico") {
       if (await serveStatic(path, res, deps.controlPanelDir)) return true;
-    }
-    if (path === "/debug" || path.startsWith("/debug/")) {
-      return serveStatic(path.replace(/^\/debug/, "") || "/", res, deps.panelDir);
     }
     return serveStatic(path, res, deps.controlPanelDir);
   }
@@ -139,7 +135,11 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
   }
   if (path === "/api/answer" && req.method === "POST") {
     const b = await readBody(req);
-    const ok = svc.pending.answer(String(b.questionId ?? ""), String(b.answer ?? ""));
+    const qid = String(b.questionId ?? "");
+    const text = String(b.answer ?? "");
+    // 先走 AskUserQuestion 自己的待答表（它按 toolCallId 索引），再兜底老的 registry
+    let ok = answerWithText(qid, text);
+    if (!ok) ok = svc.pending.answer(qid, text);
     json(res, 200, { ok });
     return true;
   }
@@ -183,6 +183,10 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
     } catch (e) { json(res, 500, { error: e instanceof Error ? e.message : String(e) }); }
     return true;
   }
+  // ── 预览：外站同源代理 + 项目内静态文件（面板「浏览器」标签）—— 拆到 routes-preview.ts
+  //    必须排在下面那条老路由前面：/api/preview/file 与 /api/preview/proxy 也会命中那个正则
+  if (await handlePreviewRoutes(path, url, req, res, svc, json)) return true;
+
   const previewMatch = /^\/api\/preview\/([^/]+)$/.exec(path);
   if (previewMatch) {
     const id = decodeURIComponent(previewMatch[1]!);
@@ -216,6 +220,9 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
 
   // ── M6 / M7 服务路由（情绪 / 疲劳 / 定时 / 心跳 / 感知）—— 拆到 routes-services.ts
   if (await handleServiceRoutes(path, url, req, res, svc, json, () => readBody(req))) return true;
+
+  // ── 工具控制面（PTC）：RunScript 脚本里的 doveTool / listTools 打这里 —— 拆到 routes-tools.ts
+  if (await handleToolRoutes(path, url, req, res, svc, json, () => readBody(req))) return true;
 
   // ── 日志与配置 ─────────────────────────────────────
   // 重新申请屏幕录制权限（默认只在首次启动问一次，这个接口给「我想开了」用）
@@ -282,15 +289,15 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
   return true;
 }
 
-async function serveStatic(path: string, res: ServerResponse, panelDir: string): Promise<boolean> {
-  if (!existsSync(panelDir)) {
+async function serveStatic(path: string, res: ServerResponse, dir: string): Promise<boolean> {
+  if (!existsSync(dir)) {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end("<h1>Dove Harness 已启动</h1><p>界面还没构建。请运行 <code>cd control-panel && npm install && npm run build</code>。</p>");
     return true;
   }
   const rel = path === "/" ? "index.html" : path.replace(/^\//, "");
-  const file = join(panelDir, rel);
-  const target = existsSync(file) ? file : join(panelDir, "index.html");
+  const file = join(dir, rel);
+  const target = existsSync(file) ? file : join(dir, "index.html");
   try {
     const data = await readFile(target);
     res.writeHead(200, { "Content-Type": MIME[extname(target)] ?? "application/octet-stream" });

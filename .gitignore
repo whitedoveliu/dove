@@ -34,5 +34,3 @@ models/
 
 # 系统
 .DS_Store
-__pycache__/
-*.pyc

@@ -41,13 +41,13 @@ fi
 # 向量模型（可选，没有就走降级）
 if [ ! -f "$HOME/.dove/models/Xenova/bge-small-zh-v1.5/onnx/model_quantized.onnx" ]; then
   echo "  ⚠ 向量模型没下（记忆检索会退化成字面匹配）"
-  echo "    想下的话跑：node --no-warnings packages/embedding/scripts/fetch-model.mjs"
+  echo "    想下的话跑：node --no-warnings harness/packages/embedding/scripts/fetch-model.mjs"
 fi
 echo
 
 # 起内核
 echo "  正在启动内核…"
-DOVE_PORT="$PORT" "$NODE" --no-warnings packages/server/src/main.ts &
+DOVE_PORT="$PORT" "$NODE" --no-warnings harness/packages/server/src/main.ts &
 HARNESS=$!
 
 # 退出时收干净

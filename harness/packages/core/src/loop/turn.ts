@@ -2,7 +2,7 @@
  * Agent 循环（T1.2 / T1.3）
  * 双层：内层 step（streamText + 工具往返）≤100；外层 turn（四道闸门）≤10。
  */
-import type { Provider, ChatMessage, ToolCallPayload } from "../providers/types.ts";
+import type { Provider, ChatMessage, ToolCallPayload, StreamResult } from "../providers/types.ts";
 import type { Usage } from "../session/types.ts";
 import type { Tool } from "../tools/types.ts";
 import { toWireSchemas } from "../tools/types.ts";
@@ -11,12 +11,21 @@ import type { ExecDeps, ExecOutcome } from "./tool-exec.ts";
 import { evaluateGates, newCounters, bumpCounter } from "./gates.ts";
 import type { GateId } from "./gates.ts";
 import { STEP_CAP, STEP_CAP_COMPACTION_BONUS } from "../constants.ts";
+// mt / 记忆块注入只有这一个正确实现（第一条 text part），循环层不再自己拼字符串
+import { injectIntoLastUser } from "../context/tail-context.ts";
 
 export interface TurnHooks {
   onText?: (delta: string, full: string) => void;
   onReasoning?: (delta: string, full: string) => void;
   onToolStart?: (call: ToolCallPayload) => void;
   onToolResult?: (o: ExecOutcome) => void;
+  /**
+   * **每个 step 的 provider 流结束时**调用（不论成功失败）。
+   * 为什么必须按 step 而不是按轮：调用方的流式缓冲（脱敏回看窗口）会把短回复整段扣住，
+   * 只在整轮结束才放的话，多个 step 的文本会被拼成一条、且日志里看不到中间说过什么
+   * （见 agent/text-collector.ts 顶部）。
+   */
+  onStreamEnd?: () => void;
   onAssistantMessage?: (text: string, calls: ToolCallPayload[]) => void;
   /** 每个 step 结束后的真实用量（用于压缩阈值估算） */
   onUsage?: (u: { inputTokens: number; outputTokens: number; cacheReadTokens: number }) => void;
@@ -49,6 +58,8 @@ export interface TurnDeps {
   signal?: AbortSignal;
   maxSteps?: number;
   isSubagent?: boolean;
+  /** 跳过完成守卫（心跳回合：它的"完成"就是 HEARTBEAT_OK，见 loop/gates.ts 的说明） */
+  skipCompletionGuard?: boolean;
   hooks?: TurnHooks;
 }
 
@@ -70,18 +81,18 @@ function mergeUsage(a: Usage, b: Usage): Usage {
   };
 }
 
-/** 把 mt 与记忆块 prepend 到最后一条 user 消息（缓存友好的关键） */
+/**
+ * 把 mt 与记忆块 prepend 到最后一条 user 消息（缓存友好的关键）
+ *
+ * ⚠️ 一律转交 context/tail-context.ts 的 injectIntoLastUser —— 它是「贴进最后一条 user
+ *    消息的**第一个 text part**」的唯一正确实现。这里原来自己又写了一遍字符串拼接版，
+ *    而且对块状 content 走 `JSON.stringify`：一旦最后一条 user 消息带 image_url 块
+ *    （ReadImage 之后的历史就是这种形态），注入的就不是「前缀 + 原文」，
+ *    而是把整条消息**压平成一串假 JSON 文本**，图片和文本边界全丢 —— provider 侧要么
+ *    直接报非法消息，要么模型看到一堆它没说过的话。
+ */
 export function applyTailContext(messages: ChatMessage[], mt?: string, memories?: string): ChatMessage[] {
-  if (!mt && !memories) return messages;
-  const out = [...messages];
-  let idx = -1;
-  for (let i = out.length - 1; i >= 0; i--) if (out[i]!.role === "user") { idx = i; break; }
-  if (idx < 0) return out;
-  const m = out[idx]!;
-  const prefix = [mt ? `[Context: ${mt}]` : "", memories ?? ""].filter(Boolean).join("\n\n");
-  const body = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-  out[idx] = { ...m, content: prefix + "\n\n" + body };
-  return out;
+  return injectIntoLastUser(messages, mt ?? "", memories);
 }
 
 /** 系统提示词 → provider 消息（支持双 system 块，供 Anthropic 类 provider 吃缓存） */
@@ -120,6 +131,7 @@ export async function runTurn(deps: TurnDeps): Promise<TurnResult> {
   let totalSteps = 0;
   let sawVisibleOutput = false;
   let sawAttemptCompletion = false;
+  let sawPermissionDenied = false;
   let aborted = false;
   let endReason = "stop";
   let hadToolCalls = false;
@@ -139,23 +151,42 @@ export async function runTurn(deps: TurnDeps): Promise<TurnResult> {
 
       let fullText = "";
       let fullReasoning = "";
-      const stream = await deps.provider.stream({
-        model: deps.model,
-        messages: buildWireMessages(deps.systemPrompt, messages, deps.dualSystem),
-        tools: buildWireTools(),
-        toolChoice: deps.isSubagent && step >= stepCap ? "none" : "auto",
-        signal: deps.signal,
-        reasoningEffort: "high",
-        onUsage: (u) => deps.hooks?.onUsage?.(u),
-        onTextDelta: (d) => { fullText += d; deps.hooks?.onText?.(d, fullText); },
-        onReasoningDelta: (d) => { fullReasoning += d; deps.hooks?.onReasoning?.(d, fullReasoning); },
-      });
+      // ⚠️ provider.stream **会抛**：fetch 的 DNS/连接错误、流中途断开、
+      //    abort 都不是「返回一个带 error 的结果」，而是直接 reject
+      //    （见 providers/openai-compat.ts —— 只有 HTTP 非 2xx 才走 stream.error）。
+      //    这里不兜住的话异常会穿过整个 runTurn 冒到 AgentRuntime.run，
+      //    于是**收尾那一段全被跳过**：没有 turn_end、没有 interrupted、没有落库的
+      //    assistant 消息、也没有回合后的记忆写入 —— 用户那边就是「发了消息什么都没发生」
+      //    （清单 B⑫：回合结束是唯一的收尾触发点，异常路径不能绕过它）。
+      let stream: StreamResult;
+      try {
+        stream = await deps.provider.stream({
+          model: deps.model,
+          messages: buildWireMessages(deps.systemPrompt, messages, deps.dualSystem),
+          tools: buildWireTools(),
+          toolChoice: deps.isSubagent && step >= stepCap ? "none" : "auto",
+          signal: deps.signal,
+          reasoningEffort: "high",
+          onUsage: (u) => deps.hooks?.onUsage?.(u),
+          onTextDelta: (d) => { fullText += d; deps.hooks?.onText?.(d, fullText); },
+          onReasoningDelta: (d) => { fullReasoning += d; deps.hooks?.onReasoning?.(d, fullReasoning); },
+        });
+      } catch (e) {
+        stream = {
+          text: "", reasoning: "", toolCalls: [],
+          usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+          finishReason: "error",
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
 
       totalUsage = mergeUsage(totalUsage, {
         inputTokens: stream.usage.inputTokens, outputTokens: stream.usage.outputTokens,
         cacheReadTokens: stream.usage.cacheReadTokens, cacheWriteTokens: stream.usage.cacheWriteTokens,
       });
       if (stream.text) sawVisibleOutput = true;
+      // 先放尾巴再判错误：流失败也要把已经吐出来的那部分交给调用方
+      deps.hooks?.onStreamEnd?.();
       if (stream.error) { endReason = "error"; break; }
 
       deps.hooks?.onAssistantMessage?.(stream.text, stream.toolCalls);
@@ -172,6 +203,13 @@ export async function runTurn(deps: TurnDeps): Promise<TurnResult> {
       const outcomes = await executeBatch(stream.toolCalls, { ...deps.execDeps, tools: deps.tools });
       for (const o of outcomes) {
         if (o.toolName === "AttemptCompletion") sawAttemptCompletion = true;
+        // ⚠️ 这一行以前是 `sawPermissionDenied: false`（写死在 evaluateGates 的入参里），
+        //    于是闸门③「权限续跑」**永远不可能开火** —— gates.ts 里那条提醒、
+        //    PERMISSION_CONTINUE_RETRIES 计数器、permission-continue 这个 GateId 全是死代码。
+        //    实测后果：用户拒绝一次操作后，模型不会被告知（它只看到工具结果里那句
+        //    "[权限] 用户拒绝了这次操作"），于是要么原地重试同一条命令、要么直接收尾，
+        //    用户看到的就是一个**没有任何产出的回合**。
+        if (o.denied) sawPermissionDenied = true;
         deps.hooks?.onToolResult?.(o);
         messages.push({
           role: "tool", tool_call_id: o.toolCallId, name: o.toolName,
@@ -192,9 +230,10 @@ export async function runTurn(deps: TurnDeps): Promise<TurnResult> {
 
     const pairs = countToolPairs(messages);
     const decision = evaluateGates({
-      steerPending: deps.steerPending(), sawAttemptCompletion, sawPermissionDenied: false,
+      steerPending: deps.steerPending(), sawAttemptCompletion, sawPermissionDenied,
       finishReason: endReason, toolCallCount: pairs.calls, toolResultCount: pairs.results,
       sawVisibleOutput, hadToolCalls, aborted,
+      skipCompletionGuard: deps.skipCompletionGuard,
     }, counters);
 
     if (!decision.gate) break;
@@ -207,6 +246,9 @@ export async function runTurn(deps: TurnDeps): Promise<TurnResult> {
     } else if (decision.reminder) {
       messages.push({ role: "user", content: decision.reminder });
       reminded = true;
+      // 提醒过一次就清标记（和完成守卫一样）：否则拒绝是同一次、提醒会重复发，
+      // 反而把模型绕进「我是不是又踩了什么」的自我怀疑里。
+      if (decision.gate === "permission-continue") sawPermissionDenied = false;
       sawAttemptCompletion = false;
     }
     if (!folded && !reminded) break;

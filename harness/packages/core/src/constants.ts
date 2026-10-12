@@ -40,8 +40,58 @@ export const OUTPUT_FIELD_LIMITS: Record<string, number> = {
 };
 export const OUTPUT_DEFAULT_STRING_LIMIT = 900;
 
+// ── PTC：RunScript（模型写代码调用工具，Alma §3.4） ────
+/** 脚本默认超时（与 Alma 同值） */
+export const PTC_DEFAULT_TIMEOUT_MS = 120_000;
+/** 脚本超时上限（与 Alma 同值，10 分钟） */
+export const PTC_MAX_TIMEOUT_MS = 600_000;
+/**
+ * RunScript **工具本身**的超时（executeOne 的 race 上限）。
+ * 必须大于脚本自己的超时：否则脚本还没到点就被外层 race 掐掉，
+ * 模型拿到的是「工具 RunScript 超时」，而脚本的 stdout / 超时说明全丢 —— 那是静默失败。
+ */
+export const PTC_PARENT_TIMEOUT_MS = PTC_MAX_TIMEOUT_MS + 60_000;
+/**
+ * 脚本内 doveTool 等内核的 HTTP 等待上限（兜底值）。
+ * 脚本请求会在审批上阻塞，所以执行器会按脚本的 timeout_ms 把它**下调**（见 run-script.ts）：
+ * 让脚本在被子进程超时杀掉之前，先自己报一条「等内核等超时了」的错。
+ */
+export const PTC_INVOKE_TIMEOUT_MS = 600_000;
+/**
+ * 单条流（stdout / stderr）留在内存里的硬上限，超了就地截断。
+ * 256k 与 Alma 的执行器同档；完整内容仍由 budget.ts 落盘回写路径。
+ */
+export const PTC_STREAM_HARD_CAP = 256_000;
+
 // ── 审批 ──────────────────────────────────────────────
 export const APPROVAL_CLASSIFIER_TIMEOUT_MS = 10_000;
+
+/** 等用户点「允许 / 拒绝」的默认上限：5 分钟。**默认值不动**，只是变成可配置。 */
+export const APPROVAL_TIMEOUT_MS = 300_000;
+
+/**
+ * 生效的审批等待上限。
+ *
+ * 为什么要有：实测（10-06/07 日志）审批挂满 5 分钟 → 自动拒绝 → 那一轮白跑，
+ * 用户回来只看到失败。超时本身可以保留（不能无限等），但**必须能调**：
+ * 离开工位前把 DOVE_APPROVAL_TIMEOUT_MS 调大，比回来发现活白干了强。
+ * 非法值（NaN / ≤0）一律退回默认，避免一个手滑的环境变量把审批直接掐成 0 毫秒。
+ */
+export function approvalTimeoutMs(): number {
+  const raw = Number(process.env.DOVE_APPROVAL_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : APPROVAL_TIMEOUT_MS;
+}
+
+/** 毫秒 → 「5 分钟」/「30 秒」/「1.5 小时」（写给用户看的，不要出现裸毫秒数） */
+export function humanDuration(ms: number): string {
+  if (ms < 1000) return Math.round(ms) + " 毫秒";
+  const s = ms / 1000;
+  if (s < 60) return (Number.isInteger(s) ? s : s.toFixed(1)) + " 秒";
+  const m = s / 60;
+  if (m < 60) return (Number.isInteger(m) ? m : m.toFixed(1)) + " 分钟";
+  const h = m / 60;
+  return (Number.isInteger(h) ? h : h.toFixed(1)) + " 小时";
+}
 
 // ── 记忆 ──────────────────────────────────────────────
 export const MEMORY_DEFAULTS = {
@@ -149,6 +199,26 @@ export const CONTEXT_NEAR_COMPACT_FRACTION = 0.85;
 
 // ── 主动性 ────────────────────────────────────────────
 export const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
+
+/**
+ * 心跳自检清单的兜底文本（**单点定义**，两处读它）：
+ *   - scheduler/heartbeat.ts：HEARTBEAT.md 缺失时的兜底清单；
+ *   - memory/files.ts：首次运行落盘成 <configDir>/HEARTBEAT.md。
+ *
+ * 纪律：清单里的每一项都必须能用**只读工具**回答（RuntimeStatus / Read / Glob / Grep / Recall）。
+ * 实测病灶：清单原来问「有没有没跑完的任务」，而 Home 线程拿不到 Bash、
+ * 也没有任何「看运行状态」的工具 —— 模型只能猜，每次心跳 1–4 步就 HEARTBEAT_OK，
+ * 自检形同虚设。加问题之前先确认有工具能答。
+ */
+export const HEARTBEAT_CHECKLIST_TEXT: string = [
+  "# HEARTBEAT · 主动性检查单",
+  "",
+  "> 每次心跳醒来时按这份清单自检；没事做就安静待着，不要刷存在感。",
+  "",
+  "- 有没有没跑完的任务？（RuntimeStatus：后台任务 / 子代理）",
+  "- 有没有快到期、已经过期或该提醒的事？（RuntimeStatus 的定时任务 next_run；今天日记里的约定）",
+  "- 有没有已经产出、值得说一句的进展？（Glob/Read 看 outputs/ 与 memory/今天.md 有没有新东西）",
+].join("\n");
 
 /**
  * 定时任务「短到会烧钱」的警戒线。

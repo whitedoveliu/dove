@@ -2,12 +2,12 @@
 <html lang="zh-CN" suppressHydrationWarning>
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/jpeg" href="/logo.jpg" />
+    <link rel="icon" type="image/png" href="/dove-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f8fa" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#181a1f" />
     <meta name="description" content="Dove — 实时控制台" />
-    <title>Dove — AI 网站生成控制台</title>
+    <title>Dove — 编码 Agent 控制台</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
     <link
@@ -18,7 +18,7 @@
       (function () {
         try {
           var fromQuery = new URLSearchParams(location.search).get("theme");
-          var stored = fromQuery || localStorage.getItem("aperture-theme");
+          var stored = fromQuery || localStorage.getItem("dove-theme");
           var mode = stored === "light" || stored === "dark" || stored === "system" ? stored : "light";
           var dark = mode === "dark" ||
             (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);

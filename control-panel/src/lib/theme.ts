@@ -7,7 +7,7 @@ export type ThemeMode = "light" | "dark" | "system";
 /** 默认主题：深色（Codex 风格以深色为主） */
 export const DEFAULT_THEME: ThemeMode = "light";
 
-const STORAGE_KEY = "aperture-theme";
+const STORAGE_KEY = "dove-theme";
 
 function systemPrefersDark() {
   return typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches;

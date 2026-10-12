@@ -5,6 +5,8 @@
  * - edit / pause / resume 是**人类的动作**：模型只在用户明确要求时做，不要自作主张暂停或改目标；
  * - complete / blocked 模型可以做：complete 只在**真的做完并验证过**时用；
  *   blocked 只在同一个具体条件跨多轮都没解决时用，必须写 blocked_reason。
+ * - 带验收标准（criteria）的目标另外过一道**独立评估**：评估没过时 complete 会被拒
+ *   （GOAL_EVAL_FAILED），错误里带着失败项 —— 那是下一轮要补的活，不是让你改标准。
  */
 import { defineTool, S } from "../types.ts";
 import { guarded, str, optStr, optNum } from "./util.ts";
@@ -16,7 +18,9 @@ export const UpdateGoalTool = defineTool({
   name: "UpdateGoal",
   description:
     "更新当前目标。action=complete 只在真的做完并验证过时用；action=blocked 只在同一个具体条件卡住多轮时用，且必须给 blocked_reason。"
-    + "edit / pause / resume 属于人类的决定 —— 只在用户明确要求时才做。",
+    + "edit / pause / resume 属于人类的决定 —— 只在用户明确要求时才做。"
+    + "注意：带验收标准（criteria）的目标，独立评估没通过时 action=complete 会被拒（错误码 GOAL_EVAL_FAILED），"
+    + "失败项写在该错误里 —— 那是要补的活，不是让你去改标准。",
   parameters: S.obj({
     goal_id: S.str("GetGoal 返回的 id"),
     revision: S.num("GetGoal 返回的 revision（乐观并发，过期会被拒）"),

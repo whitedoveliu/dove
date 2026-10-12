@@ -39,6 +39,8 @@ export interface ApprovalResponse {
   reason?: "user" | "timeout" | "no-window";
   denyReason?: string;
   decision?: "allow" | "deny";
+  /** reason=timeout 时：实际等了多久（毫秒）。写给用户看的错误文案要用它 */
+  timeoutMs?: number;
 }
 
 export interface ToolServices {
@@ -49,6 +51,11 @@ export interface ToolServices {
     => Promise<{ status: "running" | "done"; taskId?: string; output?: string }>;
   /** 查后台任务状态（TaskOutput 用） */
   getTask?: (taskId: string) => { taskId: string; label: string; status: string; result?: string } | undefined;
+  /**
+   * 列出某线程派出去的后台任务（RuntimeStatus 用）。
+   * 心跳自检要回答「有没有没跑完的任务」—— 没有它就只能靠猜。
+   */
+  listTasks?: (threadId: string) => TaskSummary[];
   /** 把任务派到项目线程（D8：Home 只读 + 调度） */
   dispatchToProject?: (projectId: string, instruction: string) => Promise<{ output: string; endReason: string }>;
   /** 项目操作 */
@@ -167,6 +174,16 @@ export interface McpResourcePort {
   servers(): { name: string; connected: boolean; enabled: boolean; error?: string }[];
   list(server?: string): Promise<McpResourceListing[]>;
   read(uri: string, server?: string): Promise<McpResourceReadResult[]>;
+}
+
+/** 后台任务的一条摘要（形状对齐 agents/task-registry.ts 的 TaskRecord） */
+export interface TaskSummary {
+  id: string;
+  kind: string;
+  status: string;
+  prompt: string;
+  createdAt: number;
+  finishedAt?: number;
 }
 
 /** 子代理 / 后台任务的一条摘要（ListAgents 的输出行） */

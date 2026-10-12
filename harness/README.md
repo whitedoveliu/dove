@@ -1,11 +1,7 @@
 # Dove Harness
 
 **常驻、有记忆、双层循环、事件溯源**的桌面创意 Agent 内核。
-从零重写，替代原来的 Python 版 `agent_core.py`。
 
-> 设计依据：[harness-redesign.md](../../docs/harness-redesign.md)（设计稿） ·
-> [harness-implementation-plan.md](../../docs/harness-implementation-plan.md)（实施计划） ·
-> [dove-persona.md](../../docs/dove-persona.md)（人设） ·
 > Alma Harness 复刻规格书与答疑 P0–P2
 
 ---
@@ -20,13 +16,13 @@ node --no-warnings packages/server/src/main.ts
 # 2) 命令行跑一个任务
 DOVE_APPROVE=auto node --no-warnings scripts/run-task.ts dove-studio "把配色改成暖色"
 
-# 3) 起前端面板（开发模式，5273 端口，/api 代理到 8790）
-cd apps/panel && npm install && npm run dev
-# 或构建后由内核直接托管
-cd apps/panel && npm run build     # 产物在 apps/panel/dist，内核会自动托管
+# 3) 起前端面板（control-panel，开发模式 3006，后端走内核的 8008 兼容层）
+cd ../control-panel && pnpm install && pnpm dev
+# 或构建后由内核直接托管（产物挂在内核 8790 的根路径）
+cd ../control-panel && pnpm build     # 产物在 control-panel/dist
 ```
 
-**零构建步骤**：Node 25 原生跑 `.ts`（类型擦除），不需要 tsc 编译。
+**零构建步骤**：Node 24+ 原生跑 `.ts`（类型擦除），不需要 tsc 编译。
 `tsc --noEmit` 只用于类型检查。
 
 ---
@@ -44,7 +40,6 @@ cd apps/panel && npm run build     # 产物在 apps/panel/dist，内核会自动
 | `DOVE_BASE_URL` | `https://api.deepseek.com/v1` | OpenAI 兼容端点 |
 | `DOVE_API_KEY` | 回退读仓库根的 `env` 里的 `ANTHROPIC_API_KEY` | API key |
 | `DOVE_APPROVE` | `ask` | 审批策略：`ask` 弹窗 / `auto` 自动放行（CLI、无人值守）/ `deny` 一律拒绝 |
-| `DOVE_PANEL_DIR` | `apps/panel/dist` | 面板产物目录 |
 
 ---
 
@@ -64,21 +59,21 @@ packages/
     providers/  OpenAI 兼容 provider（手写 SSE + tool_call 归并）
     loop/       step 循环 · turn 闸门 · 看门狗 · steering · 工具执行管线
     context/    分段装配 · mt 尾部注入 · 记忆切片 · token 估算 · AutoCompact
-    tools/      注册表 · 输出预算 · 调用修复 · 审批链 · 42 个内置工具（分层见下）
+    tools/      注册表 · 输出预算 · 调用修复 · 审批链 · 44 个内置工具（分层见下）
     memory/     文件层 · 向量层 · 检索 · 写入 · 睡眠合并
     agents/     子代理运行时 · 后台任务注册表
     projects/   构建 · 预览 · 版本（git）
   prompts/      11 个提示词段（纯文本，不进代码）
   server/       HTTP + SSE + 服务装配
-apps/panel/     React 19 面板
+../control-panel/  React 19 面板（产品界面）
 fixtures/       回归夹具与场景卡
 ```
 
-**工具分层**（共 42 个；CORE 只往尾部追加，顺序 = wire 顺序 = 前缀缓存）
+**工具分层**（共 44 个；CORE 只往尾部追加，顺序 = wire 顺序 = 前缀缓存）
 
 | 层 | 数量 | 内容 |
 |---|---|---|
-| CORE | 15 | Read · Write · Edit · Glob · Grep · Bash · BashOutput · KillShell · Recall · Remember · Sleep · CurrentTime · ReadImage · GetContextRemaining · Present |
+| CORE | 17 | Read · Write · Edit · Glob · Grep · Bash · BashOutput · KillShell · Recall · Remember · Sleep · CurrentTime · ReadImage · GetContextRemaining · Present · RuntimeStatus · RunScript |
 | SYSTEM | 10 | AttemptCompletion · AskUserQuestion · TodoWrite · ToolSearch · Skill · DispatchToProject · ExitPlanMode · CreateGoal · GetGoal · UpdateGoal |
 | ON_DEMAND | 17 | WebSearch · WebFetch · Task · TaskOutput · ListAgents · SendMessage · InterruptAgent · ListMcpResources · ReadMcpResource · CronCreate · CronList · CronDelete · TerminalOpen · TerminalSend · TerminalRead · TerminalClose · TerminalList |
 
@@ -104,10 +99,10 @@ ON_DEMAND 的每个工具**必须写 `discoverable`**（`ToolSearch` 的描述�
 ## 测试
 
 ```bash
-npm test                      # 22 个核心单测
+npm test                      # 59 个核心单测
 npm run lint                  # 文件大小 + 依赖方向
 node scripts/smoke-context.ts # 上下文装配 49 项
-node scripts/smoke-memory.ts  # 记忆系统 44 项
+node scripts/smoke-memory.ts  # 记忆系统 45 项
 node scripts/smoke-bootstrap.ts
 node scripts/run-task.ts <fixture> "<任务>"   # 端到端跑一个任务
 node scripts/drive-http.mjs "<任务>"          # 走真实 HTTP/SSE（浏览器那条路）

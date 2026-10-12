@@ -8,7 +8,21 @@ export type AgentEventType =
   | "tool_start" | "tool_result" | "tool_approval"
   | "ask_user" | "todo_update"
   | "compaction" | "repair" | "steering"
-  | "stats" | "error" | "done";
+  /**
+   * 这一轮结束了，但**用户什么都没看到**（没有 assistant 文本、也没有 AttemptCompletion）。
+   * 载荷：{ endReason, aborted, note }。面板据此把消息标成「已中断」并给出重试按钮 ——
+   * 没有它，客户端断开时界面会永远停在"什么都没发生"（见 agent/turn-outcome.ts 的说明）。
+   */
+  | "interrupted"
+  | "stats" | "error" | "done"
+  /**
+   * 长期目标（goal）的事件。评估结论必须发出来 —— 没有它，用户只会看到
+   * 「目标一直没完成」而不知道是哪一条验收标准没过（见 agents/goal-evaluator.ts）。
+   *   goal_eval   ：{ pass, round, reason, failures[], scored[], evidence, evaluator, note? }
+   *   goal_round  ：{ round, objective, eval_failures? }
+   *   goal_blocked：{ reason }
+   */
+  | "goal_eval" | "goal_round" | "goal_blocked";
 
 export interface AgentEvent {
   type: AgentEventType;

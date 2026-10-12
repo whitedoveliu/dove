@@ -2,9 +2,7 @@
 # dove 功能验证脚本
 # 用法: ./verify.sh [--quick]    --quick 跳过耗时检查（E2E 对话）
 #
-# 历史：这个脚本以前编译 python/*.py 并检查 SEO 函数表 ——
-# 那套 Python 实现已从仓库移除（见 harness/packages/server/src/legacy/CONTRACT.md）。
-# 现在验的是**当前的 TS 内核**（harness/）。
+# 验的是**当前的 TS 内核**（harness/）：静态检查 + 单测 + 冒烟 + 服务健康 + E2E 对话。
 set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 H="$ROOT/harness"
@@ -26,8 +24,13 @@ echo "== 3. 冒烟（真实执行，不是纯函数）=="
 for s in smoke-turn smoke-subagent smoke-memory smoke-terminal smoke-mcp-resources; do
   if (cd "$H" && node --no-warnings "scripts/$s.ts" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
 done
-for s in smoke-routes.mjs smoke-cli-exit.mjs; do
+for s in smoke-routes.mjs smoke-cli-exit.mjs smoke-cli.mjs; do
   if (cd "$H" && node --no-warnings "scripts/$s" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
+done
+
+echo "== 3b. 新能力冒烟（PTC / 后台任务 / 循环纪律 / 目标验收）=="
+for s in smoke-ptc smoke-jobs smoke-loop-audit smoke-goal-eval smoke-goal-events; do
+  if (cd "$H" && node --no-warnings "scripts/$s.ts" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
 done
 
 echo "== 4. 服务健康 =="

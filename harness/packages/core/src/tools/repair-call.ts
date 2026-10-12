@@ -102,6 +102,16 @@ function coerce(v: unknown, type: string | undefined, key: string, notes: string
   if (type === "string" && typeof v !== "string") { notes.push(`参数 "${key}" 已从 ${typeof v} 转成 string`); return typeof v === "object" ? JSON.stringify(v) : String(v); }
   if (type === "number" && typeof v !== "number") { const n = Number(v); if (Number.isFinite(n)) { notes.push(`参数 "${key}" 已转成 number`); return n; } }
   if (type === "boolean" && typeof v !== "boolean") { if (v === "true") return true; if (v === "false") return false; }
-  if (type === "array" && !Array.isArray(v) && v !== undefined && v !== null) { return [v]; }
+  // 数组：模型经常把数组写成 JSON 字符串（`"[{\"a\":1}]"`）。
+  // 原来一律包成 `[v]` —— 于是 `["{\"a\":1}"]` 交给工具，工具报的是
+  // 「第 1 项缺少 xxx」这种**误导性**错误（模型不知道是自己序列化错了，不会自纠）。
+  // 现在：能 parse 成数组就展开（和 Alma 一样的取舍），parse 不动就**原样交回去**，
+  // 让 schema 报「参数必须是数组」，模型一看就知道该改什么。
+  if (type === "array" && !Array.isArray(v) && v !== undefined && v !== null) {
+    if (typeof v === "string") {
+      try { const p = JSON.parse(v) as unknown; if (Array.isArray(p)) { notes.push(`参数 "${key}" 已从 JSON 字符串展开成数组`); return p; } } catch { /* 交给 schema 报错 */ }
+    }
+    return v;
+  }
   return v;
 }

@@ -9,7 +9,7 @@ import { applyBudget } from "../tools/budget.ts";
 import { repairToolCall } from "../tools/repair-call.ts";
 import { classifyLocally, buildApprovalRequest } from "../tools/approval.ts";
 import type { ToolCallPayload } from "../providers/types.ts";
-import { TOOL_TIMEOUT_MS } from "../constants.ts";
+import { TOOL_TIMEOUT_MS, approvalTimeoutMs, humanDuration } from "../constants.ts";
 
 export interface ExecOutcome {
   toolCallId: string;
@@ -93,6 +93,13 @@ async function decideApproval(
 
   if (tool.approval === "always") {
     const req: ApprovalRequest = { title: `允许执行 ${tool.name}？`, message: JSON.stringify(args).slice(0, 600), riskLevel: "medium" };
+    // ⚠️ 这一行**不能省**（上面两个分支都有，这里曾经漏了）：
+    //    通知不发出去，界面/日志就不知道有人在等，调用方只能干等到
+    //    DOVE_APPROVAL_TIMEOUT_MS（缺省 5 分钟）自动拒绝 —— 用户从没看见弹窗，
+    //    模型拿到的是「没人处理这次审批」，表现成「工具莫名失败」。
+    //    实测（PTC 的 RunScript，唯一用 always 的工具）：事件流是
+    //    tool_start → 5 分钟后 approval_timeout，中间什么都没有。
+    deps.onApprovalNeeded?.(toolCallId, req);
     return { needed: true, request: req, response: await deps.resolveApproval(req, toolCallId) };
   }
 
@@ -129,11 +136,23 @@ export async function executeOne(
   const appr = await decideApproval(tool, args, deps, call.id);
   if (appr.needed && !appr.response?.approved) {
     const reason = appr.response?.reason;
+    // 超时要**说清等了多久**（问题 ⑤）。原来只有一句「审批超时」，
+    // 用户回来只看到「Bash 失败」，既不知道发生了什么，也不知道能调。
+    const waitedMs = appr.response?.timeoutMs ?? approvalTimeoutMs();
     const text = reason === "timeout"
-      ? "[权限] 审批超时，命令已被自动拒绝。"
+      ? `[权限] 等待审批超时（${humanDuration(waitedMs)}），命令已被自动拒绝。` +
+        "没有人处理这次审批请求；想等久一点可以设置环境变量 DOVE_APPROVAL_TIMEOUT_MS（毫秒）。"
       : reason === "no-window"
-        ? "[权限] 没有可用的审批窗口，命令已被自动拒绝。"
+        ? "[权限] 没有可用的审批窗口（界面没连上），命令已被自动拒绝。"
         : "[权限] 用户拒绝了这次操作。";
+    // 超时不再静默：单独发一条事件，面板/日志能把它显示成一条明确提示
+    if (reason === "timeout") {
+      try {
+        deps.ctxBase.emit("tool:approval_timeout", {
+          toolCallId: call.id, tool: name, timeoutMs: waitedMs, message: text,
+        });
+      } catch { /* 事件发不出去不影响结果 */ }
+    }
     return {
       toolCallId: call.id, toolName: name, input: args, ok: false, errorText: text, denied: true,
       durationMs: Date.now() - started, approval: appr.request ? { request: appr.request, response: appr.response! } : undefined,

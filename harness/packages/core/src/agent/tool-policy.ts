@@ -7,9 +7,16 @@
  */
 import type { Tool } from "../tools/types.ts";
 
-/** 会改动文件系统 / 产生副作用的工具 */
+/**
+ * 会改动文件系统 / 产生副作用的工具
+ *
+ * RunScript 与 Bash 同一档：脚本里能写文件、能起进程、能联网 —— 它就是本地代码执行。
+ * 所以 Home 线程（没有 Bash）也拿不到它；只读线程同样（见下面的 READONLY_EXTRA_BLOCKED）。
+ * 只把 RunScript 放进 READONLY_EXTRA_BLOCKED 是不够的：那会留下
+ * 「Home 线程没有 Bash、却有等价的任意代码执行」这个洞。
+ */
 export const MUTATING_TOOLS = new Set([
-  "Write", "Edit", "Delete", "Bash", "KillShell",
+  "Write", "Edit", "Delete", "Bash", "KillShell", "RunScript",
   "QuickEdit",
 ]);
 

@@ -94,3 +94,4 @@ export interface ActivityPort {
   listSnapshots(date?: string, limit?: number): unknown[];
   dailyReport(date: string): Promise<string>;
   weeklyReport(): Promise<string>;
+}

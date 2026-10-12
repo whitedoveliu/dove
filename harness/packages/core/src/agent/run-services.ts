@@ -21,6 +21,8 @@ import { getModelInfo } from "../providers/index.ts";
 import { ImageRelay } from "./image-attach.ts";
 import { makeContextStats } from "./context-stats.ts";
 import { SubagentHost } from "./subagent-host.ts";
+import { executeOne } from "../loop/tool-exec.ts";
+import { bindPtcRuntime, PTC_APPROVAL_PREFIX } from "../tools/builtin/run-script.ts";
 
 export interface RunServicesInput {
   /** execDeps.ctxBase.services —— 同一个对象引用 */
@@ -79,6 +81,10 @@ export function attachRunServices(input: RunServicesInput): RunServices {
 
   svc.spawnSubagent = ({ prompt, label, background }) => subagents.spawn(prompt, label ?? "子任务", background === true);
   svc.getTask = (taskId) => subagents.getTask(taskId);
+  // 后台任务清单（RuntimeStatus 用）：心跳自检要回答「有没有没跑完的任务」。
+  // 接线是「bootstrap 传 tasks → AgentServices 声明 → runtime 转发到这里」，
+  // 最后一跳就在这一行 —— 漏了它工具只会说「未接入」，代码上完全看不出问题。
+  if (input.tasks) svc.listTasks = (threadId) => input.tasks!.list(threadId);
   svc.listAgents = () => subagents.list();
   svc.sendAgentMessage = (id, message) => subagents.send(id, message);
   svc.interruptAgent = (id) => subagents.interrupt(id);
@@ -92,6 +98,28 @@ export function attachRunServices(input: RunServicesInput): RunServices {
     toolDefs: () => wireSchemas(currentActiveNames()),
     usage: input.usage,
     messages: input.liveMessages,
+  });
+
+  // ── PTC（RunScript）：脚本里的 doveTool 要能回到内核执行 ────────────────
+  // 只有这里同时拿得到「本轮的 execDeps」和「按线程策略裁过的工具表」，所以绑定放在这。
+  // ⚠️ 脚本内每次调用都走 executeOne —— 也就是**同一条审批链**：
+  //    需要审批的工具照常弹窗（绝不因为「是脚本发的」而放行），输出照样过预算，
+  //    审批请求上加一句前缀，用户在弹窗里才认得出这是脚本发的。
+  bindPtcRuntime(input.parentThreadId, {
+    tools: input.tools,
+    invoke: async (name, args, callId) => {
+      const deps = input.execDeps;
+      const outcome = await executeOne(
+        { id: callId, type: "function", function: { name, arguments: JSON.stringify(args) } },
+        {
+          ...deps,
+          tools: input.tools,
+          onApprovalNeeded: (id, req) =>
+            deps.onApprovalNeeded?.(id, { ...req, message: PTC_APPROVAL_PREFIX + "\n" + req.message }),
+        },
+      );
+      return { ok: outcome.ok, output: outcome.output, errorText: outcome.errorText };
+    },
   });
 
   return { images, subagents };

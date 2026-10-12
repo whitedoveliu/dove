@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Loader2, StopCircle, Settings2, Check, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Trash2, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye, ClipboardList, XCircle, Target } from "lucide-react";
+import { Send, Loader2, StopCircle, Settings2, Check, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye, ClipboardList, XCircle, Target } from "lucide-react";
 import { Hint } from "@/components/ui/tooltip";
 import { IconButton } from "@/components/ui/icon-button";
 import { loadSavedStyle } from "./AIStyleSelector";
@@ -9,6 +9,8 @@ import MessageList from "./MessageList";
 import { SubagentBar, reduceSubagents, type SubagentInfo } from "./subagent-bar";
 import { SubagentView } from "./subagent-view";
 import { ComposerBox, PermissionSelect } from "./composer-box";
+import { SteerQueueBar } from "./steer-queue-bar";
+import { enqueueMessage, queueForProject, rekeyQueuedProject, removeQueuedMessage, takeQueueHead, type QueuedMessage } from "@/lib/steer-queue";
 import { GoalBar } from "./goal-bar";
 import { usePermissionMode, usePlanMode, readDraftPlanMode, writeDraftPlanMode } from "@/lib/permission";
 import { useGoal, readDraftGoal, writeDraftGoal, clearDraftGoal } from "@/lib/goal";
@@ -16,7 +18,8 @@ import { goalPhaseLabel, goalSummary, parseGoalCommand, truncateGoal } from "@/l
 import { useToast, type ToastOptions } from "@/components/ui/toast";
 import type { SlashCommand } from "@/components/slash-menu";
 import { isExitPlanModeTool } from "@/lib/plan-mode";
-import { Message, sendChatMessage, submitUserInput, stopGeneration, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, clearDoveCloud, listSubagents, type Project, type Goal, type GoalAction, type GoalPostBody } from "@/lib/api";
+import { extractPresentedFiles, isPresentTool, type PresentedFile } from "@/lib/presented-files";
+import { Message, sendChatMessage, submitUserInput, stopGeneration, steerMessage, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, listSubagents, type Project, type Goal, type GoalAction, type GoalPostBody } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -287,6 +290,8 @@ interface ChatPanelProps {
   onFileModifying?: (isModifying: boolean) => void;  // 文件修改工具调用回调（用于提前展示预览面板）
   /** 打开项目内文件（消息流里的交付物卡片）—— 由 App 接到右侧预览面板 */
   onOpenFile?: (path: string) => void;
+  /** Present 声明了交付物 —— App 用它把 .html 自动放到右侧浏览器标签 */
+  onPresentedFiles?: (files: PresentedFile[]) => void;
   onProjectCreated?: () => void;  // 新建项目后的回调（用于刷新目录树）
   asideCollapsed?: boolean;        // 预览区是否已收起
   onToggleAside?: () => void;      // 收起/展开预览区
@@ -299,7 +304,7 @@ interface ChatPanelProps {
   onPendingMessageConsumed?: () => void;
 }
 
-export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onOpenFile, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
+export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onOpenFile, onPresentedFiles, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   // 子代理状态（顶部状态栏）。内核的 subagent_text 不带 label，
   // 流式文本按「最近一个 running 的」归并 —— 见 reduceSubagents。
@@ -336,6 +341,30 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
    *   · A 跑完把标志清掉，如果那时用户在 B，B 的输入框状态也是错的
    */
   const [runningProjects, setRunningProjects] = useState<Set<string>>(() => new Set());
+  /**
+   * 运行中排的队（本轮跑着的时候用户又发了几条）。
+   *
+   * 以前运行中发送**直接丢掉**；现在排进这里，回合结束后自动发下一条。
+   * 它和「插话」是两条路：排队等整个回合跑完，插话只等这一步（step）跑完。
+   * 停止（stop）不清空它 —— 排队的语义就是「这些都要发」。
+   */
+  const [queued, setQueued] = useState<QueuedMessage[]>([]);
+  /**
+   * 当前是否**有提问在等回答**。
+   *
+   * 为什么要有这个：AskUserQuestion 在内核里是**阻塞等待**的（默认 5 分钟超时才放行）。
+   * 这段时间用户"打字回答"必须走 /api/user-input；一旦被当成"运行中插话"丢进队列或
+   * steering，问题就永远收不到答案 —— 界面会整整卡 5 分钟，看起来就是"AI 正在思考…"不动。
+   */
+  const pendingQuestion = useMemo(
+    () => [...messages].reverse().find((m) => m.askUser && !m.askUser.answered),
+    [messages],
+  );
+  /** 正在插话的那一条（那一行的按钮转圈，同时挡住重复点） */
+  const [steeringId, setSteeringId] = useState<string | null>(null);
+  /** 队列的会话 key：草稿页（还没建项目）是 "" —— 见 lib/steer-queue.ts 的 project 字段 */
+  const queueKey = projectId ?? "";
+  const prevQueueKeyRef = useRef(queueKey);
   /**
    * 当前正在看哪个会话 —— 给**流回调**判断用。
    *
@@ -439,10 +468,6 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const [labMenuOpen, setLabMenuOpen] = useState(false);
   const [promptReplacementDialogOpen, setPromptReplacementDialogOpen] = useState(false);
   
-  // Clear Dove Cloud 状态
-  const [clearCloudDialogOpen, setClearCloudDialogOpen] = useState(false);
-  const [clearCloudLoading, setClearCloudLoading] = useState(false);
-
   // AI 风格状态
   const [aiStyle, setAiStyle] = useState(() => loadSavedStyle());
 
@@ -533,6 +558,20 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   };
   
   // 只更新 skipped_by_restore 标记，不替换整个消息列表（避免闪烁和滚动）
+  /**
+   * 会话末端的「回滚」成功之后 —— 照 PreviewPanel 里 switchVersion 之后的处理：
+   * 刷新预览 + 不再停在历史版本；再把面板自己的历史重读一遍（skipped_by_restore），
+   * 被回滚掉的那一轮就会折叠成「已回滚」。延迟 500ms 是学 version_restored 那段：
+   * 等内核把历史写完再读，免得读到一半。
+   */
+  const handleRolledBack = () => {
+    onRefreshPreview?.();
+    onVersionChange?.(null);
+    if (projectId) {
+      setTimeout(() => { void updateSkippedMarks(projectId); }, 500);
+    }
+  };
+
   const updateSkippedMarks = async (port: string) => {
     try {
       const data = await getHistory(port);
@@ -852,7 +891,30 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     // 也要能 /goal pause / complete。只拦"手动发送"这条路 —— messageText 是程序自动发的
     // （重试 / 继续 / 建完任务后的第一条），里面以 /goal 开头也只是普通正文。
     if (messageText === undefined && (await runGoalCommand(textToSend))) return;
-    if (!textToSend.trim() || isLoading) return;
+    if (!textToSend.trim()) return;
+
+    /**
+     * 运行中发送 = **排队**（不再像以前那样直接丢掉）。
+     *
+     * 只拦「手动发送」这一条路：messageText 是程序自动发的（重试 / 继续 /
+     * 队列自动发下一条），它们不该再进队列 —— 否则自己套自己，永远发不出去。
+     */
+    // ① 有未回答的提问 → **发送就是回答**（不能排队，也不能插话）
+    if (isLoading && pendingQuestion && messageText === undefined) {
+      setInput("");
+      await handleAskUserSubmit(pendingQuestion.id, textToSend);
+      toast({ title: "已作为回答提交", duration: 2000 });
+      return;
+    }
+
+    if (isLoading) {
+      if (messageText === undefined) {
+        setQueued((prev) => enqueueMessage(prev, projectId ?? "", textToSend));
+        setInput("");
+        toast({ title: "已加入队列", description: "当前回合结束后自动发送", duration: 2200 });
+      }
+      return;
+    }
 
     // ⚠️ 这个会话在这次 send 里是哪个 —— 流回调靠它判断「事件还该不该写进当前视图」。
     //    必须在这里**捕获**（闭包），不能到回调里再读 projectId（那时可能是别的会话了）。
@@ -1222,6 +1284,17 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
               })
             );
           } else if (event.type === "tool_result") {
+            // Present 交付物：把这次的参数 + 结果拼成一小段事件流解析出文件清单，
+            // 交给 App —— 产出的 .html 要自动在右侧「浏览器」标签打开（非 HTML 不打扰）
+            if (isPresentTool(event.tool)) {
+              const lastParams = lastToolParams;
+              const params = lastParams && lastParams.tool === event.tool ? lastParams.params : undefined;
+              const files = extractPresentedFiles([
+                { type: "tool_start", tool: event.tool, params },
+                { type: "tool_result", tool: event.tool, result: event.result },
+              ]);
+              if (files.length > 0) onPresentedFiles?.(files);
+            }
             lastToolParams = null;  // 清除
             
             // 保存工具执行结果（用于继续生成）
@@ -1661,6 +1734,65 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
       onSwitchingVersionChange?.(false);
     }
   };
+
+  /** 队列：删除一条（只从队列拿掉，什么都不发） */
+  const handleQueueRemove = (id: string) => {
+    setQueued((prev) => removeQueuedMessage(prev, id));
+  };
+
+  /**
+   * 队列：插话 —— 走 /api/steer，内核在**下一个 step 边界**折进当前回合
+   * （不打断正在生成的那一步）。成功后这条出队；失败留在队列里，用户还能删或等它自动发。
+   */
+  const handleQueueSteer = async (item: QueuedMessage) => {
+    if (!projectId) return;
+    setSteeringId(item.id);
+    try {
+      await steerMessage(projectId, item.text);
+      setQueued((prev) => removeQueuedMessage(prev, item.id));
+      toast({ title: "已插话：下个 step 生效", description: item.text, tone: "success" });
+    } catch (e) {
+      toast({ title: "插话失败", description: e instanceof Error ? e.message : String(e), tone: "danger" });
+    } finally {
+      setSteeringId(null);
+    }
+  };
+
+  /**
+   * 草稿页排队搬家：第一条消息把项目建出来之后，挂在 "" 上的队列要迁到真实 id 上。
+   * （不迁的话它们既不会显示、也永远不会被发出去。）
+   */
+  useEffect(() => {
+    const prev = prevQueueKeyRef.current;
+    prevQueueKeyRef.current = queueKey;
+    if (prev === "" && queueKey !== "") {
+      setQueued((q) => rekeyQueuedProject(q, prev, queueKey));
+    }
+  }, [queueKey]);
+
+  /**
+   * 回合结束（isLoading 从 true 变 false）且**本会话**队列非空 →
+   * 取队首按正常发送路径发出，其余保留（别的会话排的原样不动）。
+   *
+   * 两条守卫：
+   *   · isLoading —— 只在真正停下来的时候发；
+   *   · drainGuard —— setQueued 摘队首 + handleSend 里同步 setIsLoading(true)
+   *     本该在同一批里落地，这里再兜一层，绝不把第二条顺手发出去。
+   *     isLoading 变 true 时把闸打开，供下一轮用。
+   * 停止（stop）也会走到这里：停完队列不清空，下一条照发（见 handleStop）。
+   */
+  const drainGuardRef = useRef(false);
+  useEffect(() => {
+    if (isLoading) { drainGuardRef.current = false; return; }
+    if (drainGuardRef.current) return;
+    // 有提问在等就先别自动发：那会把消息当插话推进当前回合，问题依然没被回答
+    if (pendingQuestion) return;
+    const { head, rest } = takeQueueHead(queued, queueKey);
+    if (!head) return;
+    drainGuardRef.current = true;
+    setQueued(rest);
+    void handleSend(head.text);
+  }, [isLoading, queued, queueKey, pendingQuestion]);
 
   const handleStop = async () => {
     try {
@@ -2155,6 +2287,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 onScreenshotCancel={handleScreenshotCancelInline}
                 onRetry={handleRetry}
                 onOpenFile={onOpenFile}
+                projectId={projectId}
+                onRolledBack={handleRolledBack}
               />
             </div>
             <div ref={messagesEndRef} />
@@ -2295,6 +2429,17 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             multiple
             className="hidden"
             onChange={handleFileSelect}
+          />
+
+          {/* 运行中的待发送队列 —— 输入框**上方**（空队列时组件自己返回 null，不占位置）。
+              每行：删除 / 插话；插话只在真的有回合在跑时才可点。 */}
+          <SteerQueueBar
+            items={queueForProject(queued, queueKey)}
+            onRemove={handleQueueRemove}
+            onSteer={(item) => void handleQueueSteer(item)}
+            canSteer={isLoading && !pendingQuestion}
+            steeringId={steeringId}
+            className="mx-auto w-full max-w-[880px]"
           />
 
           {/* 输入卡片 —— 和起始页**同一个 ComposerBox**（结构 / 发送按钮 / 斜杠菜单只有一份）。
@@ -2569,70 +2714,6 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         open={promptReplacementDialogOpen}
         onOpenChange={setPromptReplacementDialogOpen}
       />
-
-      {/* Clear Dove Cloud 确认对话框 */}
-      <Dialog open={clearCloudDialogOpen} onOpenChange={setClearCloudDialogOpen}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-danger">
-              <AlertTriangle className="h-5 w-5" />
-              Clear Dove Cloud
-            </DialogTitle>
-            <DialogDescription className="text-left space-y-2">
-              <p className="font-medium text-danger">⚠️ This is a destructive operation!</p>
-              <p>This will permanently delete:</p>
-              <ul className="list-disc list-inside text-sm space-y-1 ml-2">
-                <li>All database tables and their data</li>
-                <li>All Edge Functions</li>
-              </ul>
-              <p className="text-sm text-muted-foreground mt-2">
-                This action cannot be undone. Make sure you have a backup if needed.
-              </p>
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="gap-2 sm:gap-0">
-            <Button
-              variant="outline"
-              onClick={() => setClearCloudDialogOpen(false)}
-              disabled={clearCloudLoading}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={async () => {
-                setClearCloudLoading(true);
-                try {
-                  const result = await clearDoveCloud();
-                  if (result.success) {
-                    alert(`✅ ${result.message}\n\nTables deleted: ${result.tables_deleted?.join(', ') || 'none'}\nFunctions deleted: ${result.functions_deleted?.join(', ') || 'none'}`);
-                  } else {
-                    alert(`⚠️ ${result.message}\n\nFailed tables: ${result.tables_failed?.join(', ') || 'none'}\nFailed functions: ${result.functions_failed?.join(', ') || 'none'}`);
-                  }
-                  setClearCloudDialogOpen(false);
-                } catch (error) {
-                  alert(`❌ Failed to clear Dove Cloud: ${error instanceof Error ? error.message : 'Unknown error'}`);
-                } finally {
-                  setClearCloudLoading(false);
-                }
-              }}
-              disabled={clearCloudLoading}
-            >
-              {clearCloudLoading ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Clearing...
-                </>
-              ) : (
-                <>
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  Delete All
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {/* 导入项目对话框 */}
       <Dialog open={showImportDialog} onOpenChange={setShowImportDialog}>

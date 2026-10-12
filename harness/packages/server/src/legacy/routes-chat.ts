@@ -1,15 +1,16 @@
 /**
  * 老契约：对话相关路由（/api/chat 是核心）
  *
- * 与 python/agent_core.py 对齐的地方：
+ * 这里要对齐的契约要点：
  *  - 事件词表与字段名（见 sse-compat.ts）
  *  - 「改了代码 → 提交 git → 自动构建 → preview_ready」这条尾巴
  *  - interrupted / locked 两个状态事件
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
-import { json, readBody, projectIdToPort, portToProject, type LegacyProject } from "./server.ts";
+import { json, readBody, projectIdToPort, portToProject, findProjectByKey, type LegacyProject } from "./server.ts";
 import { toLegacy, sessionIdEvent, MODIFYING_TOOLS, type LegacyEvent } from "./sse-compat.ts";
+import { listPendingAsks, answerWithText } from "../../../core/src/tools/builtin/ask-user.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runWithGoalContinuation } from "../goal-runner.ts";
@@ -43,6 +44,28 @@ function writeSse(res: ServerResponse, e: LegacyEvent): void {
 export async function handleChatRoutes(
   path: string, url: URL, req: IncomingMessage, res: ServerResponse, svc: Services,
 ): Promise<boolean> {
+  // ── POST /api/steer（运行中插话 / steering）─────────
+  // 面板拿不到新内核的 threadId，所以和权限 / 目标路由一样用**三键查找**
+  // （端口 → 项目 id → 目录名）定位项目，再取它的 project 线程。
+  // 语义：**不打断**正在生成的那一步，只在下一个 step 边界折进当前回合
+  // （见 core/src/loop/turn.ts 的 drainSteering）。
+  if (path === "/api/steer" && req.method === "POST") {
+    const b = await readBody(req);
+    const message = String(b.message ?? "").trim();
+    if (!message) { json(res, 400, { success: false, code: "EMPTY_MESSAGE", message: "message 不能为空" }); return true; }
+
+    const key = String(b.project_id || b.port || b.key || "");
+    const proj = findProjectByKey(svc, key);
+    if (!proj) { json(res, 404, { success: false, code: "PROJECT_NOT_FOUND", message: `项目不存在（${key}）` }); return true; }
+
+    const thread = svc.store.listThreads("project").find((t) => t.projectId === proj.id);
+    if (!thread) { json(res, 404, { success: false, code: "THREAD_NOT_FOUND", message: "项目线程不存在" }); return true; }
+
+    svc.steering.push(thread.id, message);
+    json(res, 200, { success: true, queued: true });
+    return true;
+  }
+
   // ── POST /api/chat ─────────────────────────────────
   if (path === "/api/chat" && req.method === "POST") {
     const b = await readBody(req);
@@ -97,7 +120,7 @@ export async function handleChatRoutes(
       });
 
       // 尾巴：改了代码 → 提交版本 → 自动构建 → preview_ready
-      // （对齐 Python 版的 "if self.is_modified:" 那一段）
+      // （老契约的语义：改了代码就自动提交 + 构建）
       if (modified) {
         try {
           const snap = await svc.projects.snapshot(proj.id, message.slice(0, 60) || "对话修改");
@@ -187,7 +210,15 @@ export async function handleChatRoutes(
         ok = svc.pending.resolveApproval(target.toolCallId, yes, yes ? undefined : answer);
       }
     } catch { ok = false; }
-    // ② 不是审批 → 按 AskUserQuestion 处理
+    // ② 不是审批 → AskUserQuestion：按线程找到那个正在等回答的提问，投进去
+    if (!ok) {
+      try {
+        const asks = listPendingAsks();
+        const target = asks.find((a) => a.threadId === sessionId) ?? asks[0];
+        if (target) ok = answerWithText(target.toolCallId, answer);
+      } catch { /* 落到下面的兜底 */ }
+    }
+    // ③ 兜底：老的 PendingRegistry（保留，未走 ask_user 工具的调用方还在用）
     if (!ok) {
       try {
         const q = svc.pending.listPendingQuestions?.() ?? [];

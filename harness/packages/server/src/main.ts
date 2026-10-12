@@ -72,14 +72,12 @@ if (process.env.DOVE_EXIT_WITH_PARENT === "1") {
 }
 const hub = new SseHub();
 const running = new Map<string, AbortController>();
-// 产品界面 = control-panel 的构建产物（用户明确要求保留这个 UI，不要换）
+// 产品界面 = control-panel 的构建产物
 const controlPanelDir = process.env.DOVE_CONTROL_PANEL_DIR
   ?? resolve(import.meta.dirname, "../../../../control-panel/dist");
-// 调试面板（记忆 / 定时 / 感知这些 control-panel 没有的视图），挂在 /debug
-const panelDir = process.env.DOVE_PANEL_DIR ?? resolve(import.meta.dirname, "../../../apps/panel/dist");
 
 const server = createServer((req, res) => {
-  handle(req, res, { svc, hub, controlPanelDir, panelDir, running }).catch((e) => {
+  handle(req, res, { svc, hub, controlPanelDir, running }).catch((e) => {
     console.error("[server] 未处理错误:", e);
     try { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: String(e) })); } catch { /* ignore */ }
   });
@@ -102,7 +100,7 @@ server.on("error", (e: NodeJS.ErrnoException) => {
   process.exit(2);
 });
 
-// ── 老契约兼容层（8008）：让 control-panel 一行不改地跑在新内核上 ──
+// ── 面板兼容层（8008）：让 control-panel 一行不改地跑在内核上 ──
 const legacyPort = Number(process.env.DOVE_LEGACY_PORT ?? 8008);
 let legacy: Awaited<ReturnType<typeof startLegacyServer>> = null;
 if (process.env.DOVE_LEGACY !== "off") {

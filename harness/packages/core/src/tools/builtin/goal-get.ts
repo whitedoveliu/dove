@@ -7,7 +7,8 @@ import { goalPort, goalPayload } from "./goal-port.ts";
 
 export const GetGoalTool = defineTool({
   name: "GetGoal",
-  description: "读当前会话的目标，包含 UpdateGoal 需要的 id 与 revision。改目标前先读一次，不要凭记忆写 revision。",
+  description: "读当前会话的目标，包含 UpdateGoal 需要的 id 与 revision。改目标前先读一次，不要凭记忆写 revision。"
+    + "建目标时给了 criteria 的话，这里能回读验收标准，以及最近一次独立评估的结论（last_eval）。",
   parameters: S.obj({}, []),
   outputTier: "exact",
   approval: "never",

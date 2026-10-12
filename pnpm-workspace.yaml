@@ -1,6 +1,5 @@
 packages:
   - control-panel
-  - react-2.0-tpl
 
 allowBuilds:
   esbuild: true
