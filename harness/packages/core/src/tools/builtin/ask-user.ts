@@ -5,9 +5,15 @@
  */
 import { defineTool, S } from "../types.ts";
 import { guarded } from "./util.ts";
+import { APPROVAL_TIMEOUT_MS, approvalTimeoutMs, humanDuration } from "../../constants.ts";
 
-/** 等用户回答的上限；工具内常量（不写进 constants.ts，保持目录边界） */
-export const ASK_USER_TIMEOUT_MS = 300_000;
+/**
+ * 等用户回答的默认上限（毫秒）。
+ * 与审批共用同一个可配置项：DOVE_APPROVAL_TIMEOUT_MS（缺省 5 分钟）——
+ * 「等用户回话」和「等用户点允许」是同一类等待，两个数只会让人调错一个。
+ * 这里保留常量是为了给工具描述与兜底文案一个默认值；真正等待用 approvalTimeoutMs()。
+ */
+export const ASK_USER_TIMEOUT_MS = APPROVAL_TIMEOUT_MS;
 /** 事件名：发问 / 已解答（UI 据此弹窗与收起） */
 export const ASK_USER_EVENT = "tool:ask_user";
 export const ASK_USER_RESOLVED_EVENT = "tool:ask_user_resolved";
@@ -24,6 +30,42 @@ export interface AskAnswer { id: string; selected: string[]; custom?: string }
 
 const pending = new Map<string, (a: AskAnswer[] | null) => void>();
 const early = new Map<string, AskAnswer[]>();
+
+/**
+ * 正在等回答的提问（toolCallId → 线程 + 问题原文）。
+ *
+ * 为什么需要：兼容层的 `/api/user-input` 只带线程 id、不带问题 id，它得先知道
+ * "这个线程此刻在等哪个提问" 才能把答案投递进来。**没有这张表，答案永远投不进来，
+ * AskUserQuestion 只能干等 5 分钟超时** —— 界面看起来就是卡住了。
+ */
+const meta = new Map<string, { threadId: string; questions: AskQuestion[] }>();
+
+/** 由 server 调用：列出当前等待回答的提问 */
+export function listPendingAsks(): { toolCallId: string; threadId: string; questions: AskQuestion[] }[] {
+  return [...meta.entries()].map(([toolCallId, m]) => ({ toolCallId, threadId: m.threadId, questions: m.questions }));
+}
+
+/** 把一段纯文本（或 JSON 数组）回答拆成结构化答案 */
+function textToAnswers(text: string, questions: AskQuestion[]): AskAnswer[] {
+  let list: string[] | null = null;
+  const t = text.trim();
+  if (t.startsWith("[")) {
+    try { const p = JSON.parse(t) as unknown; if (Array.isArray(p)) list = p.map((x) => String(x)); } catch { /* 当纯文本处理 */ }
+  }
+  const parts = list ?? [t];
+  return questions.map((q, i) => {
+    const v = parts[i] ?? parts[0] ?? "";
+    const isLabel = q.options?.some((o) => o.label === v) ?? false;
+    return isLabel ? { id: q.id, selected: [v] } : { id: q.id, selected: [], custom: v };
+  });
+}
+
+/** 由 server 调用：用一段文本回答该提问（兼容层只有纯文本 / JSON 数组） */
+export function answerWithText(toolCallId: string, text: string): boolean {
+  const m = meta.get(toolCallId);
+  if (!m) return false;
+  return submitAnswers(toolCallId, textToAnswers(text, m.questions));
+}
 
 /** 由 server 调用：把用户答案投递给正在等待的工具调用 */
 export function submitAnswers(toolCallId: string, answers: AskAnswer[]): boolean {
@@ -118,11 +160,15 @@ export const AskUserQuestionTool = defineTool({
       return { answers: pre, timed_out: false, note: "用户已就本次提问给出回答。" };
     }
 
+    // 等待上限可配置（DOVE_APPROVAL_TIMEOUT_MS），与审批同源 —— 见文件头
+    const timeoutMs = approvalTimeoutMs();
     // 先登记等待，再发事件 —— 避免「答案比等待先到」的竞态
-    const wait = waitForAnswers(ctx.toolCallId, ASK_USER_TIMEOUT_MS, ctx.signal);
+    const wait = waitForAnswers(ctx.toolCallId, timeoutMs, ctx.signal);
+    meta.set(ctx.toolCallId, { threadId: ctx.threadId, questions });
     ctx.emit(ASK_USER_EVENT, { toolCallId: ctx.toolCallId, threadId: ctx.threadId, questions });
 
     const answers = await wait;
+    meta.delete(ctx.toolCallId);
     ctx.emit(ASK_USER_RESOLVED_EVENT, { toolCallId: ctx.toolCallId, answered: Boolean(answers) });
 
     if (!answers) {
@@ -130,8 +176,9 @@ export const AskUserQuestionTool = defineTool({
         answers: [],
         timed_out: true,
         questions,
-        note: "没有拿到用户回答（超时 " + Math.round(ASK_USER_TIMEOUT_MS / 1000) + " 秒或窗口不可用）。" +
-          "不要假设用户选了什么：可以先做不受影响的部分，或稍后再问。",
+        note: "没有拿到用户回答（等了 " + humanDuration(timeoutMs) + " 被自动收尾，或窗口不可用）。" +
+          "不要假设用户选了什么：可以先做不受影响的部分，或稍后再问。" +
+          "（等待时长可用环境变量 DOVE_APPROVAL_TIMEOUT_MS 调整。）",
       };
     }
     return { answers, timed_out: false, note: "收到的回答见 answers（selected 是被选中的 label，custom 是自由输入）。" };

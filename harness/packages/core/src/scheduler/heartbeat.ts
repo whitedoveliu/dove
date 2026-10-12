@@ -8,19 +8,16 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { HEARTBEAT_ACTIVE_HOURS, HEARTBEAT_INTERVAL_MS } from "../constants.ts";
+import { HEARTBEAT_ACTIVE_HOURS, HEARTBEAT_CHECKLIST_TEXT, HEARTBEAT_INTERVAL_MS } from "../constants.ts";
 
 export const HEARTBEAT_OK = "HEARTBEAT_OK";
 export const HEARTBEAT_FILE = "HEARTBEAT.md";
 
-/** HEARTBEAT.md 缺失时的兜底清单：保证首次启动也能自检 */
-export const DEFAULT_HEARTBEAT_CHECKLIST = [
-  "# HEARTBEAT · 主动性检查单",
-  "",
-  "- 有没有没跑完的任务？",
-  "- 有没有值得主动汇报的进展？",
-  "- 有没有快到期的事情需要提醒？",
-].join("\n");
+/**
+ * HEARTBEAT.md 缺失时的兜底清单：保证首次启动也能自检。
+ * 文本单点在 constants.ts（memory/files.ts 落盘的那份也用它，避免两份清单漂移）。
+ */
+export const DEFAULT_HEARTBEAT_CHECKLIST: string = HEARTBEAT_CHECKLIST_TEXT;
 
 export interface HeartbeatTickResult {
   ran: boolean;
@@ -60,9 +57,19 @@ export function inActiveHours(
   return hour >= hours[0] && hour < hours[1];
 }
 
-/** 判定「无事发生」：只有 HEARTBEAT_OK（允许尾部标点与空白）才算 */
+/**
+ * 判定「无事发生」：整段只由 HEARTBEAT_OK 组成才算（允许空白与尾部标点）。
+ *
+ * ⚠️ 为什么不是等值比较：实测日志里出现过 `"HEARTBEAT_OKHEARTBEAT_OK"` ——
+ *    模型在两个 step 里各回了一遍，两段文本被聚合成同一条 assistant 消息。
+ *    等值比较会把它判成「有事要汇报」，这条纯噪音就被 deliver 给用户了。
+ *    所以判定改成「去掉空白/标点后是 (HEARTBEAT_OK)+」——重复不影响"安静待着"。
+ *    （注意仍然不宽容：`HEARTBEAT_OK 但是构建挂了` 去空白后不是纯 OK，照样要汇报。）
+ */
 export function isHeartbeatOk(text: string): boolean {
-  return /^HEARTBEAT_OK[。.!！]?$/i.test(text.trim());
+  const packed = text.replace(/[\s。.！!，,]+/g, "");
+  if (!packed) return false;
+  return /^(?:HEARTBEAT_OK)+$/i.test(packed);
 }
 
 export class Heartbeat {
@@ -158,13 +165,23 @@ export class Heartbeat {
       "你是 Dove，现在是一次心跳自检（不是用户发来的消息）。",
       `当前时间：${formatStamp(now)}。`,
       "",
+      "Heartbeat 回合在 Home 线程里跑：按设计**没有 Bash / Write / Edit**。",
+      "你只能用这几个只读工具去查：",
+      "- **RuntimeStatus**：运行状态快照（后台任务 / 子代理 / 定时任务与下一次触发时间 / 进程跑了多久）；",
+      "- **Read / Glob / Grep**：读文件（<配置目录>/memory/今天.md、outputs/ 下的产物、日志都行）；",
+      "- **Recall**：查长期记忆；**CurrentTime**：精确时间。",
+      "跑命令类的检查（ls / ps / git status）在这里做不了 —— 查不到就不要假装查过。",
+      "",
       "按下面的清单检查你自己和这个工作台：",
       this.checklist(),
       "",
-      "输出规则：",
-      "1. 只有「真的需要用户注意」的事情才输出内容，一到三句话，直接说要紧的，不要寒暄。",
-      "2. 没有需要汇报的事情，只回复 HEARTBEAT_OK（不要加任何其他字）。",
-      "3. 不要为了刷存在感而汇报无关紧要的小事。",
+      "纪律：",
+      "1. 清单里的每一条都要**真的用上面的工具看过**再下结论，不要凭印象猜。",
+      "2. 只有「真的需要用户注意」的事情才输出内容，一到三句话，直接说要紧的，不要寒暄。",
+      "3. 没有需要汇报的事情 → 只回复 HEARTBEAT_OK（一次就够，不要重复，不要加任何其他字）。",
+      "   **不要**在 HEARTBEAT_OK 后面补「自检完成 / 没有什么要汇报的」这类总结句 ——",
+      "   只要 OK 后面还跟着别的字，这条回复就会被当成一次汇报推给用户（实测踩过）。",
+      "4. 不要为了刷存在感而汇报无关紧要的小事。",
     ].join("\n");
   }
 }

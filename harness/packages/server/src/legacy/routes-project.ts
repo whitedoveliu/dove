@@ -388,11 +388,5 @@ export async function handleProjectRoutes(
     return true;
   }
 
-  if (path === "/api/clear-dove-cloud" && req.method === "POST") {
-    await readBody(req);
-    json(res, 200, { success: true, message: "没有可清理的 Dove Cloud 资源", tables_deleted: [], functions_deleted: [] });
-    return true;
-  }
-
   return false;
 }

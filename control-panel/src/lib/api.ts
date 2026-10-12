@@ -870,6 +870,33 @@ export async function stopGeneration(projectId?: string | null): Promise<{
 }
 
 /**
+ * 运行中插话（steering）。
+ *
+ * 语义要说清楚：它**不打断**正在生成的那一步 —— 内核只在**下一个 step 边界**
+ * 把它折进当前回合（core/src/loop/turn.ts 的 drainSteering），所以成功 ≠ 已经生效。
+ * 这正是它和「排队等下一轮」的区别：排队要等整个回合跑完，插话只要等这一步跑完。
+ *
+ * key 可以是端口 / 项目 id / 目录名（后端三键查找，和权限接口完全一致）。
+ * 没有在跑的回合时不该调它：消息会一直躺在内核的 steering 队列里没人读。
+ */
+export async function steerMessage(key: string, text: string): Promise<{
+  success: boolean;
+  queued: boolean;
+  message?: string;
+}> {
+  const r = await fetch(`${getApiBaseUrl()}/api/steer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ project_id: key, message: text }),
+  });
+  const d = (await r.json().catch(() => ({}))) as { success?: boolean; queued?: boolean; message?: string };
+  if (!r.ok || d.success === false) {
+    throw new Error(d.message || `HTTP error! status: ${r.status}`);
+  }
+  return { success: true, queued: d.queued !== false, message: d.message };
+}
+
+/**
  * 重试：丢弃临时分支上的修改，切回主分支
  */
 export async function retryGeneration(projectId: string): Promise<{
@@ -1173,29 +1200,6 @@ export async function importProject(projectId: string, versionId: string): Promi
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ project_id: projectId, version_id: versionId }),
-  });
-  
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.message || `HTTP error! status: ${response.status}`);
-  }
-  return response.json();
-}
-
-/**
- * Clear all Dove Cloud data (tables and Edge Functions)
- * WARNING: This is a destructive operation!
- */
-export async function clearDoveCloud(): Promise<{
-  success: boolean;
-  message: string;
-  tables_deleted?: string[];
-  tables_failed?: string[];
-  functions_deleted?: string[];
-  functions_failed?: string[];
-}> {
-  const response = await fetch(`${getApiBaseUrl()}/api/clear-dove-cloud`, {
-    method: "POST",
   });
   
   if (!response.ok) {

@@ -92,7 +92,9 @@ export function buildExecDeps(input: WireInput): Omit<ExecDeps, "tools"> {
   return {
     ctxBase,
     resolveApproval: async (req: ApprovalRequest, toolCallId: string): Promise<ApprovalResponse> => {
-      return svc.pending.requestApproval(toolCallId, req, 300_000, true);
+      // 不写死毫秒数：等待上限由 PendingRegistry 决定（DOVE_APPROVAL_TIMEOUT_MS，缺省 5 分钟）。
+      // 以前这里硬编码 300_000，把环境变量那一层整个绕过去了。
+      return svc.pending.requestApproval(toolCallId, req, undefined, true);
     },
     onApprovalNeeded: input.onApprovalNeeded,
     ...input.execOverrides,

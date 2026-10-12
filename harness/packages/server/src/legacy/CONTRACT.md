@@ -3,8 +3,8 @@
 兼容层（8008 端口）服务的 `control-panel` 吃的是**旧 Python 版**的接口形状。
 Python 代码已从仓库移除，这份文档是**目前唯一**的契约记录 —— 改兼容层前先看这里。
 
-> 来源：`python/api_server.py`（路由）与 `python/agent_core.py`（SSE 事件）。
-> 抽取时间：2026-10-08。原文可按这两个路径从 git 历史找回。
+> 权威来源：本目录 —— 路由见 `routes-*.ts`，SSE 事件见 `sse-compat.ts`；字段名以 `control-panel` 实际在读的为准。
+> 抽取时间：2026-10-08。
 
 ---
 
@@ -66,7 +66,6 @@ text_editor_code_execution_tool_result
 ```
 /api/browser_result
 /api/chat
-/api/clear-dove-cloud
 /api/dialog/choose-folder
 /api/import-project
 /api/projects/attach

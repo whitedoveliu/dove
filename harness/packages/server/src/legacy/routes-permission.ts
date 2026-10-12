@@ -11,7 +11,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
-import { json, readBody, portToProject } from "./server.ts";
+import { json, readBody, findProjectByKey } from "./server.ts";
 
 /** 收新机值 + 旧别名（存量数据里还是 full/workspace/readonly，双读兼容） */
 const MODES = new Set(["danger-full-access", "workspace-write", "read-only", "auto"]);
@@ -57,14 +57,10 @@ export async function handlePermissionRoutes(
 
   // 三键查找（端口 → 项目 id → 目录名），顺序和删除路由**完全一致**。
   // ⚠️ 只认端口不够：前端拿到的可能是 project.id，Number("pmuxxx") = NaN → 404 → 静默失败，
-  //    表现出来就是「选了权限但没生效」。
+  //    表现出来就是「选了权限但没生效」。查找逻辑已抽到 server.ts 的 findProjectByKey ——
+  //    权限 / 目标 / 插话三条路由共用同一份，避免哪天改一处漏一处。
   const key = decodeURIComponent(m[1]!);
-  let proj = portToProject(svc, Number(key));
-  if (!proj) {
-    const hit = svc.projects.get(key)
-      ?? svc.projects.list().find((p) => p.path.split("/").filter(Boolean).pop() === key);
-    if (hit) proj = { id: hit.id, name: hit.name, path: hit.path, port: hit.port };
-  }
+  const proj = findProjectByKey(svc, key);
   if (!proj) { json(res, 404, { success: false, message: "项目不存在（" + key + "）" }); return true; }
   const thread = svc.store.listThreads("project").find((t) => t.projectId === proj.id);
   if (!thread) { json(res, 404, { success: false, message: "项目线程不存在" }); return true; }

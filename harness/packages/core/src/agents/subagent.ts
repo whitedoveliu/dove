@@ -19,10 +19,15 @@ export interface SubagentOptions {
   model: string;
   prompt: string;
   label?: string;
-  tools: Map<string, Tool>;
+  /**
+   * 工具表。**可以不传** —— 不传就是「只会思考、不会动手」的子代理：
+   * 目标验收评估器就是这么跑的（它只对着给定证据打分，不能改产物、也不能自己去"找"证据）。
+   */
+  tools?: Map<string, Tool>;
   /** 允许使用的工具名；缺省 = general-purpose 白名单 */
   allowedTools?: string[];
-  execDeps: Omit<ExecDeps, "tools">;
+  /** 不传 tools 时也不需要它：没有任何调用会被执行 */
+  execDeps?: Omit<ExecDeps, "tools">;
   systemPrompt?: string;
   signal?: AbortSignal;
   /**
@@ -33,7 +38,7 @@ export interface SubagentOptions {
   drainSteering?: () => string[];
   onText?: (delta: string) => void;
   /** 工具调用。**带参数** —— 只给名字的话界面上只能看到「subagent 调用了 Bash」，
-   *  看不到它到底在跑什么命令（用户明确要求要看这个）。 */
+   *  看不到它到底在跑什么命令。 */
   onToolUse?: (name: string, args: Record<string, unknown>) => void;
   /** 思考过程（provider 的 reasoning_content）。子代理是黑盒跑很久，
    *  不把思考流出来的话界面上只有一个转圈。 */
@@ -66,7 +71,7 @@ const DEFAULT_SYSTEM = [
 
 export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult> {
   const allow = new Set(opts.allowedTools ?? GENERAL_PURPOSE_TOOLS);
-  const tools = new Map([...opts.tools].filter(([name]) => allow.has(name)));
+  const tools = new Map([...(opts.tools ?? new Map<string, Tool>())].filter(([name]) => allow.has(name)));
   const wire = toWireSchemas([...tools.values()]);
 
   const messages: ChatMessage[] = [
@@ -121,7 +126,14 @@ export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult
       catch { args = { _raw: c.function.arguments }; }
       opts.onToolUse?.(c.function.name, args);
     }
-    const outcomes = await executeBatch(stream.toolCalls, { ...opts.execDeps, tools });
+    const outcomes = opts.execDeps
+      ? await executeBatch(stream.toolCalls, { ...opts.execDeps, tools })
+      // 没有 execDeps = 这个子代理本来就没有工具权限（评估器）：真收到调用也不能执行，
+      // 如实回一条错误让它自己改口，别装作执行成功了。
+      : stream.toolCalls.map((c) => ({
+        toolCallId: c.id, toolName: c.function.name, input: {}, ok: false,
+        errorText: "这个子代理没有工具权限，不能调用工具。", durationMs: 0,
+      }));
     for (const o of outcomes) {
       messages.push({
         role: "tool", tool_call_id: o.toolCallId, name: o.toolName,

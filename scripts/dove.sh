@@ -40,7 +40,7 @@ start_api() {
   [ -n "$API_PID" ] && kill -0 "$API_PID" 2>/dev/null && return 0
   if port_open $API_PORT; then say "agent API 已在 :$API_PORT（外部进程），复用"; return 0; fi
   say "启动 agent API (:$API_PORT)…"
-  ( cd "$ROOT/python" && exec ./venv/bin/python api_server.py >> "$LOG_DIR/api_server.log" 2>&1 ) &
+  ( cd "$ROOT" && exec node --no-warnings "$ROOT/harness/packages/server/src/main.ts" >> "$LOG_DIR/api_server.log" 2>&1 ) &
   API_PID=$!
   for _ in $(seq 1 60); do port_open $API_PORT && break; sleep 0.5; done
   port_open $API_PORT && say "API 就绪 (pid $API_PID)" || say "⚠️ API 启动超时，见 logs/api_server.log"

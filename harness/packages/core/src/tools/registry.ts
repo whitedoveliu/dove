@@ -30,6 +30,10 @@ import { ReadImageTool } from "./builtin/read-image.ts";
 import { GetContextRemainingTool } from "./builtin/context-remaining.ts";
 // 交付物：把「已经写完的文件」声明给界面（渲染成卡片，可点开预览）
 import { PresentTool } from "./builtin/present.ts";
+// 只读运行状态（RuntimeStatus）：Home 线程被裁掉 Bash 后，「有没有没跑完的任务」只剩它能答
+import { RuntimeStatusTool } from "./builtin/runtime-status.ts";
+// PTC：写代码调用工具（Alma §3.4）。常驻：模型必须知道「我能写脚本一次做多步」
+import { RunScriptTool } from "./builtin/run-script.ts";
 
 // ── SYSTEM：元工具，永远在，不参与激活 ─────────────────
 import { AttemptCompletionTool } from "./builtin/attempt-completion.ts";
@@ -73,6 +77,11 @@ export const CORE_TOOLS: Tool[] = [
   SleepTool, CurrentTimeTool,
   ReadImageTool, GetContextRemainingTool,
   PresentTool,
+  // 只追加在 CORE 尾部：既有工具的 wire 顺序不变（缓存纪律）
+  RuntimeStatusTool,
+  // 只追加在 CORE 尾部（缓存纪律）：PTC 要让模型随时能用，所以进常驻段；
+  // 它能不能真的用由线程策略决定（Home / 只读线程里被裁掉，见 agent/tool-policy.ts）
+  RunScriptTool,
 ];
 
 export const SYSTEM_TOOLS: Tool[] = [
@@ -267,6 +276,20 @@ export function getTool(name: string): Tool | undefined {
 /** 全部工具（CORE + SYSTEM + ON_DEMAND + EXTERNAL），顺序固定：**外部工具只追加在尾部** */
 export function allTools(): Tool[] {
   return [...CORE_TOOLS, ...SYSTEM_TOOLS, ...ON_DEMAND_TOOLS, ...externalToolList];
+}
+
+/**
+ * 工具在哪一层 —— PTC 的工具控制面（/api/tools/list）要回报它：
+ * 脚本要判断「这个工具是不是已经常驻 / 要不要先 ToolSearch 激活」只能靠这个。
+ */
+export type ToolLayer = "core" | "system" | "on-demand" | "external" | "unknown";
+
+export function toolLayer(name: string): ToolLayer {
+  if (CORE_TOOLS.some((t) => t.name === name)) return "core";
+  if (SYSTEM_TOOLS.some((t) => t.name === name)) return "system";
+  if (ON_DEMAND_TOOLS.some((t) => t.name === name)) return "on-demand";
+  if (externalToolList.some((t) => t.name === name)) return "external";
+  return "unknown";
 }
 
 /**

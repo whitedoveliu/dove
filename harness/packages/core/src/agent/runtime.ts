@@ -16,13 +16,15 @@ import { buildExecDeps } from "./wire.ts";
 import { applyThreadPolicy, renderPolicyNotice } from "./tool-policy.ts";
 import { PLAN_MODE_NOTICE, planAwareMode } from "./plan-mode.ts";
 import { normalizePermissionMode } from "../tools/approval.ts";
+import { approvalTimeoutMs } from "../constants.ts";
 import { runDispatch } from "./dispatch.ts";
 import { SubagentTranscript, makeSubagentThreadId } from "../agents/subagent-store.ts";
 import { currentActiveNames } from "../tools/registry.ts";
 import { hydrateImages } from "../context/images.ts";
 import { attachRunServices } from "./run-services.ts";
-import { RedactStream } from "../security/redact-stream.ts";
+import { TextCollector } from "./text-collector.ts";
 import { toWireHistory } from "./wire-history.ts";
+import { hasVisibleOutcome, noOutputNote } from "./turn-outcome.ts";
 import type { EventSink, AgentEvent } from "./events.ts";
 import type { PendingRegistry } from "./pending.ts";
 import { getModelInfo } from "../providers/index.ts";
@@ -90,6 +92,12 @@ export interface AgentServices {
 export interface RunOptions {
   threadId: string; userText: string; projectId?: string | null; model?: string;
   signal?: AbortSignal; sink: EventSink;
+  /**
+   * 心跳回合：跳过完成守卫。心跳的"完成"就是 HEARTBEAT_OK，没有"任务完成"这回事；
+   * 让守卫开火只会白烧一轮、并把 OK 又说一遍（实测：10-11 日志的
+   * "HEARTBEAT_OKHEARTBEAT_OK"、临时内核实测 "HEARTBEAT_OK…没有需要打扰你的事"）。
+   */
+  heartbeat?: boolean;
 }
 
 export class AgentRuntime {
@@ -97,7 +105,11 @@ export class AgentRuntime {
   constructor(services: AgentServices) { this.#s = services; }
   get services(): AgentServices { return this.#s; }
 
-  async run(opts: RunOptions): Promise<{ assistantMessageId: string; endReason: string; usage: import("../session/types.ts").Usage }> {
+  async run(opts: RunOptions): Promise<{
+    assistantMessageId: string; endReason: string; usage: import("../session/types.ts").Usage;
+    /** true = 本轮**没有任何用户可见产出**，运行时补了一条说明（问题 ④） */
+    silent?: boolean;
+  }> {
     const { store, eventLog, pending, steering } = this.#s;
     const thread = store.getThread(opts.threadId);
     if (!thread) throw new Error(`线程 ${opts.threadId} 不存在`);
@@ -167,21 +179,14 @@ export class AgentRuntime {
     // ── 收集 assistant parts（事件 = 持久化 = UI 的同一份数据）
     const parts: Part[] = [];
     const toolIndex = new Map<string, ToolPart>();
-    let textPart: { type: "text"; text: string; state?: "streaming" } | null = null;
-    let reasoningPart: { type: "reasoning"; text: string; state?: "streaming" } | null = null;
-
-    const ensureText = () => { if (!textPart) { textPart = { type: "text", text: "", state: "streaming" }; parts.push(textPart as Part); } return textPart; };
-    // 回复层流式脱敏（T8.1）
-    const textRedactor = new RedactStream({
-      onHit: (hits) => {
-        eventLog.append("redacted", { where: "assistant_text", hits }, { run: runId, step: stepNo });
-        opts.sink({ type: "redacted", hits });
-      },
-    });
-    const ensureReasoning = () => { if (!reasoningPart) { reasoningPart = { type: "reasoning", text: "", state: "streaming" }; parts.push(reasoningPart as Part); } return reasoningPart; };
 
     const model = opts.model ?? thread.model ?? "deepseek-flash";
     let stepNo = 0;
+    // 文本聚合 / 流式脱敏 / 逐步 flush：见 agent/text-collector.ts 顶部（问题 ④⑥ 都栽在这里）
+    const texts = new TextCollector({
+      parts, eventLog, sink: opts.sink as (e: { type: string; [k: string]: unknown }) => void,
+      runId, step: () => stepNo,
+    });
     let compacted = false;
     let lastUsage: { inputTokens: number; outputTokens: number; cacheReadTokens: number } | undefined;
 
@@ -202,10 +207,11 @@ export class AgentRuntime {
       execOverrides: { permissionMode, classifier: this.#s.classifier },
       onApprovalNeeded: (id, req) => {
         wd.pause();
-        eventLog.append("tool_approval", { toolCallId: id, riskLevel: req.riskLevel, title: req.title }, { run: runId });
+        const timeoutMs = approvalTimeoutMs();   // 问题 ⑤：等多久一起发，界面能提前提示
+        eventLog.append("tool_approval", { toolCallId: id, riskLevel: req.riskLevel, title: req.title, timeoutMs }, { run: runId });
         const tp = toolIndex.get(id);
         if (tp) { tp.state = "approval-requested"; }
-        opts.sink({ type: "tool_approval", toolCallId: id, message: req.message, title: req.title, riskLevel: req.riskLevel });
+        opts.sink({ type: "tool_approval", toolCallId: id, message: req.message, title: req.title, riskLevel: req.riskLevel, timeoutMs });
       },
     });
 
@@ -251,6 +257,7 @@ export class AgentRuntime {
         history: trimmed, userText: opts.userText,
         tailContext: effectiveTail, memoriesBlock,
         tools: policy.tools,
+        skipCompletionGuard: opts.heartbeat === true,
         activeToolNames: () => currentActiveNames(),   // 按需工具开关（函数：中途激活要立刻生效）
         execDeps,
         steerPending: () => steering.pending(opts.threadId),
@@ -291,19 +298,9 @@ export class AgentRuntime {
         },
         hooks: {
           onUsage: (u) => { lastUsage = u; },
-          onText: (delta) => {
-            // T8.1：回复层再脱敏一次 —— 密钥/凭据绝不推到界面或落进日志。
-            // 逐 token 推流意味着必须用流式脱敏器（见 security/redact-stream.ts）。
-            const safe = textRedactor.push(delta);
-            if (safe.length === 0) return;
-            const p = ensureText(); p.text += safe;
-            eventLog.append("assistant_text", { delta: safe.slice(0, 400) }, { run: runId, step: stepNo });
-            opts.sink({ type: "text", content: safe });
-          },
-          onReasoning: (delta, full) => {
-            const p = ensureReasoning(); p.text = full;
-            opts.sink({ type: "reasoning", content: delta });
-          },
+          onText: (delta) => texts.push(delta),
+          onReasoning: (delta, full) => texts.reasoning(delta, full),
+          onStreamEnd: () => texts.flush(),   // 每个 step 都要放尾巴，见 text-collector.ts（问题 ⑥）
           onToolStart: (call: ToolCallPayload) => {
             wd.touch();
             const tp: ToolPart = {
@@ -334,17 +331,19 @@ export class AgentRuntime {
       });
     } finally { wd.stop(); }
 
-    // 把脱敏器扣住的尾巴放出来（否则最后一段会丢）
-    //
-    // ⚠️ 这里也必须写事件日志。之前漏了，后果是：
-    //    脱敏器有 256 字符回看窗口，**短回复整段都扣在窗口里**，
-    //    只在 flush 时吐出 —— 于是「模型说过的话」几乎从来没进过日志。
-    //    实测 1092 轮对话只留下 2 条 assistant_text，日志视图里 AI 全是空的。
-    const tailText = textRedactor.flush();
-    if (tailText.length > 0) {
-      const p = ensureText(); p.text += tailText;
-      eventLog.append("assistant_text", { delta: tailText.slice(0, 400) }, { run: runId, step: stepNo });
-      opts.sink({ type: "text", content: tailText });
+    // 尾巴兜底：每个 step 已经 flush 过，这里再放一次（幂等，防止 provider 报错提前退出那一步）
+    texts.flush();
+
+    // ── 空回合兜底（问题 ④）：为什么会有这种结局，见 agent/turn-outcome.ts 顶部
+    const silent = !hasVisibleOutcome(parts);
+    if (silent) {
+      const note = noOutputNote(result.endReason, result.aborted);
+      eventLog.append("interrupted", {
+        endReason: result.endReason, aborted: result.aborted, steps: result.steps, note,
+      }, { run: runId });
+      // 先报「被中断了」，再补一条 text 说明：只发 interrupted，用户只看到"已暂停"
+      opts.sink({ type: "interrupted", endReason: result.endReason, aborted: result.aborted, note });
+      texts.annotate(note);
     }
 
     for (const p of parts) if (!isToolPart(p)) p.state = "output-available";
@@ -381,7 +380,7 @@ export class AgentRuntime {
       }
     }
 
-    return { assistantMessageId: assistantMsg.id, endReason: result.endReason, usage: result.usage };
+    return { assistantMessageId: assistantMsg.id, endReason: result.endReason, usage: result.usage, silent };
   }
 }
 

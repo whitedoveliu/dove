@@ -8,29 +8,16 @@ import {
   Eye, 
   FilePlus, 
   Pencil, 
-  Trash2, 
-  RefreshCw, 
   Search, 
-  Hammer, 
-  Palette, 
-  BookOpen, 
-  Image, 
   HelpCircle,
   Terminal,
-  Database,
-  Cloud,
-  Key,
   ListTodo,
   Camera,
   History,
-  FileText,
   Globe,
-  Phone,
   Brain,
   CheckCircle,
   CheckCircle2,
-  Sparkles,
-  SearchCode,
   LucideIcon,
   Send,
   MessageSquareMore,
@@ -67,6 +54,7 @@ import remarkBreaks from "remark-breaks";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import TodoPanel from "./TodoPanel";
+import { TurnActions } from "@/components/turn-actions";
 import { PresentedFiles } from "@/components/presented-files";
 import { PlanCard } from "@/components/plan-card";
 import {
@@ -100,6 +88,10 @@ interface MessageListProps {
   onRetry?: () => void;  // 重试
   /** 打开项目内文件（交付物卡片 / 正文路径点击）——接到右侧预览面板 */
   onOpenFile?: (path: string) => void;
+  /** 当前项目 key（会话末端的回滚要用；拿不到就只显示复制） */
+  projectId?: string | null;
+  /** 回滚成功后刷新历史 / 预览 —— 由 ChatPanel 接（照它 version_restored 那一段） */
+  onRolledBack?: () => void;
 }
 
 // Restore Confirm 内联组件
@@ -844,56 +836,18 @@ function getToolIcon(toolName: string): LucideIcon {
     "read_files": Eye,
     "new_file": FilePlus,
     "edit_file": Pencil,
-    "delete_file": Trash2,
-    "rename_file": RefreshCw,
     "search_in_files": Search,
-    "str_replace_based_edit_tool": Pencil,
-    "quick_edit_page": Pencil,
-    
-    // 构建和设计
-    "build_project_check": Hammer,
-    "design_layout": Palette,
-    "design_system_planning": Palette,
-    
-    // React Bits
-    "get_react_bits_list": Search,
-    "get_react_bits_documentation": BookOpen,
-    "install_react_bits": Wrench,
-    
-    // 图片相关
-    "generate_images": Image,
-    "edit_image_ai": Image,
-    "get_url_screenshot": Camera,
     
     // 用户交互
     "ask_user": HelpCircle,
-    "ask_user_for_secret": Key,
     
     // 搜索和文档
-    "search_help_docs": Search,
-    "search_library_docs": Search,
-    "get_library_documentation": BookOpen,
     "web_search": Globe,
-    "code_search": SearchCode,  // AI 代码搜索
-    
-    // 数据库和部署 (Dove Cloud)
-    "connect_dove_cloud": Cloud,
-    "execute_sql": Database,
-    "deploy_edge_function": Cloud,
-    "get_supabase_secret_list": Key,
     
     // 命令和历史
     "run_command": Terminal,
-    "get_history_version_code": History,
-    "read_console_logs": FileText,
-    "read_network_requests": Globe,
     
     // 其他
-    "save_todo": ListTodo,
-    "get_form_url": Globe,
-    "add_dove_call": Phone,
-    "memory": Brain,
-    "sub_agent": Sparkles,
     "finish": CheckCircle,
     "todo_write": ListTodo,
   };
@@ -912,23 +866,10 @@ function formatToolInfo(toolName: string, info?: string): string {
     "edit_file": ["file_path", "path"],
     "new_file": ["file_path", "path"],
     "read_files": ["file_paths", "file_path", "path"],
-    "delete_file": ["file_path", "path"],
-    "rename_file": ["old_path", "new_path"],
-    "str_replace_based_edit_tool": ["path"],
-    "quick_edit_page": ["file_path", "path"],
     // 搜索工具 - 提取查询
     "search_in_files": ["query", "search", "keyword"],
-    "search_context7": ["query"],
-    "get_docs_context7": ["query"],
-    "code_search": ["query"],  // AI 代码搜索
-    // URL 工具 - 提取 URL
-    "get_url_screenshot": ["url"],
-    "get_form_url": ["url"],
     // 命令工具 - 提取命令
     "run_command": ["command"],
-    // 数据库工具 - 提取描述
-    "execute_sql": ["description"],
-    "deploy_edge_function": ["function_name", "function_slug"],
   };
   
   const keys = keyMappings[toolName] || ["file_path", "path", "query", "url", "command"];
@@ -1153,6 +1094,8 @@ export default function MessageList({
   onScreenshotCancel,
   onRetry,
   onOpenFile,
+  projectId,
+  onRolledBack,
 }: MessageListProps) {
   // 跟踪哪些折叠区域被展开了
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
@@ -1178,7 +1121,7 @@ export default function MessageList({
         <div className="text-center space-y-4">
           <div className="flex justify-center">
             <img 
-              src="/logo.png" 
+              src="/dove-icon-512.png" 
               alt="Logo" 
               className="w-16 h-16 object-contain"
             />
@@ -1253,6 +1196,8 @@ export default function MessageList({
                   onScreenshotCancel={onScreenshotCancel}
                   onRetry={onRetry}
                   onOpenFile={onOpenFile}
+                  projectId={projectId}
+                  onRolledBack={onRolledBack}
                   isSkipped={true}
                   isLatestUserMessage={message.id === latestUserMessageId}
                 />
@@ -1278,6 +1223,8 @@ export default function MessageList({
             onScreenshotCancel={onScreenshotCancel}
             onRetry={onRetry}
             onOpenFile={onOpenFile}
+            projectId={projectId}
+            onRolledBack={onRolledBack}
             isSkipped={false}
             isLatestUserMessage={message.id === latestUserMessageId}
           />
@@ -1303,6 +1250,8 @@ function MessageItem({
   onScreenshotCancel,
   onRetry,
   onOpenFile,
+  projectId,
+  onRolledBack,
   isSkipped,
   isLatestUserMessage,
 }: {
@@ -1321,12 +1270,24 @@ function MessageItem({
   onRetry?: () => void;
   /** 打开项目内文件预览（交付物卡片 / 正文路径） */
   onOpenFile?: (path: string) => void;
+  /** 当前项目 key（会话末端的回滚要用） */
+  projectId?: string | null;
+  /** 回滚成功后刷新历史 / 预览 */
+  onRolledBack?: () => void;
   isSkipped: boolean;
   isLatestUserMessage?: boolean;
 }) {
   // 判断是否是最后一条消息且正在加载
   const isLastMessage = message.id === messages[messages.length - 1]?.id;
   const isGenerating = isLoading && isLastMessage && message.role === "assistant";
+  /**
+   * 会话末端的操作行只挂在**最后一条 assistant 消息**上（不是每条都挂）。
+   * 复制用的是去掉 <next-step-action> 的正文 —— events 分支渲染的也是这些文本。
+   */
+  const showTurnActions = isLastMessage && message.role === "assistant" && !isSkipped;
+  // 复制用的正文（去掉 <next-step-action>）。useMemo：历史消息的正文不会变，
+  // 别在别处 setState 重渲时把每条消息的正则都重跑一遍。
+  const copyText = useMemo(() => parseNextStepActions(message.content).cleanContent, [message.content]);
 
   // 本轮 Present 声明的交付物：卡片与正文 inline-code 点击共用同一份解析结果
   const presentedFiles = useMemo(() => extractPresentedFiles(message.events), [message.events]);
@@ -1873,8 +1834,10 @@ function MessageItem({
                       聊天显示「版本 2」→ git 的 version 2 → 实际是「恢复到版本 1」那个提交
                     → 点它会切到回滚的内容，不是那次对话的改动。
 
-                    回滚入口保留在右侧面板的「版本历史」—— 它直接读 git 列表
-                    （version_number = list.length - i），不会错位。
+                    回滚入口现在有两处，都**直接读 git 列表**（不会错位）：
+                      · 右侧面板的「版本历史」（version_number = list.length - i）
+                      · 最后一条消息下方的操作行（见 components/turn-actions.tsx，
+                        取 versions[1] = 上一轮之前的快照）
                   */}
                   {false && message.version_number && (
                     <button
@@ -1955,12 +1918,27 @@ function MessageItem({
           </div>
       </PresentedFileContext.Provider>
 
-      {/* 时间戳和费用 - 气泡外部，生成中不显示 */}
-      {!(isGenerating) && (
+      {/* 时间戳和费用 - 气泡外部，生成中不显示。
+          最后一条 assistant 消息例外：它的时间挪到下面操作行的右侧元信息里，
+          免得同一个时间在同一块地方出现两次。 */}
+      {!(isGenerating) && !showTurnActions && (
         <div className="text-[10px] text-muted-foreground/60 px-1 flex items-center gap-2 justify-start">
           <span>{message.timestamp.toLocaleTimeString()}</span>
             </div>
           )}
+
+      {/* 会话末端的操作行：复制 / 回滚 + 右侧淡色元信息（token 用量 · 时间）。
+          只给最后一条 assistant 消息 —— 这是「这一轮跑完了，我能做什么」的动作区。 */}
+      {showTurnActions && (
+        <TurnActions
+          content={copyText}
+          projectId={projectId}
+          usage={message.usage}
+          timestamp={message.timestamp}
+          disabled={isLoading || isSwitchingVersion}
+          onRolledBack={onRolledBack}
+        />
+      )}
       </div>
   );
 }

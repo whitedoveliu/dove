@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { HEARTBEAT_CHECKLIST_TEXT } from "../constants.ts";
 
 export const CORE_FILES = ["SOUL.md", "USER.md", "MEMORY.md", "HEARTBEAT.md"] as const;
 export type CoreFileName = (typeof CORE_FILES)[number];
@@ -97,16 +98,12 @@ export const DEFAULT_MEMORY: string =
     "## 线索",
   ].join("\n") + "\n";
 
-export const DEFAULT_HEARTBEAT: string =
-  [
-    "# HEARTBEAT · 主动性检查单",
-    "",
-    "> 每次心跳醒来时按这份清单自检；没事做就安静待着，不要刷存在感。",
-    "",
-    "- 有没有没跑完的任务？",
-    "- 有没有值得主动汇报的进展？",
-    "- 有没有快到期的事情需要提醒？",
-  ].join("\n") + "\n";
+/**
+ * 首次运行落盘的 HEARTBEAT.md。
+ * 文本单点在 constants.ts —— 清单必须与心跳兜底清单**同一份**，
+ * 否则「有 HEARTBEAT.md」和「没有 HEARTBEAT.md」两种情况下自检的问题都不一样。
+ */
+export const DEFAULT_HEARTBEAT: string = HEARTBEAT_CHECKLIST_TEXT + "\n";
 
 // ── 日期工具（本地时区） ─────────────────────────────────────
 

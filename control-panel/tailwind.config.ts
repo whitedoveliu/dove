@@ -1,7 +1,7 @@
 import type { Config } from "tailwindcss";
 
 /**
- * Aperture Design System — Tailwind bridge.
+ * Dove Design System — Tailwind bridge.
  *
  * Every value here reads from a CSS custom property declared in
  * app/globals.css, so the whole product re-themes from one place and

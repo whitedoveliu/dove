@@ -31,7 +31,8 @@ import {
   getProjectInfo,
   type Project,
 } from "@/lib/api";
-import { normalizeProjectPath } from "@/lib/presented-files";
+import { normalizeProjectPath, type PresentedFile } from "@/lib/presented-files";
+import { isHtmlPath } from "@/lib/preview-url";
 
 // 获取 API 主机地址（支持局域网访问）
 const getApiHost = () => typeof window !== "undefined" ? window.location.hostname : "localhost";
@@ -75,6 +76,10 @@ function ControlPanel() {
   const [asideCollapsed, setAsideCollapsed] = useState(false);
   const [health, setHealth] = useState<"unknown" | "online" | "offline">("unknown");
   const [activeFile, setActiveFile] = useState<{ port: string; path: string } | null>(null);
+  /** 要在右侧「浏览器」标签打开的网页（agent 产出的 .html / 用户点交付物卡片） */
+  const [previewOpenTarget, setPreviewOpenTarget] = useState<{ path: string; token: number; force: boolean } | null>(null);
+  /** 「预览就绪」自增计数：右侧收到后切回浏览器标签 */
+  const [previewFocusToken, setPreviewFocusToken] = useState(0);
   const { toast } = useToast();
   const iframeRef = useRef<HTMLIFrameElement>(null);
   
@@ -83,6 +88,22 @@ function ControlPanel() {
   const IDLE_TIMEOUT = 10 * 60 * 1000; // 10 分钟
   
   /**
+   * 在右侧「浏览器」标签打开一个项目内网页。
+   * force = 用户自己点的（一定打开）；否则是 agent 产出的自动打开（用户接管过地址栏就不抢）。
+   */
+  const openWebPage = useCallback((path: string, force: boolean) => {
+    setAsideCollapsed(false);   // 预览区收起了就先展开，否则打开了也看不到
+    setPreviewOpenTarget({ path, token: Date.now() + Math.random(), force });
+  }, []);
+
+  /** Present 声明了交付物：只有网页（.html）才自动打开，png / csv 之类不打扰 */
+  const handlePresentedFiles = useCallback((files: PresentedFile[]) => {
+    const page = files.find((f) => isHtmlPath(f.path));
+    if (!page) return;
+    openWebPage(page.path, false);
+  }, [openWebPage]);
+
+  /**
    * 打开项目内文件预览（消息流里的交付物卡片 / 正文里的文件路径）。
    *
    * 复用目录面板那条链：setActiveFile → 右侧 FilePeek → readProjectFile(port, path)。
@@ -90,6 +111,7 @@ function ControlPanel() {
    *   · 字符串归一化（反斜杠转正斜杠、去掉 "./" 前缀）
    *   · 万一是绝对路径，按项目根裁成相对路径；拿不到项目根就原样试，
    *     FilePeek 会显示「文件不存在」，不会静默失败
+   *   · 网页（.html）改走右侧「浏览器」标签渲染，不当文本读
    */
   const handleOpenProjectFile = useCallback(async (path: string) => {
     const port = projectId;
@@ -105,8 +127,10 @@ function ControlPanel() {
         /* 拿不到项目根：按原样试，让 FilePeek 报错 */
       }
     }
+    // 网页交付物直接渲染，不当文本读
+    if (isHtmlPath(target)) { openWebPage(target, true); return; }
     setActiveFile({ port, path: target });
-  }, [projectId]);
+  }, [projectId, openWebPage]);
 
   // 处理运行时错误的回调
   const handleRuntimeError = useCallback((error: { message: string; source?: string; lineno?: number; stack?: string }) => {
@@ -251,9 +275,10 @@ function ControlPanel() {
     // 热更常开：构建交给 dev server，静态模式那套 loading 已不需要
   }, []);
   
-  // 预览构建完成回调：热更模式下只需清理 loading
+  // 预览构建完成回调：热更模式下只需清理 loading，并让右侧自动切回浏览器标签（Codex 那种）
   const handlePreviewReady = useCallback(async (_newVersion: number) => {
     setIsRefreshingPreview(false);
+    setPreviewFocusToken((n) => n + 1);
   }, []);
   
   // iframe 用户活动回调（用于重置空闲计时器）
@@ -776,6 +801,7 @@ function ControlPanel() {
             enableHotReload={enableHotReload}
             onFileModifying={setIsFileModifying}
             onOpenFile={(path) => void handleOpenProjectFile(path)}
+            onPresentedFiles={handlePresentedFiles}
             onProjectCreated={() => void loadProjects(true)}
             onQuickCreateTask={(text) => void handleQuickCreateTask(text)}
             projects={projects}
@@ -812,6 +838,8 @@ function ControlPanel() {
               devServerPort={devServerPort}
               onDevServerPortChange={setDevServerPort}
               onStartDevServer={handleStartDevServer}
+              openTarget={previewOpenTarget}
+              focusToken={previewFocusToken}
               asideCollapsed={asideCollapsed}
               onToggleAside={() => setAsideCollapsed((prev) => !prev)}
             />

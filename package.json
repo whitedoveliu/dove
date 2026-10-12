@@ -2,17 +2,15 @@
   "name": "dove",
   "private": true,
   "version": "0.1.0",
-  "description": "AI 创意 agent：网站 / PPT / 视频 / 图片生成，桌面端形态",
+  "description": "编码 agent：常驻 TS 内核 + Web 工作台（浏览器 / 桌面 / CLI 共用同一内核）",
   "scripts": {
     "panel:dev": "pnpm --filter control-panel dev",
     "panel:build": "pnpm --filter control-panel build",
     "verify": "./verify.sh",
-    "verify": "./verify.sh",
-    "tpl:dev": "pnpm --filter react-2.0-tpl dev",
     "app": "./scripts/dove.sh",
     "app:build": "./scripts/dove.sh --build"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   }
 }

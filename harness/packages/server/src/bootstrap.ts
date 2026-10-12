@@ -35,6 +35,7 @@ import { providerLlm } from "../../core/src/memory/index.ts";
 import { MEMORY_SLEEP_DEFAULTS } from "../../core/src/constants.ts";
 import { initMcp, type McpWiring } from "./mcp-wiring.ts";
 import type { McpPort } from "./mcp-wiring.ts";
+import { publishDiscovery } from "./discovery.ts";
 
 export type { Config, Services, EmotionPort, FatiguePort, CronPort, HeartbeatPort, ActivityPort } from "./bootstrap-types.ts";
 function findEnvFile(start: string): string | null {
@@ -75,7 +76,8 @@ export function loadConfig(): Config {
     dbFile: process.env.DOVE_DB ?? join(repoRoot, "harness", ".data", "dove.db"),
     configDir: process.env.DOVE_CONFIG ?? join(homedir(), ".dove"),
     workspaceRoot: process.env.DOVE_WORKSPACE ?? join(homedir(), "DoveProjects"),
-    templateDir: process.env.DOVE_TEMPLATE ?? (existsSync(join(repoRoot, "react-2.0-tpl")) ? join(repoRoot, "react-2.0-tpl") : undefined),
+    // 模板目录可选：仓库不再内置模板，只有显式设了 DOVE_TEMPLATE 时才往新项目里拷
+    templateDir: process.env.DOVE_TEMPLATE,
     providerBaseUrl: process.env.DOVE_BASE_URL ?? "https://api.deepseek.com/v1",
     apiKey: key,
     tavilyApiKey,
@@ -275,7 +277,14 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     configDir: cfg.configDir,
     run: async (prompt) => {
       const homeId = store.getOrCreateHomeThread().id;
-      const r = await runtime.run({ threadId: homeId, userText: prompt, sink: (e) => emit({ ...e, heartbeat: true }) });
+      const r = await runtime.run({
+        threadId: homeId, userText: prompt,
+        sink: (e) => emit({ ...e, heartbeat: true }),
+        heartbeat: true,   // 心跳不需要"完成任务"这道守卫（见 RunOptions.heartbeat）
+      });
+      // 空产出的心跳 = 无事发生。runtime 会为「没有任何可见产出」的回合补一条说明
+      // （问题 ④），但那是给**用户回合**看的；心跳把它当汇报发出去就是纯噪音。
+      if (r.silent) return "";
       return assistantText(r.assistantMessageId, homeId);
     },
     // 只有「真的需要用户注意」的内容才会走到这里（HEARTBEAT_OK 已被 heartbeat 内部抑制）
@@ -323,6 +332,10 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       activity = null;
     }
   }
+
+  // 对外发现信息（~/.dove/port + api-spec.md）：内核是常驻服务，CLI / 外部 agent
+  // 得先知道去哪儿说话。只写这两个文件，绝不碰用户数据；写失败也不影响内核干活。
+  publishDiscovery(cfg, tools.size);
 
   return {
     cfg, db, store, eventLog, pending, steering, runtime, tools, projects, preview, memory, tasks,

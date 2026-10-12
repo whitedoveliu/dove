@@ -1,5 +1,5 @@
 /**
- * 模型展示名与用量归一化（与后端 model_pricing.py / agent_stats.py 对应）。
+ * 模型展示名与用量归一化。
  *
  * 后端 usage 结构经历了一次演进：
  *   · 旧：只有 sonnet / opus 两个 Claude 档位桶
@@ -43,7 +43,7 @@ export interface UsageLike {
   };
 }
 
-/** 已知模型的展示名（key 与后端 model_pricing.REGISTRY 对齐） */
+/** 已知模型的展示名 */
 const DISPLAY_NAMES: Record<string, string> = {
   "deepseek-flash": "DeepSeek V4.1 Flash",
   "deepseek-v4-pro": "DeepSeek V4 Pro",
@@ -58,7 +58,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   "gemini-2.5-flash": "Gemini 2.5 Flash",
   unknown: "未知模型",
   // 历史 wire 值：sonnet / opus 只是"基础档 / 升级档"的旧字段名，
-  // 当前两档实际对应 deepseek-flash / deepseek-v4-pro（见 python/agent_stats.py 注释）
+  // 当前两档实际对应 deepseek-flash / deepseek-v4-pro
   sonnet: "DeepSeek V4.1 Flash",
   opus: "DeepSeek V4 Pro",
   混合: "混合模型",

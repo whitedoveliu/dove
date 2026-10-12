@@ -1,13 +1,14 @@
 /**
  * SSE 事件翻译层：新内核的事件 → control-panel 认识的**老词表**。
  *
- * 为什么要有这一层：control-panel 是已经调好的界面（用户明确要求不要动它），
- * 它消费的是老 Python 后端那套事件。内核换了，但**契约不能换** ——
+ * 为什么要有这一层：control-panel 消费的就是这套事件词表，**契约不能换** ——
  * 换契约就得改界面，改界面就是"UI 变了"。
  *
- * 老词表的权威来源是 python/agent_core.py 的 yield 语句（逐字对齐）。
+ * 老词表由本文件定义 —— 字段名逐字对齐 control-panel 实际读取的那些。
  */
 import type { AgentEvent } from "../agent/events.ts";
+import { humanDuration } from "../../../core/src/constants.ts";
+import { goalLegacyEvents } from "./sse-goal.ts";
 
 /** 老契约里前端会读的事件 */
 export type LegacyEvent =
@@ -26,7 +27,7 @@ export type LegacyEvent =
   | { type: "tool_result"; tool: string; result: string }
   | { type: "todo_update"; todos: unknown[]; merge?: boolean }
   | { type: "stats"; rounds: number; is_modified: boolean; model_escalated: boolean; usage: LegacyUsage }
-  | { type: "log"; content: string }
+  | { type: "log"; content: string; goal_eval?: LegacyGoalEval }
   | { type: "build_start" }
   | { type: "build_error"; error: string }
   | { type: "preview_ready" }
@@ -36,6 +37,23 @@ export type LegacyEvent =
   | { type: "error"; message: string }
   | { type: "ask_user"; tool_use_id: string; question: string; suggestions?: string[] }
   | { type: "done" };
+
+/**
+ * 目标评估结论的机器可读部分 —— 挂在 log 事件上（面板只读 content，这些字段给 CLI / 脚本）。
+ * 形状贴着内核的 GoalVerdict（/api/projects/:id/goal 的 last_eval 就是它），两处回读好对照。
+ *
+ * 为什么不新造一个 goal_eval 事件类型：面板的词表是**写死的**，它不认的类型等于没发。
+ */
+export interface LegacyGoalEval extends GoalVerdict {
+  /** 通过项 id（= items 里没进 failures 的那些） */
+  passed: string[];
+  /** 证据条数：这一轮送到评估器面前的有几条（空证据一律 FAIL，靠它分清「没证据」和「没达标」） */
+  evidence: number;
+  /** model = 真评估器；stub = 冒烟桩 */
+  evaluator: string;
+  /** 目标端口写不回结论时（complete 会一直被拒）的补充说明 */
+  note?: string;
+}
 
 export interface LegacyUsage {
   total_cost_usd: number;
@@ -89,7 +107,7 @@ export function toolInfoLine(input: Record<string, unknown> | undefined): string
   return parts.join("\n").slice(0, 300);
 }
 
-/** 工具结果转字符串（老契约要字符串，超长截到 500 —— 和 Python 版一致） */
+/** 工具结果转字符串（老契约要字符串，超长截到 500） */
 export function resultToString(result: unknown, limit = 500): string {
   let s: string;
   if (typeof result === "string") s = result;
@@ -99,7 +117,7 @@ export function resultToString(result: unknown, limit = 500): string {
   return s.length > limit ? s.slice(0, limit) + "..." : s;
 }
 
-/** 只有这些工具算"改了代码"（Python 版就是这几个） */
+/** 只有这些工具算"改了代码"（老契约就是这几个） */
 export const MODIFYING_TOOLS = new Set([
   "Write", "Edit", "Delete", "new_file", "edit_file", "delete_file", "rename_file",
   "quick_edit_page", "str_replace_based_edit_tool",
@@ -184,9 +202,30 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
           String(e.title ?? "需要你的许可"),
           e.message ? String(e.message).slice(0, 600) : "",
           e.riskLevel ? `（风险等级：${e.riskLevel}）` : "",
+          // 提前把等待上限说清楚（问题 ⑤）：用户离开工位前就知道不处理会自动拒绝，
+          // 而不是回来只看到一句没头没尾的失败。
+          typeof e.timeoutMs === "number" ? `（${humanDuration(e.timeoutMs)}内未处理将自动拒绝）` : "",
         ].filter(Boolean).join("\n\n"),
         suggestions: ["允许", "拒绝"],
       }];
+
+    // ── 审批超时（问题 ⑤）───────────────────────────
+    // 内核在等待超时时专门发这个事件。以前没有它，超时是**完全静默**的：
+    // 前端弹窗还开着、用户回来只看到「Bash 失败」，不知道中间发生过什么。
+    case "tool:approval_timeout": {
+      const tool = String(e.tool ?? "");
+      const waited = typeof e.timeoutMs === "number" ? humanDuration(e.timeoutMs) : "";
+      return [{ type: "log", content: `⏱ 审批等待超时${waited ? "（" + waited + "）" : ""}，已自动拒绝${tool ? "：" + tool : ""}。想等久一点：DOVE_APPROVAL_TIMEOUT_MS` }];
+    }
+
+    // ── 空回合（问题 ④）───────────────────────────────
+    // 内核在「回合结束了但用户什么也没看到」时发这个。老契约的 interrupted 是前端
+    // 认得的事件：它把这条 assistant 消息标成「已中断」并显示重试按钮
+    // （见 control-panel/src/components/ChatPanel.tsx 的 `event.type === "interrupted"`）。
+    // 说明文案由内核随事件一起发 text，前端会把它显示出来 —— 只发 interrupted
+    // 的话用户看到的只有"已暂停"三个字，还是不知道发生了什么。
+    case "interrupted":
+      return [{ type: "interrupted" }];
 
     case "compaction":
       return [{ type: "log", content: `🗜 上下文压缩：${e.from} → ${e.to} 条` }];
@@ -313,6 +352,12 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
 
     case "tool:attempt-completion":
       return [];
+
+    // ── 长期目标：评估结论 / 轮次推进 / 被挡下（翻译在 sse-goal.ts，这里只转发）──
+    case "goal_eval":
+    case "goal_round":
+    case "goal_blocked":
+      return goalLegacyEvents(e);
 
     default:
       return [];

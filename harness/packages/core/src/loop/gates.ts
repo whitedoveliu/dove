@@ -37,6 +37,13 @@ export interface GateInput {
   hadToolCalls: boolean;
   /** 是否被用户中止 */
   aborted: boolean;
+  /**
+   * 跳过完成守卫（② 心跳回合用）。
+   * 心跳的契约是「没事就只回 HEARTBEAT_OK」——本来就没有"完成任务"这回事。
+   * 守卫在这里只会强行再开一轮，于是模型把 OK 又说一遍、或补一句"自检完成"，
+   * 结果是**明明没事却打扰用户**（实测复现：输出 "HEARTBEAT_OK心跳自检完成，没有需要打扰你的事。"）。
+   */
+  skipCompletionGuard?: boolean;
 }
 
 export interface GateDecision {
@@ -60,7 +67,8 @@ export function evaluateGates(input: GateInput, c: GateCounters): GateDecision {
   // ② 完成守卫：干过活的回合必须明确声明完成
   //    ⚠️ 只在 hadToolCalls 时触发 —— 纯聊天回合强制声明完成毫无意义，
   //       而且会诱发模型把刚说过的话再说一遍（实测过的事故）。
-  if (input.hadToolCalls && !input.sawAttemptCompletion
+  if (!input.skipCompletionGuard
+      && input.hadToolCalls && !input.sawAttemptCompletion
       && input.finishReason === "stop" && input.sawVisibleOutput
       && c.completionGuard < COMPLETION_GUARD_RETRIES) {
     return {

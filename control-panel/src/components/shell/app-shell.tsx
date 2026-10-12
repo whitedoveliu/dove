@@ -6,8 +6,8 @@ import { cn } from "@/lib/utils";
 
 /* ---------------------------------------------------------------- constants */
 
-const SIDEBAR_KEY = "aperture-sidebar-width";
-const ASIDE_KEY = "aperture-preview-width";
+const SIDEBAR_KEY = "dove-sidebar-width";
+const ASIDE_KEY = "dove-preview-width";
 
 export const SIDEBAR_MIN = 208;
 export const SIDEBAR_MAX = 480;
