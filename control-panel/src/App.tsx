@@ -808,7 +808,17 @@ function ControlPanel() {
   const handleChooseAndAttach = async () => {
     try {
       const picked = await chooseFolder();
-      if (!picked.success || !picked.path) return;   // 用户取消就什么都不做
+      if (picked.cancelled) return;                 // 用户主动取消：正常路径，不做声
+      if (!picked.success || !picked.path) {
+        // 拿不到路径 ≠ 取消（没有选择器 / Tauri 命令被 ACL 拒 / 超时 / 后端读不懂）——
+        // 必须说出来。以前这里跟取消合并成一句 `return`，症状就是「点了没反应」（真栽过）。
+        toast({
+          title: "没能唤起文件夹选择框",
+          description: picked.message ?? "未知原因",
+          tone: "warning",
+        });
+        return;
+      }
       const result = await attachFolder({ path: picked.path });
       toast({ title: result.message, description: result.project?.path, tone: "success" });
       await loadProjects(true);
