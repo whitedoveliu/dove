@@ -4,14 +4,14 @@
   Dove
 </h1>
 
-<p align="center"><strong>A coding agent with screen memory.</strong><br>Resident HTTP kernel · CLI, browser and desktop clients · 44 built-in tools</p>
+<p align="center"><strong>A coding agent that runs as a resident kernel.</strong><br>Resident HTTP kernel · CLI, browser and desktop clients · 44 built-in tools</p>
 
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
 <p align="center">
   <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-3_steps-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-features"><img src="https://img.shields.io/badge/Tools-44-green?style=for-the-badge" alt="Tools"></a>
-  <a href="#-verification"><img src="https://img.shields.io/badge/Tests-59_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
+  <a href="#-verification"><img src="https://img.shields.io/badge/Tests-294_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -33,19 +33,24 @@ change code  →  build to prove it  →  look at the result  →  roll back if 
 
 | | |
 |---|---|
-| 🧠 **Screen memory** | screenshots → 3-level dedupe → local OCR → CJK index → retrieved into the current turn |
 | 🐍 **PTC (RunScript)** | the model writes a TS/JS script that calls other tools; one approval covers the whole script, every call still re-enters the kernel |
-| ⌨️ **`dove` CLI** | 17 subcommands against the resident kernel (`run` · `chat` · `approve` · `steer` · `tools` …); `--json` emits NDJSON |
-| 🤖 **Subagents** | isolated context, 10-tool whitelist, 100-step cap; the run is a sub-thread you can click into |
+| ⌨️ **`dove` CLI** | 18 subcommands against the resident kernel (`run` · `chat` · `approve` · `steer` · `undo` · `tools` …); `--json` emits NDJSON |
+| 🤖 **Subagents** | four roles (`general` / `coder` / `explore` / `plan`) each with its own tool allow-list, 100-step cap, and a run you can click into; `resume` re-attaches the **same** context instead of starting over |
 | 🖥️ **Terminal & jobs** | one shell stays alive, so `cd` / `export` survive; background jobs keep the last 200,000 chars, stall at 90 s, auto-background at 60 s |
 | 📋 **Goals with acceptance** | `criteria` are graded by an independent evaluator each round; empty evidence = automatic FAIL, failures are fed into the next round |
 | 🛡️ **Permissions** | read-only removes the write tools from the tool table; approvals scan **every segment**, and script calls re-enter the same chain |
+| 📝 **Project instructions** | `AGENTS.md` from config home, `~/.agents`, then repo root → cwd, each block tagged with a `<!-- From: path -->` anchor; over 32 KiB warns instead of truncating |
+| 🔒 **Secret-path guard** | a hard deny list (SSH / cloud creds / `.env`, plus this repo's own `env`) that **never** becomes an approval prompt; Grep and Glob filter hits out instead of erroring |
 | 🧩 **Event-sourced turns** | what the model saw is what is on disk; unpaired tool calls become "unknown result"; a turn with no output emits `interrupted` |
+| 🗂️ **Per-thread journal + undo** | every thread gets its own append-only log (`seq` **is** the line number, large bodies go to blobs instead of being cut at 2 000 chars); `dove undo` marks turns as undone and deletes nothing |
+| ⚖️ **Ordered approval chain** | seven named policies, first verdict wins; a tool can declare its own rule pattern (`Bash(rm *)`) so "allow and remember" is per-shape, not per-tool |
+| 🧵 **Conflict-aware scheduling** | tools declare which paths they touch; read-only calls run in parallel, writes to an overlapping path serialise, submission order never jumps the queue |
+| 📉 **Turn net-diff** | `Write` / `Edit` self-report their mutations, so each turn yields one net diff per file (first `before` + last `after`), emitted as a `turn_diff` event |
+| 🔔 **Notifications that keep the turn alive** | a background task finishing mid-turn is delivered through the steering channel, so the gate extends the turn and the model sees the result without waiting for the next prompt |
+| 🔑 **Env stays in the environment** | a setting that came from an env var is never written to `model.json` (env > file > default), so a temporary secret cannot become a permanent file |
 
 ## 🤔 Why it is different
 
-- **It remembers your screen, not just your files.** OCR frames are indexed with a self-built CJK 2-gram inverted
-  index (FTS5 returns 0 hits for Chinese) and retrieved with two legs: local ONNX vectors at 0.40, or bag-of-words at 0.25.
 - **Its permissions are capability cuts.** Read-only does not instruct the model to avoid writing — the write tools are
   removed from its tool table before the turn starts, and approvals scan **every segment** of a command chain. A script
   call is never a way around this: `doveTool` re-enters the same approval chain.
@@ -56,7 +61,7 @@ change code  →  build to prove it  →  look at the result  →  roll back if 
 
 ## 🚀 Quick start
 
-Requires **Node 24+**. Screen OCR, video and PDF helpers need macOS with Xcode Command Line Tools.
+Requires **Node 24+**. Video and PDF helpers need macOS with Xcode Command Line Tools.
 
 ```bash
 git clone https://github.com/whitedoveliu/dove.git && cd dove
@@ -81,8 +86,8 @@ dove run "fix the failing test" --thread <id>   # one turn, streamed to stdout
 dove approve --allow                            # answer pending approvals headlessly
 ```
 
-Optional local embedding model. Without it, memory falls back to literal matching and the screen-memory
-vector leg stays off (lexical matching still works). Both steps are needed — the model alone is not enough:
+Optional local embedding model. Without it, memory falls back to literal matching.
+Both steps are needed — the model alone is not enough:
 
 ```bash
 # 1) the one external dependency, isolated in that package (this is what loads the ONNX runtime)
@@ -100,7 +105,7 @@ The CLI is a client: it never starts a second kernel, it finds the running one a
 
 | | |
 |---|---|
-| Commands | `health` `status` `version` `up` `logs` `threads` `run` `chat` `stop` `steer` `approve` `pending` `answer` `tools` `skills` `goals` `goal` |
+| Commands | `health` `status` `version` `up` `logs` `threads` `run` `chat` `stop` `steer` `approve` `pending` `answer` `tools` `skills` `goals` `goal` `undo` |
 | Port discovery | `--port` > `DOVE_PORT` > `~/.dove/port` > scan 8790–8799 |
 | Output | `--json` is NDJSON and never colored; notes go to stderr, so `dove run --quiet "…" > answer.txt` is a clean answer |
 | Exit codes | `0` ok · `1` failure · `2` usage · `3` kernel unreachable · `4` kernel error · `130` interrupted |
@@ -112,10 +117,10 @@ The CLI is a client: it never starts a second kernel, it finds the running one a
 ```
 harness/          kernel (Node runs .ts natively — no build step)
   bin/dove.mjs      CLI entry point (package.json `bin`)
-  packages/cli/     CLI: port discovery · HTTP + SSE client · 17 subcommands
-  packages/core/    loop · tools · memory · subagents · permissions · screen perception
+  packages/cli/     CLI: port discovery · HTTP + SSE client · 18 subcommands
+  packages/core/    loop · tools · memory · subagents · permissions
   packages/server/  HTTP + SSE · tool control plane · the legacy API the UI talks to
-  packages/prompts/ 11 prompt slots (s01–s11)
+  packages/prompts/ 12 prompt slots (s01–s12; s12 = project AGENTS.md)
   scripts/          smoke tests (they execute the real paths)
 control-panel/    UI (React 19 + Vite)
 apps/desktop/     Tauri shell (resolves the kernel at runtime: DOVE_REPO → ~/.dove/repo → upward search)
@@ -133,10 +138,9 @@ every file stays ≤ 400 lines (`lint-file-size.mjs`).
 | `DOVE_MODEL` / `DOVE_TOOL_MODEL` | `deepseek-flash` | main model / tool model |
 | `DOVE_PORT` | `8790` | kernel port |
 | `DOVE_WORKSPACE` | `~/DoveProjects` | projects root |
-| `DOVE_CONFIG` | `~/.dove` | memory, sessions, screen data, cache |
+| `DOVE_CONFIG` | `~/.dove` | memory, sessions, cache |
 | `DOVE_DB` | `harness/.data/dove.db` | SQLite file |
 | `DOVE_APPROVE` | `ask` | `ask` / `auto` / `deny` |
-| `DOVE_ACTIVITY` | on | set `off` to disable screen perception |
 | `DOVE_AUTO_BACKGROUND_MS` | `60000` | foreground Bash without an explicit timeout becomes a background job |
 | `DOVE_JOB_STALL_MS` | `90000` | no output for this long marks a job `stalled` |
 | `DOVE_REPO` | — | kernel repo for the desktop shell |
@@ -159,13 +163,21 @@ Reading a `SKILL.md` pre-checks its `requires.bins` / `requires.env` and warns a
 ## ✅ Verification
 
 ```bash
-./verify.sh              # 21 checks: lint, 3 test suites, 13 smoke scripts, 2 health, 2 E2E
-cd harness && npm test   # 59 tests: 38 core, 12 fixes, 1 goal, 5 P0, 3 wiring
+./verify.sh              # lint · full unit glob · 18 smoke scripts · 2 health · 2 E2E
+cd harness && npm test   # 304 tests across 36 files (303 pass, 1 skipped)
 ```
 
-New this round: `smoke-cli` · `smoke-ptc` · `smoke-jobs` · `smoke-loop-audit` · `smoke-goal-eval` · `smoke-goal-events`.
-Failures that are environmental, not regressions: the two health checks and `smoke-routes` need the kernel running
-on 8790; E2E needs an existing project.
+The unit step runs the whole `packages/core/test/*.test.ts` glob. It used to name three files by hand, which
+silently skipped `cache-usage` / `capture` / `mode` / `prefix` — "tests pass" was therefore a weaker claim than it
+looked. It also now prints the pass/fail tally.
+
+Smoke scripts real-execute the paths they claim to cover: `smoke-turn` `smoke-subagent` `smoke-memory`
+`smoke-terminal` `smoke-mcp-resources` `smoke-context` `smoke-routes` `smoke-cli-exit` `smoke-cli` `smoke-ptc` `smoke-jobs`
+`smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo` `smoke-legacy-files` `smoke-preview` `smoke-legacy-files` `smoke-preview`.
+
+Failures that are environmental, not regressions: the two health checks and `smoke-routes` need a kernel on 8790;
+E2E needs an existing project. `verify.sh` refuses to start if a smoke port is already taken — two concurrent
+runs otherwise collide and look like code breakage.
 
 ## 🆚 Compared with
 
@@ -174,7 +186,12 @@ on 8790; E2E needs an existing project.
 | Plan mode | Enter / ExitPlanMode | update_plan | plan mode | ✅ write tools removed (hard read-only) |
 | Subagents | Agent + TaskStop | 9 control tools | subagent + fork | ✅ navigable sub-thread + control plane |
 | Persistent terminal | TerminalCapture | write_stdin | terminal_* (node-pty) | ✅ zero-dependency PTY |
-| Screen perception | — | — | — | ✅ screenshot memory |
+| Tool-result budget | truncate + offload to a file | symmetric head/tail buffer (1 MiB) | — | ✅ per-line shaping **then** spill, head+tail preview |
+| Conversation undo | `/rewind` (restores code too) | `ThreadRolledBack` markers | — | ✅ append-only marks; nothing is ever deleted |
+| Approval memory | `allow` rules in `settings.json` | `exec_policy` amendments | — | ✅ session rules keyed by a tool-declared pattern |
+| Project instructions | `CLAUDE.md` + path-scoped rules | `AGENTS.md` (32 KiB cap) | — | ✅ `AGENTS.md` + `<!-- From: -->` anchor reverse-lookup |
+| Secret files | `permissions.deny` on Read | `deny` beats `write` beats `read` | — | ✅ read-side deny list, Grep/Glob filter instead of erroring |
+| Prompt-cache discipline | cache stats + invalidation causes | stable synthetic ids, append-only world state | — | ✅ byte-exact rebuild + step markers (`wire-history.ts`) |
 
 ## 📄 License
 
