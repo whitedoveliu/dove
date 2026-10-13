@@ -1,0 +1,36 @@
+# CI：只跑**不依赖内核、不需要模型 key** 的那半边验收。
+#
+# 为什么不直接跑来 ./verify.sh：它的第 3/4/5 段在本仓库的 runner 上**必然失败**，
+# 而且不是回归 ——
+#   · 第 3 段里的 smoke-routes、第 4 段的两项服务健康检查：需要 8790 端口上已经有一个
+#     在跑的 Dove 内核（它们打的是**真实进程**，不是自起的）
+#   · 第 5 段 E2E：需要一个已存在的项目，且要真发一轮对话
+#   · smoke-turn：会真调模型（需要真实 key）
+# 所以这里**故意**只跑「零外部依赖」的那一半：lint + 核心单测。
+# 完整的验收口径与各环境前提见 docs/BACKGROUND.md §4 / docs/HANDOFF.md 第四节。
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # 文件大小（≤400 行）+ 依赖方向。只依赖 node，没有 npm 依赖要装。
+      - name: lint
+        working-directory: harness
+        run: npm run lint
+
+      # 核心单测：完整的 packages/core/test/*.test.ts glob（不是点名几个文件）。
+      - name: unit tests
+        working-directory: harness
+        run: node --no-warnings --test packages/core/test/*.test.ts

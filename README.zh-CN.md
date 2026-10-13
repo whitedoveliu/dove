@@ -4,14 +4,14 @@
   Dove
 </h1>
 
-<p align="center"><strong>一个有屏幕记忆的编码 agent。</strong><br>常驻 HTTP 内核 · CLI / 浏览器 / 桌面三个客户端 · 44 个内置工具</p>
+<p align="center"><strong>一个跑成常驻内核的编码 agent。</strong><br>常驻 HTTP 内核 · CLI / 浏览器 / 桌面三个客户端 · 44 个内置工具</p>
 
 <p align="center"><a href="README.md">English</a> · <strong>简体中文</strong></p>
 
 <p align="center">
   <a href="#-快速开始"><img src="https://img.shields.io/badge/Quick_Start-3_steps-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-能力"><img src="https://img.shields.io/badge/Tools-44-green?style=for-the-badge" alt="Tools"></a>
-  <a href="#-验证"><img src="https://img.shields.io/badge/Tests-59_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
+  <a href="#-验证"><img src="https://img.shields.io/badge/Tests-294_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -33,19 +33,24 @@ HTTP 客户端 —— 同一份记忆、同一份会话、同一套审批。
 
 | | |
 |---|---|
-| 🧠 **屏幕记忆** | 截屏 → 三级判重 → 本地 OCR → 中文索引 → 检索进当前回合 |
 | 🐍 **PTC（RunScript）** | 模型写一段 TS/JS 脚本去调其它工具；一次审批覆盖整段脚本，脚本里每次调用仍回内核 |
-| ⌨️ **`dove` CLI** | 对着常驻内核的 17 个子命令（`run` · `chat` · `approve` · `steer` · `tools` …）；`--json` 出 NDJSON |
-| 🤖 **子代理** | 独立上下文、10 个工具的白名单、100 步上限；过程落盘成**可点进去**的子线程 |
+| ⌨️ **`dove` CLI** | 对着常驻内核的 18 个子命令（`run` · `chat` · `approve` · `steer` · `undo` · `tools` …）；`--json` 出 NDJSON |
+| 🤖 **子代理** | 四个角色（`general` / `coder` / `explore` / `plan`）各有自己的工具白名单、100 步上限，过程落盘成**可点进去**的子线程；`resume` 重挂**同一段**上下文，而不是从零开始 |
 | 🖥️ **终端 · 后台任务** | 一个 shell 常驻，`cd` / `export` 跨命令保留；后台任务保留**尾部** 200,000 字符，90 秒无输出标 stalled，60 秒自动转后台 |
 | 📋 **目标验收** | `criteria` 每轮由**独立评估器**打分；空证据 = 自动 FAIL，失败项反馈进下一轮 |
 | 🛡️ **权限** | 只读是把写类工具**从工具表里删掉**；审批扫命令链的**每一段**，脚本调用也回同一条链 |
+| 📝 **项目指令** | `AGENTS.md`：配置目录 → `~/.agents` → 仓库根到 cwd 逐层拼接，每段带 `<!-- From: 路径 -->` 锚点（可反查「这条规矩来自哪个文件」）；超 32 KiB 只警告不截断 |
+| 🔒 **秘密路径护栏** | 读侧硬拒名单（SSH / 云凭证 / `.env`，以及本仓库自己的 `env`），**不转成审批弹窗**；Grep/Glob 命中是过滤掉结果而不是报错 |
 | 🧩 **事件溯源** | 模型可见 ⟺ 已落盘；未配对的工具调用记为「结果未知」；回合无产出会发 `interrupted` 事件而不是静默 |
+| 🗂️ **每线程日志 + 撤销** | 每个线程一份只追加日志（`seq` **就是**行号；大正文落 blob，不再 2000 字符切断）；`dove undo` 只打标记，**一个字节都不删** |
+| ⚖️ **有序审批链** | 七条具名策略，先给出结论的获胜；工具可以自报参数模式（`Bash(rm *)`），于是「同意并记住」是按形状记，不是按工具记 |
+| 🧵 **冲突感知调度** | 工具声明自己碰哪些路径；只读并行、写重叠串行、提交顺序绝不插队 |
+| 📉 **回合净 diff** | `Write` / `Edit` 自报改动，每轮按文件给出**净 diff**（首次 before + 末次 after），以 `turn_diff` 事件发出 |
+| 🔔 **通知能给回合续命** | 后台任务在回合进行中就绪时走 steering 通道送达，闸门据此把这一轮续上，模型不用等下一次开口 |
+| 🔑 **env 就留在 env 里** | 来自环境变量的设置**永不写进** `model.json`（优先级 env > 文件 > 默认），临时密钥不会变成永久文件 |
 
 ## 🤔 不一样在哪
 
-- **它记得你的屏幕，不只是文件。** OCR 帧进的是自建的中文 2-gram 倒排索引（FTS5 查中文 0 命中），
-  检索有两条腿：本地 ONNX 向量阈值 0.40，或词袋 0.25。
 - **权限是能力裁剪。** 只读不是提示词里"请别写" —— 写类工具在回合开始前就从工具表里消失了；
   审批会扫命令链的**每一段**。脚本调用绕不过去：`doveTool` 回到同一条审批链。
 - **多步活写成代码，不是多轮对话。** 一段 4 步、读两个文件的脚本 5.5 秒跑完；
@@ -55,7 +60,7 @@ HTTP 客户端 —— 同一份记忆、同一份会话、同一套审批。
 
 ## 🚀 快速开始
 
-需要 **Node 24+**。屏幕 OCR、视频与 PDF 相关能力需要 macOS + Xcode Command Line Tools。
+需要 **Node 24+**。视频与 PDF 相关能力需要 macOS + Xcode Command Line Tools。
 
 ```bash
 git clone https://github.com/whitedoveliu/dove.git && cd dove
@@ -79,7 +84,7 @@ dove run "修一下挂掉的测试" --thread <id>   # 跑一轮，流式打到 s
 dove approve --allow                        # 无人值守时批量表态待审批
 ```
 
-可选的本地向量模型。不装的话，记忆退化成字面匹配，屏幕记忆的向量腿也会关掉（词法腿照常）。
+可选的本地向量模型。不装的话，记忆退化成字面匹配。
 **两步都要做**——只下模型是不够的：
 
 ```bash
@@ -98,7 +103,7 @@ CLI 是客户端：它绝不另起内核，而是找到在跑的那个，走 HTT
 
 | | |
 |---|---|
-| 子命令 | `health` `status` `version` `up` `logs` `threads` `run` `chat` `stop` `steer` `approve` `pending` `answer` `tools` `skills` `goals` `goal` |
+| 子命令 | `health` `status` `version` `up` `logs` `threads` `run` `chat` `stop` `steer` `approve` `pending` `answer` `tools` `skills` `goals` `goal` `undo` |
 | 端口发现 | `--port` > `DOVE_PORT` > `~/.dove/port` > 扫 8790–8799 |
 | 输出 | `--json` 是 NDJSON 且不上色；提示走 stderr，所以 `dove run --quiet "…" > answer.txt` 拿到的是干净答案 |
 | 退出码 | `0` 成功 · `1` 失败 · `2` 用法错 · `3` 连不上内核 · `4` 内核报错 · `130` 被中断 |
@@ -110,10 +115,10 @@ CLI 是客户端：它绝不另起内核，而是找到在跑的那个，走 HTT
 ```
 harness/          内核（Node 原生跑 .ts，无构建步骤）
   bin/dove.mjs      CLI 入口（package.json 的 bin）
-  packages/cli/     CLI：端口发现 · HTTP + SSE 客户端 · 17 个子命令
-  packages/core/    循环 · 工具 · 记忆 · 子代理 · 权限 · 屏幕感知
+  packages/cli/     CLI：端口发现 · HTTP + SSE 客户端 · 18 个子命令
+  packages/core/    循环 · 工具 · 记忆 · 子代理 · 权限
   packages/server/  HTTP + SSE · 工具控制面 · 界面在用的旧契约兼容层
-  packages/prompts/ 11 个提示词槽位（s01–s11）
+  packages/prompts/ 12 个提示词槽位（s01–s12；s12 = 项目的 AGENTS.md）
   scripts/          冒烟测试（跑的是真实路径）
 control-panel/    界面（React 19 + Vite）
 apps/desktop/     桌面壳（启动时解析内核位置：DOVE_REPO → ~/.dove/repo → 向上查找）
@@ -130,10 +135,9 @@ apps/desktop/     桌面壳（启动时解析内核位置：DOVE_REPO → ~/.dov
 | `DOVE_MODEL` / `DOVE_TOOL_MODEL` | `deepseek-flash` | 主模型 / 工具模型 |
 | `DOVE_PORT` | `8790` | 内核端口 |
 | `DOVE_WORKSPACE` | `~/DoveProjects` | 项目根目录 |
-| `DOVE_CONFIG` | `~/.dove` | 记忆、会话、屏幕数据、缓存 |
+| `DOVE_CONFIG` | `~/.dove` | 记忆、会话、缓存 |
 | `DOVE_DB` | `harness/.data/dove.db` | SQLite |
 | `DOVE_APPROVE` | `ask` | `ask` / `auto` / `deny` |
-| `DOVE_ACTIVITY` | 开 | 设 `off` 关掉屏幕感知 |
 | `DOVE_AUTO_BACKGROUND_MS` | `60000` | 前台 Bash 未显式给 timeout 时，跑满这个时长自动转后台 |
 | `DOVE_JOB_STALL_MS` | `90000` | 后台任务多久没有新输出就标 `stalled` |
 | `DOVE_REPO` | — | 桌面壳用来定位内核仓库 |
@@ -155,13 +159,22 @@ apps/desktop/     桌面壳（启动时解析内核位置：DOVE_REPO → ~/.dov
 ## ✅ 验证
 
 ```bash
-./verify.sh              # 21 项：lint、3 组单测、13 个冒烟、2 项服务健康、2 项 E2E
-cd harness && npm test   # 59 项：核心 38、修复 12、目标 1、P0 5、接线 3
+./verify.sh              # lint · 全量单测 glob · 18 个冒烟 · 2 项服务健康 · 2 项 E2E
+cd harness && npm test   # 304 项（36 个文件，303 通过 / 1 跳过）
 ```
 
-这一轮新增 6 条冒烟：`smoke-cli` · `smoke-ptc` · `smoke-jobs` · `smoke-loop-audit` · `smoke-goal-eval` · `smoke-goal-events`。
-属于环境问题、不是回归的失败：两项服务健康检查和 `smoke-routes` 需要内核正在 8790 上跑；
-E2E 需要有已存在的项目。
+单测那一步现在跑**完整**的 `packages/core/test/*.test.ts`。它以前只手点 3 个文件，
+于是 `cache-usage` / `capture` / `mode` / `prefix` 这 4 个文件**从来没被 verify 跑过** ——
+「测试通过」这句话因此比看上去要弱。现在还会把通过/失败计数打出来。
+
+冒烟脚本都是**真实执行**它们声称覆盖的路径：`smoke-turn` `smoke-subagent` `smoke-memory`
+`smoke-terminal` `smoke-mcp-resources` `smoke-context` `smoke-routes` `smoke-cli-exit` `smoke-cli` `smoke-ptc`
+`smoke-jobs` `smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo` `smoke-legacy-files` `smoke-preview`
+`smoke-legacy-files` `smoke-preview`。
+
+属于**环境问题而不是回归**的失败项：两项服务健康与 `smoke-routes` 需要 8790 上有内核在跑；
+E2E 需要一个已存在的项目。另外 `verify.sh` 现在会在冒烟端口被占用时**直接拒绝启动** ——
+两次 verify 同时跑会互相踩，症状看起来像代码坏了。
 
 ## 🆚 对照
 
@@ -170,7 +183,12 @@ E2E 需要有已存在的项目。
 | 计划模式 | Enter / ExitPlanMode | update_plan | plan mode | ✅ 写类工具被移除（硬只读） |
 | 子代理 | Agent + TaskStop | 9 个控制工具 | subagent + fork | ✅ 可导航子线程 + 控制面 |
 | 持久终端 | TerminalCapture | write_stdin | terminal_*（node-pty） | ✅ 零依赖 PTY |
-| 屏幕感知 | — | — | — | ✅ 截图记忆 |
+| 工具输出预算 | 截断 + 外置到文件 | 对称 head/tail 缓冲（1 MiB） | — | ✅ 先按行整形**再**外置，头尾都留预览 |
+| 会话撤销 | `/rewind`（连代码一起回退） | `ThreadRolledBack` 标记 | — | ✅ 只追加标记；从不删除任何行 |
+| 审批记忆 | `settings.json` 里的 allow 规则 | `exec_policy` 修正案 | — | ✅ 会话级规则，按工具自报的参数模式匹配 |
+| 项目指令 | `CLAUDE.md` + 路径作用域规则 | `AGENTS.md`（32 KiB 上限） | — | ✅ `AGENTS.md` + `<!-- From: -->` 锚点反查 |
+| 秘密文件 | Read 的 `permissions.deny` | `deny` 胜过 `write` 胜过 `read` | — | ✅ 读侧拒绝名单；Grep/Glob 过滤而不是报错 |
+| 前缀缓存纪律 | 缓存命中率 + 失效原因 | 稳定合成 id、只追加的 world state | — | ✅ 逐字节重建 + 步记号（`wire-history.ts`） |
 
 ## 📄 License
 
