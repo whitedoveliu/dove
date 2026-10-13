@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useMemo, useState, useRef, useEffect } from "react";
+import { useMemo, useState, useRef, useEffect } from "react";
 import { 
   MessageCircle, 
   Bot, 
@@ -48,30 +48,17 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkBreaks from "remark-breaks";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import TodoPanel from "./TodoPanel";
 import { TurnActions } from "@/components/turn-actions";
 import { PresentedFiles } from "@/components/presented-files";
 import { PlanCard } from "@/components/plan-card";
+import { TurnDiffCard } from "@/components/turn-diff-card";
+import { TurnFilesCard } from "@/components/turn-files-card";
 import {
-  extractPresentedFiles,
-  matchPresentedPath,
-  type PresentedFile,
-} from "@/lib/presented-files";
-
-/**
- * 交付物上下文：`Present` 声明过的文件路径 —— 正文里 inline-code 写的同一个路径
- * 也能点开预览（见 MarkdownContent 的 code 渲染器）。
- * 默认 null：这条消息没有交付物，一切渲染保持原样。
- */
-const PresentedFileContext = createContext<{
-  files: PresentedFile[];
-  open?: (path: string) => void;
-} | null>(null);
+  MarkdownContent,
+  PresentedFileContext,
+} from "@/components/markdown-content";
+import { extractPresentedFiles } from "@/lib/presented-files";
 
 interface MessageListProps {
   messages: Message[];
@@ -79,7 +66,8 @@ interface MessageListProps {
   isLoading?: boolean;
   isSwitchingVersion?: boolean;  // 是否正在切换版本
   showLogs?: boolean;
-  onAskUserSubmit?: (messageId: string, answer: string | string[]) => void;
+  /** 回答提问 / 确认审批。remember 只可能来自审批框的「同意并记住」 */
+  onAskUserSubmit?: (messageId: string, answer: string | string[], remember?: boolean) => void;
   onVersionClick?: (commitHash: string, versionNumber: number) => void;
   onRestoreConfirm?: (messageId: string) => void;
   onRestoreCancel?: (messageId: string) => void;
@@ -197,26 +185,46 @@ function AskUserInline({
   suggestions,
   onSubmit,
   answered,
-  userAnswer
+  userAnswer,
+  approval = false,
+  rememberRule,
 }: {
   question: string;
   questionType?: "single" | "multiple";
   suggestions?: string[];
-  onSubmit: (answer: string | string[]) => void;
+  /** remember 只有审批类才可能为 true —— 普通提问永远不传 */
+  onSubmit: (answer: string | string[], remember?: boolean) => void;
   answered?: boolean;
   userAnswer?: string | string[];
+  /** 工具审批（不是普通提问）：只有它渲染「同意并记住」 */
+  approval?: boolean;
+  /** 「同意并记住」将落下的规则形状（工具自报的参数模式，如 Bash(rm -rf /tmp/x)）；缺省 = 不给该选项 */
+  rememberRule?: string;
 }) {
   const [inputValue, setInputValue] = useState("");
   const [selectedItems, setSelectedItems] = useState<string[]>([]);
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [submittedAnswer, setSubmittedAnswer] = useState<string | string[]>("");
+  /** 「同意并记住这个形状」的勾选状态（只有审批框上有它） */
+  const [rememberOn, setRememberOn] = useState(false);
+
+  /**
+   * 这次提交该不该带 remember。
+   *
+   * 只对**允许**类回答生效：内核那边 remember 会连拒绝一起落成规则，所以
+   * 「勾了记住但点拒绝」绝不能带出去 —— 否则用户以为只是这次拒绝，
+   * 实际却写了一条「以后同形状一律拒绝」的规则。
+   * 判定正则与内核 legacy/routes-chat.ts 的 yes 判定**必须一致**：两边不一致时，
+   * 后端按拒绝处理、前端却发了 remember，就是一条拒绝规则悄悄落库。
+   */
+  const rememberFor = (value: string) => rememberOn && /^(允许|同意|allow|yes|ok|y)$/i.test(value.trim());
 
   // 单选提交
   const handleSingleSubmit = (value: string) => {
     if (!value.trim() || isSubmitted) return;
     setIsSubmitted(true);
     setSubmittedAnswer(value);
-    onSubmit(value);
+    onSubmit(value, rememberFor(value));
   };
 
   // 多选切换
@@ -256,6 +264,8 @@ function AskUserInline({
   };
 
   if (showAnswered) {
+    // 这次是不是带着「记住」提交的（只有本组件自己知道 —— 历史回放里没有这个信息）
+    const remembered = rememberOn && rememberRule && typeof displayAnswer === "string" && rememberFor(displayAnswer);
     return (
       <div className="mt-3 space-y-2 pb-3 border-b border-dashed border-muted-foreground/30">
         {/* 问题 */}
@@ -268,6 +278,12 @@ function AskUserInline({
           <Speech className="w-4 h-4 text-muted-foreground/50 mt-0.5 shrink-0" />
           <p className="text-sm text-muted-foreground/70">{formatAnswer(displayAnswer)}</p>
         </div>
+        {/* 把「记住了什么」留档：只说「已同意」的话，用户下轮又看到弹窗会以为规则没生效 */}
+        {remembered && (
+          <p className="pl-6 text-2xs text-text-tertiary">
+            已记住这个形状：<code className="rounded bg-surface-inset px-1 py-0.5 font-mono">{rememberRule}</code>
+          </p>
+        )}
       </div>
     );
   }
@@ -372,6 +388,28 @@ function AskUserInline({
             </Button>
           ))}
         </div>
+      )}
+
+      {/* 「同意并记住」——只画在**审批**上，且必须让用户看清记住的是「这个形状」，
+          不是「这个工具永远放行」：形状串（工具自报的参数模式）原样展示在文案里。 */}
+      {approval && rememberRule && (
+        <label className="flex cursor-pointer select-none items-start gap-2 rounded-md border border-border bg-surface/60 px-2.5 py-2">
+          <input
+            type="checkbox"
+            checked={rememberOn}
+            onChange={(e) => setRememberOn(e.target.checked)}
+            className="mt-0.5 size-3.5 accent-accent"
+          />
+          <span className="space-y-0.5">
+            <span className="block text-xs text-foreground/90">
+              同意并记住这个形状：
+              <code className="ml-1 rounded bg-surface-inset px-1 py-0.5 font-mono text-2xs text-text-primary">{rememberRule}</code>
+            </span>
+            <span className="block text-2xs text-text-tertiary">
+              勾上后再点「允许」：之后<strong>同形状</strong>的调用直接放行，参数不一样的仍会问你 —— 不是放行整个工具。
+            </span>
+          </span>
+        </label>
       )}
 
       {/* 自定义输入 */}
@@ -908,129 +946,6 @@ function parseNextStepActions(content: string): { actions: string[]; cleanConten
   return { actions, cleanContent };
 }
 
-// Markdown 组件配置
-function MarkdownContent({ content }: { content: string }) {
-  // 交付物上下文：命中时 inline-code 渲染成可点开的预览入口
-  const presented = useContext(PresentedFileContext);
-  return (
-    <div className="text-sm leading-relaxed prose prose-sm max-w-none dark:prose-invert">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkBreaks]}
-        components={{
-        // 代码块配置
-        code({ node, inline, className, children, ...props }: any) {
-          const match = /language-(\w+)/.exec(className || '');
-          const isBlock = !inline && !!match;
-          // 正文里写成 inline-code 的交付物路径 → 可点击，点开右侧预览面板。
-          // 只认「已在这条消息里被 Present 声明过」的路径，其余 inline-code 原样渲染。
-          if (!isBlock && presented?.open) {
-            // 用**原始** children 判多行：围栏代码块即使没写语言也会带换行，不能当成 inline
-            const rawText = String(children ?? "");
-            const text = rawText.trim();
-            const hit = text && !rawText.includes("\n") ? matchPresentedPath(text, presented.files) : null;
-            if (hit) {
-              return (
-                <button
-                  type="button"
-                  title={`预览 ${hit.path}`}
-                  onClick={() => presented.open?.(hit.path)}
-                  className={cn(
-                    "px-1.5 py-0.5 rounded bg-surface-inset text-text-primary text-[0.875em] font-mono",
-                    "cursor-pointer underline decoration-dotted underline-offset-2 transition-colors duration-fast hover:bg-surface-hover",
-                    className
-                  )}
-                >
-                  {children}
-                </button>
-              );
-            }
-          }
-          return isBlock ? (
-            <SyntaxHighlighter
-              style={vscDarkPlus}
-              language={match[1]}
-              PreTag="div"
-              customStyle={{
-                margin: '0.5rem 0',
-                borderRadius: '0.375rem',
-                fontSize: '0.875rem',
-              }}
-              {...props}
-            >
-              {String(children).replace(/\n$/, '')}
-            </SyntaxHighlighter>
-          ) : (
-            <code className={cn("px-1.5 py-0.5 rounded bg-surface-inset text-text-primary text-[0.875em] font-mono", className)} {...props}>
-              {children}
-            </code>
-          );
-        },
-        // 链接样式
-        a({ node, children, ...props }: any) {
-          return (
-            <a
-              className="text-primary hover:underline"
-              target="_blank"
-              rel="noopener noreferrer"
-              {...props}
-            >
-              {children}
-            </a>
-          );
-        },
-        // 列表样式
-        ul({ node, children, ...props }: any) {
-          return <ul className="list-disc my-2 space-y-1 pl-5" {...props}>{children}</ul>;
-        },
-        ol({ node, children, ...props }: any) {
-          return <ol className="list-decimal my-2 space-y-1 pl-5" {...props}>{children}</ol>;
-        },
-        // 引用块样式
-        blockquote({ node, children, ...props }: any) {
-          return (
-            <blockquote className="border-l-4 border-muted-foreground/30 pl-4 py-2 my-2 italic text-muted-foreground" {...props}>
-              {children}
-            </blockquote>
-          );
-        },
-        // 标题样式
-        h1({ node, children, ...props }: any) {
-          return <h1 className="text-lg font-bold mt-4 mb-2" {...props}>{children}</h1>;
-        },
-        h2({ node, children, ...props }: any) {
-          return <h2 className="text-base font-bold mt-3 mb-2" {...props}>{children}</h2>;
-        },
-        h3({ node, children, ...props }: any) {
-          return <h3 className="text-sm font-bold mt-2 mb-1" {...props}>{children}</h3>;
-        },
-        // 段落样式
-        p({ node, children, ...props }: any) {
-          return <p className="my-2" {...props}>{children}</p>;
-        },
-        // 表格样式
-        table({ node, children, ...props }: any) {
-          return (
-            <div className="overflow-x-auto my-2">
-              <table className="min-w-full border-collapse border border-muted" {...props}>
-                {children}
-              </table>
-            </div>
-          );
-        },
-        th({ node, children, ...props }: any) {
-          return <th className="border border-muted px-3 py-2 bg-muted/50 font-semibold text-left" {...props}>{children}</th>;
-        },
-        td({ node, children, ...props }: any) {
-          return <td className="border border-muted px-3 py-2" {...props}>{children}</td>;
-        },
-        }}
-      >
-        {content}
-      </ReactMarkdown>
-    </div>
-  );
-}
-
 // 折叠状态的按钮（未展开时显示）
 function SkippedMessagesCollapsed({
   messages,
@@ -1261,7 +1176,8 @@ function MessageItem({
   isSwitchingVersion?: boolean;
   showLogs?: boolean;
   onActionClick?: (action: string) => void;
-  onAskUserSubmit?: (messageId: string, answer: string | string[]) => void;
+  /** 回答提问 / 确认审批。remember 只可能来自审批框的「同意并记住」 */
+  onAskUserSubmit?: (messageId: string, answer: string | string[], remember?: boolean) => void;
   onVersionClick?: (commitHash: string, versionNumber: number) => void;
   onRestoreConfirm?: (messageId: string) => void;
   onRestoreCancel?: (messageId: string) => void;
@@ -1301,6 +1217,9 @@ function MessageItem({
     return (
       <div
         key={message.id}
+        // 最右侧「userprompt 刻度栏」靠它定位（PromptRail 的 MESSAGE_ATTR）——
+        // 刻度位置 = 这条消息在滚动容器里的相对位置，所以锚点必须落在消息本体上
+        data-message-id={message.id}
         className={cn(
           "flex flex-col gap-1 my-1 items-end py-2",
           isSkipped && "opacity-60"
@@ -1588,21 +1507,42 @@ function MessageItem({
                             const isToolRunning = isLoading && isLastMessage && isLastTool;
                             
                             elements.push(
-                              <div key={`tool-${idx}`} className="flex items-center gap-2 text-xs font-mono">
+                              /**
+                               * 单工具回退行：**必须是一行**。
+                               *
+                               * 用户实测报过「调 bash 的时候命令折成三行」：
+                               * 这条分支原来把 `toolInfo` 直接塞进 `TextShimmer`，
+                               * 而 TextShimmer 是 `inline-flex`、没有任何截断 ——
+                               * 一条带 `|` 和 `;` 的长命令就自行折成三行，把正文顶走。
+                               *
+                               * 现在的做法：
+                               *  · 行容器 `min-w-0`，命令 span `flex-1 truncate`
+                               *    （`truncate` = nowrap + hidden + ellipsis，`min-w-0`
+                               *    是为了在**窄容器**下真的能收缩 —— 右侧预览一开，
+                               *    正文只剩一半宽，没有 min-w-0 的 flex 项不会缩短）；
+                               *  · 完整命令进 `title`，hover 能看到，一个字都不丢；
+                               *  · 闪烁效果只留给工具名（它才是"正在跑"的信号），
+                               *    命令用 `animate-pulse` 保持"还在动"的观感即可 ——
+                               *    塞进 TextShimmer 的 `bg-clip-text` 里就没法再截断了。
+                               */
+                              <div key={`tool-${idx}`} className="flex min-w-0 items-center gap-2 text-xs font-mono">
                                 <ToolIcon className={cn(
                                   "w-3 h-3 flex-shrink-0",
                                   isToolRunning ? "text-muted-foreground animate-pulse" : "text-muted-foreground/70"
                                 )} />
-                                {isToolRunning ? (
-                                  <TextShimmer>
-                                    <span>{displayName(event.tool)}</span>
-                                    {toolInfo && <span className="ml-4">{toolInfo}</span>}
-                                  </TextShimmer>
-                                ) : (
-                                  <>
-                                    <span className="text-muted-foreground/70">{displayName(event.tool)}</span>
-                                    {toolInfo && <span className="ml-4 truncate text-muted-foreground/70">{toolInfo}</span>}
-                                  </>
+                                <span className={cn("shrink-0", isToolRunning ? "text-muted-foreground" : "text-muted-foreground/70")}>
+                                  {isToolRunning ? <TextShimmer>{displayName(event.tool)}</TextShimmer> : displayName(event.tool)}
+                                </span>
+                                {toolInfo && (
+                                  <span
+                                    title={toolInfo}
+                                    className={cn(
+                                      "min-w-0 flex-1 truncate text-muted-foreground/70",
+                                      isToolRunning && "animate-pulse",
+                                    )}
+                                  >
+                                    {toolInfo}
+                                  </span>
                                 )}
                               </div>
                             );
@@ -1649,14 +1589,24 @@ function MessageItem({
                             }
                             
                             const ToolIcon = getToolIcon(event.tool);
-                            // 从 info 中提取简洁的参数显示
+                            // 从 info 中提取简洁的参数显示（完整原文进 title，见下面）
                             const displayInfo = formatToolInfo(event.tool, event.info);
                             
                             elements.push(
-                              <div key={`tool-info-${idx}`} className="flex items-center gap-2 text-xs font-mono">
+                              // 和历史回放同一条规则：折叠态永远只占一行。
+                              // `min-w-0` + `flex-1 truncate` 保证窄容器（右侧预览展开时
+                              // 正文只剩一半宽）也不会折行；完整信息在 title 里。
+                              <div key={`tool-info-${idx}`} className="flex min-w-0 items-center gap-2 text-xs font-mono">
                                 <ToolIcon className="w-3 h-3 flex-shrink-0 text-muted-foreground/70" />
-                                <span className="text-muted-foreground/70">{displayName(event.tool)}</span>
-                                {displayInfo && <span className="ml-2 truncate text-muted-foreground/50">{displayInfo}</span>}
+                                <span className="shrink-0 text-muted-foreground/70">{displayName(event.tool)}</span>
+                                {displayInfo && (
+                                  <span
+                                    title={event.info || displayInfo}
+                                    className="min-w-0 flex-1 truncate text-muted-foreground/50"
+                                  >
+                                    {displayInfo}
+                                  </span>
+                                )}
                               </div>
                             );
                           } else if (event.type === "ask_user" && event.question) {
@@ -1683,9 +1633,13 @@ function MessageItem({
                                 question={event.question}
                                 questionType={event.questionType || "single"}
                                 suggestions={event.suggestions}
-                                onSubmit={(answer) => onAskUserSubmit?.(message.id, answer)}
+                                onSubmit={(answer, remember) => onAskUserSubmit?.(message.id, answer, remember)}
                                 answered={isAnswered}
                                 userAnswer={answerText}
+                                // 审批类才有这两个字段：approval 决定画不画「同意并记住」，
+                                // remember_rule 是那句文案里要原样展示的**形状**
+                                approval={event.approval === true}
+                                rememberRule={event.remember_rule}
                               />
                             );
                           } else if (event.type === "restore_confirm" && event.confirmData) {
@@ -1819,11 +1773,29 @@ function MessageItem({
                       question={message.askUser.question}
                       questionType={message.askUser.questionType || "single"}
                       suggestions={message.askUser.suggestions}
-                      onSubmit={(answer) => onAskUserSubmit?.(message.id, answer)}
+                      onSubmit={(answer, remember) => onAskUserSubmit?.(message.id, answer, remember)}
                       answered={message.askUser.answered}
                       userAnswer={message.askUser.userAnswer}
+                      approval={message.askUser.approval === true}
+                      rememberRule={message.askUser.remember_rule}
                     />
                   )}
+
+                  {/* 这一轮的 **diff 正文**（内核 turn_diff，可展开）。**只有正文**：
+                      文件清单归下面那块 TurnFilesCard，两块别再各列一遍同一批路径
+                      （以前正是这样，同一个回合下面出两个一样的块）。
+                      没有 diff 正文时组件自己返回 null。 */}
+                  {message.turn_diff && <TurnDiffCard turnDiff={message.turn_diff} />}
+
+                  {/* 这一轮产出/改动的文件清单（点一个 → 右侧「文件」模块里开一个 tab）。
+                      优先读持久化的 turn_files（刷新后还在），没有才退回实时 turn_diff；
+                      空的一轮组件自己返回 null。 */}
+                  <TurnFilesCard
+                    turnFiles={message.turn_files}
+                    turnDiff={message.turn_diff}
+                    onOpenFile={onOpenFile}
+                    port={projectId}
+                  />
 
                   {/*
                     版本条已删除 —— 它的编号是**错的**。

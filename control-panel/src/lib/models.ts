@@ -70,6 +70,40 @@ export function modelDisplay(id?: string | null): string {
   return DISPLAY_NAMES[id] ?? id;
 }
 
+/**
+ * 面板能选的模型（输入框右下角那颗 chip 的菜单就是这一份）。
+ *
+ * ⚠️ **权威在内核**（harness/packages/core/src/providers/index.ts 的 MODELS），
+ * 这里是面板侧的选择表：id 必须和内核认的那两个一模一样 —— 它最终原样进
+ * `POST /api/chat` 的 `body.model`。标签统一走 modelDisplay()，别在这里再抄一遍。
+ */
+export const MODEL_CHOICES: string[] = ["deepseek-flash", "deepseek-v4-pro"];
+
+/** 菜单要显示的完整列表：内核里配着的那个（可能是手写进 env 的）也要在里面，否则点了没勾、看着像坏了 */
+export function modelChoices(current?: string | null): string[] {
+  const id = (current ?? "").trim();
+  return id && !MODEL_CHOICES.includes(id) ? [id, ...MODEL_CHOICES] : MODEL_CHOICES;
+}
+
+/**
+ * 模型上下文窗口（token）。
+ *
+ * **权威在内核**（harness 的 providers/index.ts），这里是面板侧的展示镜像：
+ * stats 事件不带窗口，而输入框下的状态行要一个分母算上下文占用。
+ * 目前两个模型同窗口；不认识的模型也按这个算 —— 宁可分母偏大一点，
+ * 也不显示一个编出来的百分比。
+ */
+export const DEFAULT_CONTEXT_WINDOW = 1_048_576;
+
+const CONTEXT_WINDOWS: Record<string, number> = {
+  "deepseek-flash": 1_048_576,
+  "deepseek-v4-pro": 1_048_576,
+};
+
+export function contextWindowOf(id?: string | null): number {
+  return (id ? CONTEXT_WINDOWS[id] : undefined) ?? DEFAULT_CONTEXT_WINDOW;
+}
+
 function entry(
   model: string,
   display: string,

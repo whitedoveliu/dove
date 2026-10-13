@@ -4,7 +4,7 @@
  */
 
 // 动态获取 API 地址，支持局域网访问
-const getApiBaseUrl = () => {
+export const getApiBaseUrl = () => {
   if (typeof window !== "undefined") {
     // 浏览器环境：使用当前访问的主机名
     return `http://${window.location.hostname}:8008`;
@@ -12,9 +12,122 @@ const getApiBaseUrl = () => {
   return "http://localhost:8008";
 };
 
+/**
+ * 面板**自己所在的 origin**（面板由内核托管时，就是内核的 8790）。
+ *
+ * 两种 origin 别混（混过就是 401 / 读不到响应体）：
+ *   · `getApiBaseUrl()` = 兼容层 8008 —— 跨源，靠 CORS 头 + `X-Dove-Token` 头；
+ *   · 本函数 = 面板同源 —— 只有它才能：① 让 HTML 里的**相对子资源**解析得回来；
+ *     ② 同源 `fetch` 读得到响应体（下载）；③ 免令牌的 `/api/preview/*`。
+ * dev 形态（vite 3006）下面板不由内核托管，与内核不同源 —— 那几条同源路由用不了（见 README 的开发步骤）。
+ */
+export const getPanelOrigin = () => {
+  if (typeof window !== "undefined") return window.location.origin;
+  return "http://127.0.0.1:8790";
+};
+
 const API_BASE_URL = typeof window !== "undefined" 
   ? `http://${window.location.hostname}:8008` 
   : "http://localhost:8008";
+
+/* ==================== 本地令牌（8008 的准入证）==================== */
+
+/**
+ * 兼容层（8008）除 /api/health 外都要求令牌 —— 为什么、威胁是什么，见
+ * `harness/packages/server/src/local-token.ts` 的顶部注释。
+ *
+ * 面板只能问**内核自己**要（GET /api/local-token）：面板就是内核托管的，同源；
+ * 别的网页拿不到那条响应（内核只对同源与白名单里的面板源回 CORS 头，见 panel-origin.ts）。
+ *
+ * 取令牌**只做一次**：拿到或失败都记住，失败后不再自动重试 ——
+ * 重试由用户点提示条上的「重试」触发（retryLocalToken），免得失败时变成打点式的死循环。
+ */
+const TOKEN_PATHS = typeof window === "undefined"
+  ? ["http://127.0.0.1:8790/api/local-token"]
+  : [
+      // ① 同源：产品形态（面板由内核托管在 8790）
+      `${window.location.origin}/api/local-token`,
+      // ② 开发形态（vite 3006）：面板不是内核托管的，但 vite 自己把这条路径代理到内核
+      //    （control-panel/vite.config.ts 的 server.proxy）—— 对浏览器仍然是**同源**请求，
+      //    不经过 CORS，所以内核的白名单里**没有** 3006（那是项目 dev server 的区间）。
+      //    ③ 兜底：静态服务直接按主机名 + 内核默认端口找它；这条要跨源，只有白名单里的源能过
+      //    （harness/packages/server/src/panel-origin.ts）。
+      `http://${window.location.hostname}:8790/api/local-token`,
+    ];
+
+export type LocalTokenState = "pending" | "ready" | "missing";
+
+let localTokenState: LocalTokenState = "pending";
+let localTokenPromise: Promise<string> | null = null;
+/** ensureLocalToken() 落地后缓存下来的令牌本体（同步取用，见 getLocalTokenCached） */
+let cachedToken = "";
+
+async function fetchLocalToken(): Promise<string> {
+  for (const url of TOKEN_PATHS) {
+    // 用 AbortController 而不是 AbortSignal.timeout：老 WebKit 没有后者，
+    // 而它抛出来的样子和「内核不在」一模一样，会变成一条看不懂的提示条。
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5_000);
+    try {
+      const r = await fetch(url, { cache: "no-store", signal: ac.signal });
+      if (!r.ok) continue;
+      const data = (await r.json()) as { token?: unknown };
+      const token = typeof data?.token === "string" ? data.token.trim() : "";
+      if (token) return token;
+    } catch { /* 下一个候选 */ } finally { clearTimeout(timer); }
+  }
+  return "";
+}
+
+/** 取令牌（并发调用共用同一个请求；失败也是一次性的，不会自动重试） */
+export function ensureLocalToken(): Promise<string> {
+  if (!localTokenPromise) {
+    localTokenPromise = fetchLocalToken().then((t) => {
+      cachedToken = t;
+      localTokenState = t ? "ready" : "missing";
+      return t;
+    });
+  }
+  return localTokenPromise;
+}
+
+/**
+ * 已拿到的令牌（**同步**）—— 给「必须在同步路径里拼 URL」的调用方用。
+ *
+ * 谁需要：`<img>/<video>/<audio>` 的 src 与 `window.open` 的目标 URL ——
+ * 前者是渲染函数（发请求就会在渲染里产生副作用，见 App 的令牌提示条那套机制），
+ * 后者要保住用户手势（`await` 一下弹窗许可就没了）。这些地方只能在拼 URL 的那一刻取值。
+ *
+ * 取不到（还没取到 / 取失败）返回空串：URL 里干脆不带令牌 —— 那条请求会 401，
+ * 而用户已经能从 App 的提示条上看到「没取到令牌」+「重试」，不是静默失败。
+ * 失效策略只有一条：用户点「重试」（retryLocalToken 清缓存重取）；没有第二种自动失效。
+ */
+export function getLocalTokenCached(): string {
+  return cachedToken;
+}
+
+/** 面板渲染用：现在手上有没有令牌（失败时 App 会显示提示条，不是白屏） */
+export function getLocalTokenState(): LocalTokenState {
+  return localTokenState;
+}
+
+/** 提示条上「重试」用：清缓存重新取一次（用户触发，不是定时重试） */
+export function retryLocalToken(): Promise<string> {
+  localTokenState = "pending";
+  localTokenPromise = null;
+  return ensureLocalToken();
+}
+
+/**
+ * **所有** 8008 请求的唯一出口：自动补 `X-Dove-Token` 头。
+ * 别在这个文件里直接写 `fetch(...)` 打兼容层 —— 漏了令牌就是 401。
+ */
+export async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const token = await ensureLocalToken();
+  const headers = new Headers(init.headers);
+  if (token) headers.set("X-Dove-Token", token);
+  return fetch(url, { ...init, headers });
+}
 
 export interface Message {
   id: string;
@@ -43,6 +156,10 @@ export interface Message {
     questionType?: "single" | "multiple";  // 问题类型：单选或多选
     suggestions?: string[];
     userAnswer?: string | string[];  // ask_user 的用户回答（单选为字符串，多选为数组）
+    /** 审批类 ask_user（不是普通提问）——「同意并记住」只画在它上面 */
+    approval?: boolean;
+    /** 「同意并记住」将落下的规则形状；缺省 = 不给该选项（见 SSEEvent.remember_rule） */
+    remember_rule?: string;
     // restore_confirm 相关
     confirmData?: {
       target_version: number;
@@ -71,6 +188,10 @@ export interface Message {
     suggestions?: string[];
     answered?: boolean;
     userAnswer?: string | string[];  // 单选为字符串，多选为数组
+    /** 审批类提问（带「允许/拒绝」）——只有它有「同意并记住」 */
+    approval?: boolean;
+    /** 「同意并记住」将落下的规则形状（工具自报的参数模式） */
+    remember_rule?: string;
   };
   // 费用统计（按模型分别统计）
   usage?: {
@@ -115,6 +236,20 @@ export interface Message {
   skipped_by_restore?: boolean;
   // Todo 列表（嵌入消息气泡中显示）
   todos?: TodoItem[];
+  /**
+   * 本轮净 diff（内核 turn_diff 事件）——「这一轮改了什么」。
+   * 只覆盖 Write/Edit 自报的改动。
+   * 实时来自 SSE；刷新后由 /api/history 的 `turn_diff` / `turn_files` 回填（兼容层落盘，
+   * 见 harness/.../legacy/turn-files-store.ts）。
+   * 空 diff（一轮只读）**不留任何东西**：连字段都不设，渲染端自然没有空块。
+   */
+  turn_diff?: TurnDiff;
+  /**
+   * 本轮的**文件清单**（每轮文件卡片用）：优先读它，没有再退回 `turn_diff.files`。
+   * 两者内容相同，分开存是为了让「持久化回填」与「实时事件」两个来源各自可辨
+   * （见 ChatPanel 的 turn_files 赋值与 turn-files-card 的取值顺序）。
+   */
+  turn_files?: TurnDiffFile[];
 }
 
 // Todo 项目类型
@@ -122,6 +257,28 @@ export interface TodoItem {
   id: string;
   content: string;
   status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+}
+
+/** 本轮净 diff 里一个文件的增删统计（内核 turn_diff 事件） */
+export interface TurnDiffFile {
+  path: string;
+  added: number;
+  removed: number;
+  created?: boolean;
+  deleted?: boolean;
+}
+
+/**
+ * 本轮净 diff ——「这一轮改了什么」。
+ * ⚠️ 只覆盖工具**自报**的写操作（Write/Edit），Bash 里的 `> f` / `sed -i` 不在内
+ * （见内核 tools/turn-diff.ts 的边界说明）；且内核不落盘 → **刷新后没有**（实时限定）。
+ */
+export interface TurnDiff {
+  files: TurnDiffFile[];
+  /** true = 结果不完整（文件条目或正文被截断） */
+  truncated?: boolean;
+  /** 近似统一 diff 文本（最多 20k 字符）——放在可展开处，别默认铺满 */
+  diff?: string;
 }
 
 // 提示词替换规则
@@ -152,6 +309,12 @@ export interface ChatRequest {
     mime_type: string;
     size: number;
   }>;
+  /**
+   * 这一轮的模式（「+」菜单 / 斜杠命令选出来的）。kernel 只认 swarm：
+   * 用多个子代理并行处理这一轮。**不传就是老行为** —— JSON.stringify 会整个丢掉
+   * undefined 字段，所以关着的时候请求体和以前逐字节一致。
+   */
+  mode?: "plan" | "goal" | "swarm";
   // AI 风格配置
   ai_style_x?: number;  // 主动性 (0-100)，0=被动，100=主动
   ai_style_y?: number;  // 专业性 (0-100)，0=轻松，100=专业
@@ -171,6 +334,20 @@ export interface SSEEvent {
   question_type?: "single" | "multiple";  // 问题类型
   suggestions?: string[];
   session_id?: string;
+  /**
+   * 这是**工具审批**（不是普通提问）——「同意并记住」只画在它上面。
+   * 面板按它区分「允许/拒绝」的确认框和真正的提问（见 MessageList 的 AskUserInline）。
+   */
+  approval?: boolean;
+  /**
+   * 「同意并记住」将落下的**规则形状**（工具自报的参数模式，如 `Bash(rm -rf /tmp/x)`）。
+   * 缺省 = 算不出来 → 不给「记住」选项（点了其实没记住，比不给更糟）。
+   */
+  remember_rule?: string;
+  // turn_diff 相关字段（本轮净 diff）
+  files?: TurnDiffFile[];
+  truncated?: boolean;
+  diff?: string;
   // browser_action 相关字段
   action?: string;
   search?: string;
@@ -240,7 +417,7 @@ export async function sendChatMessage(
   request: ChatRequest,
   onEvent: (event: SSEEvent) => void
 ): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/api/chat`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -315,7 +492,7 @@ export async function sendChatMessage(
  * 健康检查
  */
 export async function checkHealth(): Promise<{ status: string; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/health`);
+  const response = await apiFetch(`${API_BASE_URL}/api/health`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -331,7 +508,7 @@ export async function getProjectInfo(projectId: string): Promise<{
   react_app_path: string;
   project_id: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/project-info?project_id=${projectId}`);
+  const response = await apiFetch(`${API_BASE_URL}/api/project-info?project_id=${projectId}`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -346,7 +523,7 @@ export async function resetProject(projectId: string): Promise<{
   message: string;
   project_path: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/reset-project`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/reset-project`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -403,7 +580,7 @@ export async function generateProjectName(
   port: string,
   force = false
 ): Promise<{ success: boolean; name: string; source: string }> {
-  const response = await fetch(
+  const response = await apiFetch(
     `${API_BASE_URL}/api/projects/${port}/name${force ? "?force=true" : ""}`,
     { method: "POST" }
   );
@@ -417,7 +594,7 @@ export async function generateProjectName(
  * 获取所有项目列表
  */
 export async function getProjects(): Promise<{ projects: Project[] }> {
-  const response = await fetch(`${API_BASE_URL}/api/projects`);
+  const response = await apiFetch(`${API_BASE_URL}/api/projects`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -432,7 +609,7 @@ export async function createProject(port: string): Promise<{
   message: string;
   project?: { port: string; path: string };
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/projects/create`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/projects/create`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -457,7 +634,7 @@ export async function createTask(input: {
   message: string;
   project?: { port: string; path: string; name: string; project?: string | null };
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/create`, {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/create`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: input.name, project: input.project || undefined }),
@@ -482,7 +659,7 @@ export async function chooseFolder(): Promise<{ success: boolean; path?: string;
       /* 落到后端兜底 */
     }
   }
-  const response = await fetch(`${getApiBaseUrl()}/api/dialog/choose-folder`, { method: "POST" });
+  const response = await apiFetch(`${getApiBaseUrl()}/api/dialog/choose-folder`, { method: "POST" });
   return response.json().catch(() => ({ success: false, message: "打开选择框失败" }));
 }
 
@@ -499,7 +676,7 @@ export async function attachFolder(input: {
   message: string;
   project?: { port: string; path: string; name: string; project?: string | null };
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/attach`, {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/attach`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
@@ -522,7 +699,7 @@ export async function checkProjectExists(port: string): Promise<{
   requested_port_in_use?: boolean;
   requested_port_owned?: boolean;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/projects/${port}/exists`);
+  const response = await apiFetch(`${API_BASE_URL}/api/projects/${port}/exists`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -538,7 +715,7 @@ export async function startProjectServer(port: string): Promise<{
   actual_port?: string | null;
   requested_port_conflict?: boolean;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/projects/${port}/start`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/projects/${port}/start`, {
     method: "POST",
   });
   if (!response.ok) {
@@ -561,11 +738,16 @@ export interface SubagentInfo {
   startedAt: number;
   finishedAt: number | null;
   parts: number;
+  /**
+   * token 用量（后台子代理才有：记录在任务表里，见内核 agents/task-registry.ts）。
+   * null = 没有记录 / provider 没报 → 界面显示「未上报」，**不是 0**。
+   */
+  usage: { inputTokens: number; outputTokens: number } | null;
 }
 
 /** 列出某个项目派出去的所有子代理 */
 export async function listSubagents(projectKey: string): Promise<SubagentInfo[]> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(projectKey)}/subagents`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(projectKey)}/subagents`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { subagents?: SubagentInfo[] };
   return d.subagents ?? [];
@@ -580,7 +762,7 @@ export async function readThreadMessages(threadId: string): Promise<{
   title: string;
   metadata: Record<string, unknown>;
 }> {
-  const r = await fetch(`${getApiBaseUrl()}/api/threads/${encodeURIComponent(threadId)}/messages`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/threads/${encodeURIComponent(threadId)}/messages`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   return r.json();
 }
@@ -604,21 +786,21 @@ export interface PermissionPreset {
 }
 
 export async function getPermissionPresets(): Promise<PermissionPreset[]> {
-  const r = await fetch(`${getApiBaseUrl()}/api/permission-presets`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/permission-presets`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { presets?: PermissionPreset[] };
   return d.presets ?? [];
 }
 
 export async function getPermissionMode(port: string): Promise<PermissionMode> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { mode?: PermissionMode };
   return d.mode ?? "workspace-write";
 }
 
 export async function setPermissionMode(port: string, mode: PermissionMode): Promise<PermissionMode> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ mode }),
@@ -636,7 +818,7 @@ export async function setPermissionMode(port: string, mode: PermissionMode): Pro
  * key 可以是端口 / 项目 id / 目录名（后端三键查找）。
  */
 export async function getPlanMode(port: string): Promise<boolean> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { planMode?: boolean };
   return d.planMode === true;
@@ -644,7 +826,7 @@ export async function getPlanMode(port: string): Promise<boolean> {
 
 /** 打开 / 关闭计划模式，返回后端确认后的值 */
 export async function setPlanMode(port: string, planMode: boolean): Promise<boolean> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ planMode }),
@@ -723,13 +905,13 @@ async function readGoalPayload(r: Response): Promise<GoalPayload> {
 
 /** 读当前目标。没有目标不是错误：内核返回 { goal: null, note } */
 export async function getGoal(key: string): Promise<GoalPayload> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`);
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`);
   return readGoalPayload(r);
 }
 
 /** 建 / 暂停 / 继续 / 完成 / 标阻塞 / 清除，返回内核确认后的状态（权威） */
 export async function postGoal(key: string, body: GoalPostBody): Promise<GoalPayload> {
-  const r = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`, {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(key)}/goal`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -754,7 +936,7 @@ export async function deleteProject(port: string): Promise<{
   threads_deleted?: number;
   warning?: string;
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/delete`, {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/delete`, {
     method: "POST",
   });
   if (!response.ok) {
@@ -768,7 +950,7 @@ export async function stopProjectServer(port: string): Promise<{
   message: string;
   actual_port?: string | null;
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${port}/stop`, {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/stop`, {
     method: "POST",
   });
   if (!response.ok) {
@@ -795,7 +977,7 @@ export async function restartProjectServer(port: string): Promise<{
   message: string;
   actual_port?: string | null;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/projects/${port}/restart`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/projects/${port}/restart`, {
     method: "POST",
   });
   if (!response.ok) {
@@ -812,7 +994,7 @@ export async function getProjectPlan(port: string): Promise<{
   content: string | null;
   exists: boolean;
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${port}/plan`);
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/plan`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -824,12 +1006,19 @@ export async function getProjectPlan(port: string): Promise<{
  */
 export async function submitUserInput(
   sessionId: string,
-  answer: string
+  answer: string,
+  /**
+   * 「同意并记住」——**只对工具审批有意义**（回答提问时不要传）：
+   * 内核会按这次调用的形状写一条会话规则，之后同形状直接放行
+   * （见内核 legacy/routes-chat.ts 与 core 的 tools/rule-pattern.ts）。
+   * 不传时字段整个丢掉 —— 请求体和以前逐字节一致。
+   */
+  remember?: boolean
 ): Promise<{
   success: boolean;
   message: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/user-input`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/user-input`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -837,6 +1026,7 @@ export async function submitUserInput(
     body: JSON.stringify({
       session_id: sessionId,
       answer: answer,
+      ...(remember === true ? { remember: true } : {}),
     }),
   });
   if (!response.ok) {
@@ -858,7 +1048,7 @@ export async function stopGeneration(projectId?: string | null): Promise<{
   success: boolean;
   message: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/stop`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: projectId ?? "" }),
@@ -884,7 +1074,7 @@ export async function steerMessage(key: string, text: string): Promise<{
   queued: boolean;
   message?: string;
 }> {
-  const r = await fetch(`${getApiBaseUrl()}/api/steer`, {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/steer`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_id: key, message: text }),
@@ -904,7 +1094,7 @@ export async function retryGeneration(projectId: string): Promise<{
   message?: string;
   error?: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/retry`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/retry`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -941,6 +1131,15 @@ export interface HistoryRecord {
   commit_hash?: string;
   is_modified?: boolean;  // 是否有代码变化
   skipped_by_restore?: boolean;  // 是否被恢复操作跳过
+  /**
+   * 这一轮改了哪些文件（兼容层按消息 id 落盘后回填，见 legacy/turn-files-store.ts）。
+   * 与实时 SSE 的 turn_diff 同源；刷新页面后靠它重建「每轮文件卡片」。
+   */
+  turn_files?: TurnDiffFile[];
+  /** 这一轮的近似统一 diff 正文（≤20k 字符）——「展开 diff」用，刷新后不丢 */
+  turn_diff?: string;
+  /** 文件条目或 diff 正文被截断 */
+  turn_files_truncated?: boolean;
   usage?: {
     model: string;
     models?: string[];
@@ -984,7 +1183,7 @@ export interface HistoryRecord {
 export async function getHistory(projectId: string): Promise<{
   history: HistoryRecord[];
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/history?project_id=${projectId}`);
+  const response = await apiFetch(`${API_BASE_URL}/api/history?project_id=${projectId}`);
   if (!response.ok) {
     throw new Error(`HTTP error! status: ${response.status}`);
   }
@@ -999,7 +1198,7 @@ export async function submitBrowserResult(
   action: string,
   result: unknown
 ): Promise<{ success: boolean }> {
-  const response = await fetch(`${API_BASE_URL}/api/browser_result`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/browser_result`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1021,7 +1220,7 @@ export async function submitBrowserResult(
  * 切换到指定版本
  */
 export async function switchVersion(commitHash: string, projectId: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/switch-version`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/switch-version`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1043,7 +1242,7 @@ export async function switchVersion(commitHash: string, projectId: string): Prom
  * 切换到最新版本
  */
 export async function switchToLatest(projectId: string): Promise<{ success: boolean; message: string }> {
-  const response = await fetch(`${API_BASE_URL}/api/switch-to-latest`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/switch-to-latest`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1080,7 +1279,7 @@ export async function getVersionList(projectId: string, limit: number = 20): Pro
   total_count: number;
   current_version: number;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/versions?project_id=${projectId}&limit=${limit}`);
+  const response = await apiFetch(`${API_BASE_URL}/api/versions?project_id=${projectId}&limit=${limit}`);
   
   if (!response.ok) {
     const error = await response.json();
@@ -1097,7 +1296,7 @@ export async function getProjectStatus(projectId: string): Promise<{
   is_generating: boolean;
   project_id: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/project-status?project_id=${projectId}`);
+  const response = await apiFetch(`${API_BASE_URL}/api/project-status?project_id=${projectId}`);
   
   if (!response.ok) {
     const error = await response.json();
@@ -1115,7 +1314,7 @@ export async function setPreviewVersion(projectId: string, version: number | nul
   version: number | null;
   error?: string;
 }> {
-  const response = await fetch(`${API_BASE_URL}/api/set-preview-version?project_id=${projectId}${version !== null ? `&version=${version}` : ''}`, {
+  const response = await apiFetch(`${API_BASE_URL}/api/set-preview-version?project_id=${projectId}${version !== null ? `&version=${version}` : ''}`, {
     method: "POST",
   });
   
@@ -1143,28 +1342,56 @@ export interface UploadedFile {
 
 const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 
+/** Blob → base64（分块，避免 String.fromCharCode 参数过多爆栈） */
+async function blobToBase64(blob: Blob): Promise<string> {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
 /**
- * 上传文件到服务器（临时存储）
+ * 上传文件到当前任务（落盘到 `<项目>/uploads/`），返回文件在服务端的样子。
+ *
+ * ⚠️ 请求体是 **JSON + base64**，不是 multipart —— 这不是随便选的：
+ * 内核兼容层的 /api/upload-file 用 readBody() 读请求体，它只 JSON.parse，
+ * 拿到 multipart 会解析成空对象，于是连 project_id 都读不到 →
+ * 404「项目不存在」（**实测**：multipart 必 404）。所以按它真正认的形状发：
+ *   { project_id, filename, mime_type, content_base64 }
+ *
+ * 格式不设限（内核按字节原样写盘），只有 20MB 这一条上限，客户端先挡一道，
+ * 内核侧还有一道（超了返回 400，这里会原样抛出来）。
  */
 export async function uploadFile(file: File, projectId: string): Promise<UploadedFile> {
   if (file.size > MAX_FILE_SIZE) {
-    throw new Error(`文件大小超过限制（最大 20MB），当前文件 ${(file.size / 1024 / 1024).toFixed(2)}MB`);
+    throw new Error(`「${file.name}」太大（${formatBytes(file.size)}）—— 单个文件上限 20MB`);
   }
-  
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("project_id", projectId);
-  
-  const response = await fetch(`${getApiBaseUrl()}/api/upload-file`, {
+
+  const response = await apiFetch(`${getApiBaseUrl()}/api/upload-file`, {
     method: "POST",
-    body: formData,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      project_id: projectId,
+      filename: file.name,
+      // 内核会把名字里的特殊字符换成 "_"，所以下面一律用**返回的** filename，
+      // 不拿用户给的名字去拼路径（拼不上就找不到文件）
+      mime_type: file.type || "application/octet-stream",
+      content_base64: await blobToBase64(file),
+    }),
   });
-  
+
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || `上传失败: ${response.status}`);
+    let detail = `上传失败: ${response.status}`;
+    try {
+      const error = await response.json();
+      if (error?.error) detail = String(error.error);
+    } catch { /* 响应体不是 JSON：保留状态码那句话 */ }
+    throw new Error(`「${file.name}」${detail}`);
   }
-  
+
   const result = await response.json();
   return {
     id: result.file_id,
@@ -1173,6 +1400,32 @@ export async function uploadFile(file: File, projectId: string): Promise<Uploade
     type: result.mime_type,
     uploadedAt: new Date(),
   };
+}
+
+// ==================== 截屏 ====================
+
+/**
+ * 框选截屏的返回 —— **三种形状都算正常返回**，所以 ok:false 不当异常抛：
+ *   ok:true               截到了，data 是 PNG 的 base64
+ *   ok:false + cancelled  用户按了 Esc（不是错误，面板什么都不做）
+ *   ok:false + error      真出错：501 非 macOS / 500 空截图 / 413 太大
+ */
+export type CaptureScreenResult =
+  | { ok: true; name: string; mediaType: string; data: string }
+  | { ok: false; cancelled: true; error?: undefined }
+  | { ok: false; cancelled?: false; error: string };
+
+/**
+ * 让用户框选屏幕截一张图（内核侧的 macOS 原生实现）。没有请求体；
+ * 出错那几个状态码也带着 { ok:false, error } 的正文回来，照常解析。
+ */
+export async function captureScreen(): Promise<CaptureScreenResult> {
+  const response = await apiFetch(`${API_BASE_URL}/api/capture`, { method: "POST" });
+  const data = await response.json() as { ok?: unknown };
+  if (typeof data?.ok !== "boolean") {
+    throw new Error(`截屏接口返回异常（HTTP ${response.status}）`);
+  }
+  return data as CaptureScreenResult;
 }
 
 /**
@@ -1194,7 +1447,7 @@ export async function importProject(projectId: string, versionId: string): Promi
   project_path?: string;
   version_id?: string;
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/import-project`, {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/import-project`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1232,7 +1485,7 @@ export async function getProjectFiles(
   path: string = ""
 ): Promise<{ success: boolean; port: string; path: string; entries: ProjectFileEntry[] }> {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${port}/files${query}`);
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/files${query}`);
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: "读取目录失败" }));
     throw new Error(error.message || `HTTP error! status: ${response.status}`);
@@ -1242,10 +1495,14 @@ export async function getProjectFiles(
 
 /**
  * 读取项目内单个文件内容（用于目录树的文件预览）
+ *
+ * `limit`（字节，可选）：只看前 N 字节 —— 超大文本走这条，别让 413 把预览打死。
+ * 响应 `truncated: true` 时 `size` 仍是**完整**大小，界面据此提示「共多大」。
  */
 export async function readProjectFile(
   port: string,
-  path: string
+  path: string,
+  options: { limit?: number } = {}
 ): Promise<{
   success: boolean;
   path: string;
@@ -1253,15 +1510,74 @@ export async function readProjectFile(
   size: number;
   language?: string | null;
   content: string;
+  truncated?: boolean;
 }> {
-  const response = await fetch(
-    `${getApiBaseUrl()}/api/projects/${port}/file?path=${encodeURIComponent(path)}`
-  );
+  const query = `path=${encodeURIComponent(path)}${options.limit ? `&limit=${Math.floor(options.limit)}` : ""}`;
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/file?${query}`);
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: "读取文件失败" }));
     throw new Error(error.message || `HTTP error! status: ${response.status}`);
   }
   return response.json();
+}
+
+/**
+ * 单文件元信息（大小 / 修改时间）—— 不读正文。
+ *
+ * 为什么先 stat 再决定怎么读：图片 / 音视频 / office 根本不用读正文；
+ * 文本要先知道多大，才能决定「整读」还是「只读前 256KB」（见 file-viewer.tsx）。
+ */
+export async function statProjectFile(
+  port: string,
+  path: string
+): Promise<{
+  success: boolean;
+  path: string;
+  name: string;
+  type: "file" | "dir";
+  size: number;
+  /** 秒（与目录树的 modified 同口径） */
+  modified: number;
+  language?: string | null;
+}> {
+  const response = await apiFetch(
+    `${getApiBaseUrl()}/api/projects/${port}/stat?path=${encodeURIComponent(path)}`
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ message: "读取文件信息失败" }));
+    throw new Error(error.message || `HTTP error! status: ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * 「打开方式」菜单的后端：用系统默认应用打开 / 在文件管理器里显示。
+ *
+ * 路径必须落在项目工作区内 —— 越界是**硬拒**（403），不是提示词约束，见
+ * harness/packages/server/src/legacy/routes-open-path.ts 顶部的三道闸。
+ */
+export async function openProjectPath(input: {
+  /** 项目端口 / id / 目录名（三键查找）；不传 = 以工作区根为边界 */
+  projectId?: string | null;
+  path: string;
+  action: "default" | "reveal";
+}): Promise<{ ok: boolean; message: string }> {
+  try {
+    const response = await apiFetch(`${getApiBaseUrl()}/api/open-path`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: input.path,
+        action: input.action,
+        ...(input.projectId ? { project_id: input.projectId } : {}),
+      }),
+    });
+    const data = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
+    if (data && typeof data.message === "string") return { ok: data.ok === true, message: data.message };
+    return { ok: false, message: `打开失败：HTTP ${response.status}` };
+  } catch (e) {
+    return { ok: false, message: `打开失败：${e instanceof Error ? e.message : String(e)}` };
+  }
 }
 
 /** 人类可读的文件体积 */
@@ -1323,7 +1639,7 @@ export async function getSessions(
   active_sessions: string[];
   sessions: SessionSummary[];
 }> {
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${port}/sessions?limit=${limit}`);
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/sessions?limit=${limit}`);
   if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
   return response.json();
 }
@@ -1336,16 +1652,89 @@ export async function readSessionLog(
   limit = 500
 ): Promise<SessionLogPage> {
   const query = new URLSearchParams({ session, offset: String(offset), limit: String(limit) });
-  const response = await fetch(`${getApiBaseUrl()}/api/projects/${port}/session-log?${query}`);
+  const response = await apiFetch(`${getApiBaseUrl()}/api/projects/${port}/session-log?${query}`);
   if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
   return response.json();
 }
 
-/** 会话日志的实时推送地址（SSE：先补历史再持续 tail） */
-export function sessionLogStreamUrl(port: string, session = "", offset = 0): string {
+/**
+ * 会话日志的实时推送地址（SSE：先补历史再持续 tail）。
+ *
+ * 异步：EventSource 发不了自定义头，令牌只能走 `?token=`（兼容层的闸门两种都认）。
+ */
+export async function sessionLogStreamUrl(port: string, session = "", offset = 0): Promise<string> {
   const query = new URLSearchParams({ offset: String(offset) });
   if (session) query.set("session", session);
+  const token = await ensureLocalToken();
+  if (token) query.set("token", token);
   return `${getApiBaseUrl()}/api/projects/${port}/session-log/stream?${query}`;
 }
 
 
+
+// ==================== 模型设置（设置对话框 + 模型 chip）====================
+
+/**
+ * 内核里当前的模型设置。**没有 key 本体**：hasKey 表示「存着 / env 里给了」，
+ * keyMasked 是给界面看的唯一形态（sk-…c32b）。界面任何时候都不该拿到整把 key。
+ */
+export interface ModelSettings {
+  baseUrl: string;
+  model: string;
+  hasKey: boolean;
+  keyMasked: string;
+}
+
+/** 读当前设置（内核是权威存储：存盘文件 > env > 默认） */
+export async function getModelSettings(): Promise<ModelSettings> {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/settings/model`);
+  if (!response.ok) throw new Error(`读模型设置失败（HTTP ${response.status}）`);
+  return response.json();
+}
+
+/**
+ * 写设置（只传要改的字段）→ 内核落盘 + **下一轮就用新的**，不用重启。
+ * apiKey 传空串 = 不改 key：面板拿不到原值，回传的永远是空串或用户新敲的那把。
+ */
+export async function saveModelSettings(patch: {
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+}): Promise<ModelSettings & { ok: true }> {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/settings/model`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data?.ok === false) {
+    throw new Error(data?.error || `保存模型设置失败（HTTP ${response.status}）`);
+  }
+  return data;
+}
+
+/** 「测试」的结果 —— 不通也是**正常返回**（ok:false），不当异常抛 */
+export type ModelTestResult =
+  | { ok: true; model: string; latencyMs: number }
+  | { ok: false; error: string };
+
+/**
+ * 让内核真打一次最小 completion（15s 超时）。
+ * 可以带上**还没保存**的值：用户刚敲完 key 就想试，不该逼他先保存。
+ */
+export async function testModelSettings(patch?: {
+  baseUrl?: string;
+  model?: string;
+  apiKey?: string;
+}): Promise<ModelTestResult> {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/settings/model/test`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch ?? {}),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (typeof data?.ok !== "boolean") {
+    return { ok: false, error: `测试接口返回异常（HTTP ${response.status}）` };
+  }
+  return data as ModelTestResult;
+}

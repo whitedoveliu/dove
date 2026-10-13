@@ -23,7 +23,8 @@ import {
 import { PreviewFilesPane } from "@/components/preview-files-pane";
 import { normalizeProjectPath } from "@/lib/presented-files";
 import {
-  addressOf, filePreviewUrl, fileRelOf, frameSrcFor, isProxied, normalizePreviewInput,
+  addressOf, filePreviewUrl, fileRelOf, frameSrcFor, isHtmlPath, isProxied, normalizePreviewInput,
+  projectFileUrl,
   type PreviewContext,
 } from "@/lib/preview-url";
 import { SessionLogView } from "@/components/session-log-view";
@@ -63,9 +64,23 @@ interface PreviewPanelProps {
   openTarget?: { path: string; token: number; force?: boolean } | null;
   /** 内核说「预览就绪」（preview_ready）→ 每次自增，把右侧切回浏览器标签 */
   focusToken?: number;
+  /**
+   * 在右侧**「文件」标签里以 tab 打开**一个项目内文件。
+   *
+   * 谁在传：聊天区（每轮文件卡片 / 交付物卡片）→ App → 这里。
+   * `token` 每次自增：同一个文件点两次也要把它切到前台（见 PreviewFilesPane 的 openPath）。
+   * 与上面的 `openTarget` **不是一回事**：openTarget 是浏览器标签打开网页，
+   * 这个是文件模块里开 tab 看文件（默认的「点击 → 右侧打开」走这条）。
+   */
+  openFilePath?: { path: string; token: number } | null;
+  /**
+   * `openFilePath` 已被文件模块消费掉 → 让上层把请求清成 null。
+   * 不转发的后果见 PreviewFilesPane 的同名 prop（折叠后重挂会开出幽灵 tab）。
+   */
+  onFilePathConsumed?: (token: number) => void;
 }
 
-export default function PreviewPanel({ url, iframeRef, historyVersion, latestVersion, onBackToLatest, projectId, onProjectSelect, onVersionChange, onRefreshPreview, isGenerating, isStartingServer, isSwitchingToCache, isRefreshingPreview, onBuildError, isSwitchingVersion: externalSwitching, onSwitchingVersionChange, devServerPort, onDevServerPortChange, onStartDevServer, asideCollapsed, onToggleAside, openTarget, focusToken }: PreviewPanelProps) {
+export default function PreviewPanel({ url, iframeRef, historyVersion, latestVersion, onBackToLatest, projectId, onProjectSelect, onVersionChange, onRefreshPreview, isGenerating, isStartingServer, isSwitchingToCache, isRefreshingPreview, onBuildError, isSwitchingVersion: externalSwitching, onSwitchingVersionChange, devServerPort, onDevServerPortChange, onStartDevServer, asideCollapsed, onToggleAside, openTarget, focusToken, openFilePath, onFilePathConsumed }: PreviewPanelProps) {
   const [tab, setTab] = useState<PreviewTab>("browser");
   // 浏览器标签默认停在空态：用户点「运行开发服务器」或自己输网址后才接管
   const [currentUrl, setCurrentUrl] = useState("");
@@ -115,6 +130,8 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     [currentUrl, previewCtx, frameNonce],
   );
   const proxied = isProxied(currentUrl, previewCtx);
+  // 「静态」标签的判据：**没有实时开发服务器**的画面 —— 老 8008 预览 + 面板同源的项目文件路由
+  // （fileRelOf 同时认 query 形与 project 路径形）。
   const staticPreview = /:8008\/preview\//.test(currentUrl) || fileRelOf(currentUrl, previewCtx) !== null;
 
   // 切换项目：接管标志复位，重新跟随新项目的预览
@@ -145,7 +162,11 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     if (!openTarget.force && manualNavRef.current) return;   // 用户自己输过地址 → 不抢
     const rel = normalizeProjectPath(openTarget.path);
     pinnedFileRef.current = true;
-    setCurrentUrl(filePreviewUrl(rel, ctxRef.current));
+    // html 必须走**项目路径形**：它自己的 ./style.css 是相对 URL，只有同源（且项目在路径里）
+    // 才解析得回同一个项目的目录（8008 那条的令牌在查询串里，子资源继承不到 → 整页无样式）。
+    // 没选项目 / 不是 html 时退回 query 形（服务端按「工作区根 + 各项目根」找）。
+    const port = ctxRef.current.projectId;
+    setCurrentUrl(port && isHtmlPath(rel) ? projectFileUrl(port, rel, ctxRef.current) : filePreviewUrl(rel, ctxRef.current));
     setInputUrl(rel);
     setAddressError(null);
     setProxyError(null);
@@ -159,6 +180,13 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     if (manualNavRef.current) return;   // 用户接管过地址栏 → 不抢
     setTab("browser");
   }, [focusToken]);
+
+  // 外部要求「在文件模块里打开这个文件」（聊天区点击每轮文件卡片 / 交付物卡片）
+  // → 切到文件标签，并把请求转给 PreviewFilesPane（它自己开 tab / 聚焦已有 tab）
+  useEffect(() => {
+    if (!openFilePath?.path) return;
+    setTab("files");
+  }, [openFilePath?.token]);
 
   // 外站代理探针：只取状态与可读原因（不下载 body）；失败就在面板里显示原因
   useEffect(() => {
@@ -182,7 +210,19 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
   // 通过 postMessage 接收 iframe 发送的 URL 变化通知（解决跨域问题）
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
-      // 验证消息类型
+      /**
+       * 只认**这个 iframe 自己**发的消息。
+       *
+       * 不校验来源时，页面上任何脚本（模型产出的代码就是不可信输入）都能往 window
+       * 丢一条 `IFRAME_URL_CHANGE`，把地址栏改成任意内容 —— 监听器只认 `event.data.type`，
+       * 等于把这条通道完全敞开。
+       *
+       * 判据用 `contentWindow` 的**身份**比较（跨源也成立，WindowProxy 是同一个对象），
+       * 不用 `event.origin`：iframe 的源有好几种合法形态 —— 面板同源的项目预览路由
+       * （/api/preview/project/…）、外站代理（同源）、开发服务器（任意端口）、
+       * 手输的老 8008 预览 —— 写死任何一个都会漏掉别的。
+       */
+      if (event.source !== iframeRef?.current?.contentWindow) return;
       if (event.data?.type === 'IFRAME_URL_CHANGE' && event.data?.url) {
         setInputUrl(addressOf(String(event.data.url), ctxRef.current));
       }
@@ -190,7 +230,7 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [projectId]);
+  }, [projectId, iframeRef]);
 
   // 加载版本列表
   const loadVersions = async () => {
@@ -316,8 +356,9 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
       // 刷新预览
       manualNavRef.current = false;
       pinnedFileRef.current = false;
-      const host = typeof window !== "undefined" ? window.location.hostname : "localhost";
-      openUrl(`http://${host}:8008/preview/${port}/`, false);
+      // 项目根预览同样走**面板同源的项目路径形**：没有开发服务器时，这个项目的 index.html
+      // 就是静态预览的入口，它里面的相对资源要顺着路径解析（见 lib/preview-url.ts）。
+      openUrl(projectFileUrl(port, "", ctxRef.current), false);
     } catch (error) {
       console.error("进入项目失败:", error);
       alert(`进入项目失败: ${error}`);
@@ -743,6 +784,11 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
                 src={frameSrc}
                 className="w-full h-full border-0"
                 title="Preview"
+                // 外站（走同源代理）是不可信内容：沙箱挡掉「它变成面板同源文档」这条路
+                // （同源 `fetch('/api/local-token')` 读走令牌 —— 见 file-viewer.tsx 顶部与 preview-path.ts）。
+                // 本机 dev server / 项目文件预览**不给**这个属性：前者是项目自己的源（HMR、localStorage
+                // 那套要跑），后者的隔离由服务端响应头兜底（顶层打开时属性根本管不到）。
+                sandbox={proxied ? "allow-scripts allow-forms allow-popups allow-modals allow-downloads" : undefined}
               />
             ) : (
               <div className="flex h-full items-center justify-center px-6">
@@ -772,6 +818,8 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
           <PreviewFilesPane
             port={projectId ?? null}
             devServerPort={devServerPort}
+            openPath={openFilePath}
+            onOpenPathConsumed={onFilePathConsumed}
             className="flex-1"
           />
         </div>

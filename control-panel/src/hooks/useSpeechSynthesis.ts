@@ -4,6 +4,7 @@
  */
 
 import { useCallback, useRef, useState, useEffect } from 'react';
+import { apiFetch } from '@/lib/api';
 
 interface SpeechSettings {
   rate: number;      // 语速（保留接口兼容，ElevenLabs 暂不使用）
@@ -152,7 +153,7 @@ export function useSpeechSynthesis(): UseSpeechSynthesisReturn {
   // 加载语音列表
   const loadVoices = async () => {
     try {
-      const response = await fetch(`${API_BASE_URL}/api/tts/voices`);
+      const response = await apiFetch(`${API_BASE_URL}/api/tts/voices`);
       const data = await response.json();
       const availableVoices = data.voices || [];
       
@@ -190,7 +191,7 @@ export function useSpeechSynthesis(): UseSpeechSynthesisReturn {
   const generateSpeech = async (text: string): Promise<Blob | null> => {
     try {
       const voice = currentVoiceRef.current;
-      const response = await fetch(`${API_BASE_URL}/api/tts`, {
+      const response = await apiFetch(`${API_BASE_URL}/api/tts`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
