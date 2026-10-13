@@ -89,7 +89,6 @@ const bootstrapSrc = readFileSync(ROOT + "packages/server/src/bootstrap.ts", "ut
 const schedulerPairs = [
   { name: "cron", stop: "cron.stop()", start: /cron\.start\(\)/ },
   { name: "heartbeat", stop: "heartbeat.stop()", start: /heartbeat\.start\(\)/ },
-  { name: "activity", stop: "activity?.stop()", start: /activity\.start\(\)/ },
   { name: "memory 睡眠", stop: "memory?.stopScheduler()", start: /memory\.startScheduler\(\)/ },
 ];
 const unwired = schedulerPairs.filter((p) => bootstrapSrc.includes(p.stop) && !p.start.test(bootstrapSrc));

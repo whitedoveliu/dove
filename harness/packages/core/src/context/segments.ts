@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import type { SegmentKind } from "../constants.ts";
 import type { Thread } from "../session/types.ts";
 import type { MemorySlice } from "./memories-block.ts";
+import type { ProjectInstructionsResult } from "./instructions.ts";
 import { resolveLocalTime, type LocalTime } from "./tail-context.ts";
 
 export type { SegmentKind };
@@ -49,6 +50,13 @@ export interface ProjectContext {
   configDir?: string;
   /** 可用技能目录（名字 + 一句话）；M3 起由技能注册表提供 */
   skills?: { name: string; description: string }[];
+  /**
+   * 项目指令（AGENTS.md 家族）的加载结果 —— 由调用方**读盘后注入**，段渲染自己不碰磁盘。
+   * 为什么要这样传：段渲染每轮都跑，而「要不要重读盘」是有状态的（缓存 + 指纹判定）——
+   * 那件事归 agent/assemble-adapter.ts 一个人管，段渲染只负责把拿到的这份正文摆进段里。
+   * 注入进来的这份**同一线程内天然稳定**：指纹没变，装配层复用的就是同一份字节。
+   */
+  projectInstructions?: ProjectInstructionsResult;
 }
 
 /** 装配期的可变状态（时间源与持久化文件内容） */
@@ -75,6 +83,8 @@ export interface PromptVars {
   project_name: string;
   /** Dove 的持久化目录（SOUL/USER/MEMORY/日记都在这） */
   config_dir: string;
+  /** 项目指令正文（含来源锚点）；没有指令时为空串，s12 段据此整段消失 */
+  project_instructions: string;
 }
 
 export interface SegmentContext {
@@ -132,6 +142,7 @@ export function buildSegmentContext(input: SegmentContextInput): SegmentContext 
     tmp_dir: project.tmpDir ?? join(workdir, "tmp"),
     project_name: project.projectName ?? input.thread.title ?? "",
     config_dir: project.configDir ?? process.env.DOVE_CONFIG ?? join(homedir(), ".dove"),
+    project_instructions: project.projectInstructions?.text.trim() ?? "",
   };
   return {
     thread: input.thread,
@@ -154,6 +165,24 @@ function appendGlobalFiles(text: string, ctx: SegmentContext): string {
   add("MEMORY.md", ctx.state.memory);
   if (sections.length === 0) return text;
   return `${text.trimEnd()}\n\n${sections.join("\n\n")}`;
+}
+
+/**
+ * 项目指令段（s12）的后处理。
+ *
+ * 为什么非得在这里兜一次空：正文是 `{{project_instructions}}` 占位符换进去的，没指令时换成空串，
+ * 段落文件里那几句说明就会**独自留下** —— 一个只剩标题、正文空着的段等于告诉模型
+ * 「这个项目立了规矩」却什么都没给，比不注入更糟（模型会去猜、去问、或者干脆自己编一套）。
+ * 没有指令就整段返回空串，由 assemble.ts 的 `if (text.length > 0)` 把它剔掉。
+ *
+ * 超长告警也在这里附上：模型有权知道这次注入的规矩总量已经超出预算（我们没截断，它是完整的），
+ * 冲突时该往「就近的那一份」去查 —— 顺带也让告警在聊天里能被看见，而不是只躺在日志里。
+ */
+function appendProjectInstructions(text: string, ctx: SegmentContext): string {
+  const loaded = ctx.project.projectInstructions;
+  if (!loaded || loaded.text.trim().length === 0) return "";
+  const body = text.trimEnd();
+  return loaded.warning ? `${body}\n\n> 注意：${loaded.warning}` : body;
 }
 
 function segment(
@@ -190,6 +219,10 @@ export const SEGMENTS: SegmentDef[] = [
   segment("s09-execution", "static"),
   segment("s10-retrievable-context", "static"),
   segment("s11-artifacts", "static"),
+  // ⚠️ 只许在这里（尾部）追加新段。插到中间 = 其后每一段的位置都变了 = 前缀缓存整段作废。
+  // s12 的内容按 AGENTS.md 的指纹失效（没改逐字节复用，改了下一轮装配才换）——它本来就在切点之后，
+  // 换内容只让 block2 这一段的缓存失效，冻结前缀（block1）不受影响。
+  segment("s12-project-instructions", "semi", "项目指令随项目与 AGENTS.md 的编辑变化，不是逐轮变（指纹没变则逐字节复用，见 agent/assemble-adapter.ts）", appendProjectInstructions),
 ];
 
 /** 纪律检查：非 static 段缺 reason 直接抛错（装配前调用） */

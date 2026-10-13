@@ -13,7 +13,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { errMsg } from "../tools/builtin/util.ts";
 
 export type LogLevel = "info" | "warn" | "error";
-/** 日志出口（与 activity 的 logger 同形） */
+/** 日志出口（与内核其它服务的 logger 同形） */
 export type RpcLogger = (level: LogLevel, msg: string, data?: Record<string, unknown>) => void;
 
 /** JSON-RPC 标准错误码（只列用得到的） */

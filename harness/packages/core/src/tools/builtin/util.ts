@@ -6,6 +6,7 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
+import { assertReadablePath } from "../../security/paths.ts";
 
 export type ToolOut = Record<string, unknown>;
 
@@ -57,6 +58,20 @@ export function resolveInsideWorkspace(p: unknown, workdir: string): string {
       "如果确实要写到外面，请让用户确认后用 Bash（那条路径有审批）。",
     );
   }
+  return abs;
+}
+
+/**
+ * 读操作的路径护栏：resolvePath + 秘密文件拦截（security/paths.ts）。
+ *
+ * 刻意**不**限制在工作区内 —— 与写侧的 resolveInsideWorkspace 不是同一档：
+ * 读工作区外的文件是 dove 的既有工作流（读系统头文件、读依赖源码、读 /tmp 里的产物），
+ * 这次只补「秘密文件」这一层。顺手把读也锁进工作区是另一种产品决策，
+ * 会打断现有用法，不在这里做。
+ */
+export function resolveReadablePath(p: unknown, workdir: string): string {
+  const abs = resolvePath(p, workdir);
+  assertReadablePath(abs, workdir);
   return abs;
 }
 
@@ -188,6 +203,12 @@ export async function walkFiles(opts: {
   maxFiles?: number;
   maxDepth?: number;
   skipDirs?: Set<string>;
+  /**
+   * 目录级剪枝（Glob / Grep 传「敏感目录」判定）。
+   * 为什么不能只靠过滤结果：`** / *` 会在遍历阶段就把 `.ssh` 下的名字枚举出来 ——
+   * 名字本身就有情报量，而且被过滤掉的条目仍然占扫描计数。这里进都不进去。
+   */
+  pruneDir?: (abs: string, name: string) => boolean;
 }): Promise<WalkResult> {
   const maxFiles = opts.maxFiles ?? 20000;
   const maxDepth = opts.maxDepth ?? 14;
@@ -209,6 +230,7 @@ export async function walkFiles(opts: {
       const abs = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (skip.has(e.name)) continue;
+        if (opts.pruneDir?.(abs, e.name)) continue;
         await walk(abs, depth + 1);
         continue;
       }

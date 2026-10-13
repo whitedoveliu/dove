@@ -69,6 +69,8 @@ export const RuntimeStatusTool = defineTool({
         created_at: stamp(t.createdAt, tz),
         finished_at: stamp(t.finishedAt, tz),
         running_minutes: t.finishedAt ? null : Math.round((now - t.createdAt) / 60_000),
+        // token 用量：provider 没报时给「未上报」，**不给 0**（0 会被读成没花 token）
+        usage: t.usage ? { input_tokens: t.usage.inputTokens, output_tokens: t.usage.outputTokens } : "未上报",
       }));
       return {
         available: true,

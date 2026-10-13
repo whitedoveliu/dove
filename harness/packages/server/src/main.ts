@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { loadConfig, bootstrap } from "./bootstrap.ts";
+import { loadOrMintToken } from "./local-token.ts";
 import { SseHub } from "./sse.ts";
 import { handle } from "./routes.ts";
 import { startLegacyServer } from "./legacy/server.ts";
@@ -49,6 +50,10 @@ if (!pre.ok) {
 
 const svc = await bootstrap(cfg);
 
+// 本地令牌：启动时取（有就复用、没有就生成 0600）—— 面板过 8008 闸门用的就是它。
+// 放在 bootstrap 之后、起服务之前：日志桥已经装好，这条「令牌文件已生成」会进日志缓冲。
+const apiToken = loadOrMintToken(cfg.configDir);
+
 /**
  * 父进程看门狗：桌面 App 被杀 / 崩溃 / 强退时，内核不能变成孤儿。
  *
@@ -77,7 +82,7 @@ const controlPanelDir = process.env.DOVE_CONTROL_PANEL_DIR
   ?? resolve(import.meta.dirname, "../../../../control-panel/dist");
 
 const server = createServer((req, res) => {
-  handle(req, res, { svc, hub, controlPanelDir, running }).catch((e) => {
+  handle(req, res, { svc, hub, controlPanelDir, running, token: apiToken }).catch((e) => {
     console.error("[server] 未处理错误:", e);
     try { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: String(e) })); } catch { /* ignore */ }
   });
@@ -101,10 +106,11 @@ server.on("error", (e: NodeJS.ErrnoException) => {
 });
 
 // ── 面板兼容层（8008）：让 control-panel 一行不改地跑在内核上 ──
+//    带上令牌：除 /api/health 外，/api/* 一律要它（见 legacy/server.ts 的令牌闸门）
 const legacyPort = Number(process.env.DOVE_LEGACY_PORT ?? 8008);
 let legacy: Awaited<ReturnType<typeof startLegacyServer>> = null;
 if (process.env.DOVE_LEGACY !== "off") {
-  legacy = await startLegacyServer(svc, legacyPort);
+  legacy = await startLegacyServer(svc, legacyPort, apiToken);
   if (legacy) console.log(`[dove] 兼容层: http://127.0.0.1:${legacy.port}（control-panel 用这个）`);
   else console.warn(`[dove] 兼容层没起来：端口 ${legacyPort} 被占用（control-panel 会连不上后端）`);
 }
@@ -115,7 +121,7 @@ server.listen(cfg.port, "127.0.0.1", () => {
   console.log(`[dove] 面板: ${panel}`);
   console.log(`[dove] 模型: ${cfg.model}  工作区: ${cfg.workspaceRoot}  配置: ${cfg.configDir}`);
   console.log(`[dove] 工具: ${svc.tools.size} 个  记忆: ${svc.memory ? "已启用" : "未启用"}`);
-  console.log(`[dove] 主动性: ${svc.cron ? "cron + heartbeat 已启动" : "未接入"}  感知: ${svc.activity ? "已接入" : "未接入"}`);
+  console.log(`[dove] 主动性: ${svc.cron ? "cron + heartbeat 已启动" : "未接入"}`);
 });
 
 function shutdown(): void {

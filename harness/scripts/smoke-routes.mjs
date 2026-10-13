@@ -7,13 +7,32 @@
  * 这种 bug 只有"逐个打一遍"才发现得了。
  *
  * 用法：先起内核，再 node scripts/smoke-routes.mjs [baseUrl]
+ *
+ * ⚠️ 8790 现在和 8008 一样有令牌闸门（除 /api/health 外都要 X-Dove-Token）。
+ *    本脚本打的是**真实在跑的内核**，所以必须自己带上令牌，否则整屏 401 ——
+ *    而 401 看起来像「路由坏了」，会把人往错的方向带。
+ *    令牌来源：DOVE_TOKEN（verify.sh 传）→ <DOVE_CONFIG|~/.dove>/api-token。
  */
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 const BASE = process.argv[2] ?? "http://127.0.0.1:8790";
+
+function loadToken() {
+  if (process.env.DOVE_TOKEN) return process.env.DOVE_TOKEN.trim();
+  const dir = process.env.DOVE_CONFIG ?? join(homedir(), ".dove");
+  try {
+    const f = join(dir, "api-token");
+    return existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+  } catch { return ""; }
+}
+const TOKEN = loadToken();
 
 const GETS = [
   "/api/health", "/api/threads", "/api/config", "/api/memory", "/api/projects",
   "/api/emotion", "/api/fatigue", "/api/cron", "/api/cron/history", "/api/mcp",
-  "/api/activity/status", "/api/activity/stats", "/api/logs?limit=5",
+  "/api/logs?limit=5",
   "/api/pending", "/api/config/file?name=SOUL.md",
 ];
 
@@ -26,9 +45,12 @@ function check(name, ok, detail) {
 }
 
 async function hit(method, path, body) {
+  const headers = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (TOKEN) headers["X-Dove-Token"] = TOKEN;   // 8790 与 8008 同一把锁（/api/health 除外）
   const res = await fetch(BASE + path, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(15_000),
   });

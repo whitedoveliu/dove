@@ -30,12 +30,14 @@ export class PendingRegistry {
     });
   }
 
-  resolveApproval(toolCallId: string, approved: boolean, denyReason?: string): boolean {
+  resolveApproval(toolCallId: string, approved: boolean, denyReason?: string, remember?: boolean): boolean {
     const p = this.#approvals.get(toolCallId);
     if (!p) return false;
     clearTimeout(p.timer);
     this.#approvals.delete(toolCallId);
-    p.resolve({ approved, decision: approved ? "allow" : "deny", reason: "user", denyReason });
+    // remember 原样透传：**默认 absent = 不记**（不问自记等于偷偷扩大授权）。
+    // 真正写规则的是执行器（tools/rule-pattern.ts），这里只负责把这个意图带到那儿。
+    p.resolve({ approved, decision: approved ? "allow" : "deny", reason: "user", denyReason, ...(remember === true ? { remember: true } : {}) });
     return true;
   }
 

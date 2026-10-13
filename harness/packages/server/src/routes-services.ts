@@ -1,5 +1,5 @@
 /**
- * M6 / M7 的服务路由（情绪 / 疲劳 / 定时 / 心跳 / 感知）
+ * M6 的服务路由（情绪 / 疲劳 / 定时 / 心跳）
  * 从 routes.ts 拆出来 —— 那一份已经接近 400 行上限，而这几组路由是相对独立的一块。
  * 约定：所有服务都是**可选**的，没接入时返回结构化提示，绝不抛错。
  */
@@ -82,53 +82,6 @@ export async function handleServiceRoutes(
   // ── 心跳（M6） ─────────────────────────────────────
   if (path === "/api/heartbeat" && req.method === "POST") {
     json(res, 200, svc.heartbeat ? await svc.heartbeat.tick() : { ran: false, reason: "未接入" });
-    return true;
-  }
-
-  // ── 感知（M7） ─────────────────────────────────────
-  if (path === "/api/activity/status" && req.method === "GET") {
-    json(res, 200, svc.activity ? { available: true, ...svc.activity.stats() } : { available: false });
-    return true;
-  }
-  if (path === "/api/activity/capture" && req.method === "POST") {
-    json(res, 200, svc.activity ? await svc.activity.captureNow("manual") : { skipped: "未接入" });
-    return true;
-  }
-  // 手动点火会话分析（analyzePending 平时由「会话关闭」和「30 分钟巡检」两条路自动触发）
-  if (path === "/api/activity/analyze" && req.method === "POST") {
-    if (!svc.activity) { json(res, 200, { ok: false, analyzed: 0, note: "感知服务未接入" }); return true; }
-    const limit = Number(url.searchParams.get("limit") ?? 20);
-    json(res, 200, { ok: true, analyzed: await svc.activity.analyzePending(Number.isInteger(limit) && limit > 0 ? limit : 20) });
-    return true;
-  }
-  if (path === "/api/activity/snapshots" && req.method === "GET") {
-    json(res, 200, svc.activity ? svc.activity.listSnapshots(url.searchParams.get("date") ?? undefined, Number(url.searchParams.get("limit") ?? 50)) : []);
-    return true;
-  }
-  if (path === "/api/activity/stats" && req.method === "GET") {
-    json(res, 200, svc.activity ? { available: true, ...svc.activity.stats() } : { available: false });
-    return true;
-  }
-  if (path === "/api/activity/accessibility-settings" && req.method === "POST") {
-    const m = await import("../../core/src/activity/input-monitor.ts");
-    m.openAccessibilitySettings();
-    json(res, 200, { ok: true });
-    return true;
-  }
-  if (path === "/api/activity/permission-settings" && req.method === "POST") {
-    if (svc.activity) {
-      const m = await import("../../core/src/activity/capture.ts");
-      m.openPermissionSettings();
-    }
-    json(res, 200, { ok: true });
-    return true;
-  }
-  if (path === "/api/activity/report" && req.method === "GET") {
-    const kind = url.searchParams.get("kind") ?? "daily";
-    if (!svc.activity) { json(res, 200, { report: "", note: "感知服务未接入" }); return true; }
-    const date = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
-    const report = kind === "weekly" ? await svc.activity.weeklyReport() : await svc.activity.dailyReport(date);
-    json(res, 200, { kind, date, report });
     return true;
   }
 

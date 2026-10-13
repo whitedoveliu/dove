@@ -1,5 +1,5 @@
 /**
- * Swift helper 的运行时编译与缓存（照抄 activity/ocr.ts 的成熟模式）
+ * Swift helper 的运行时编译与缓存（沿用「源码 hash 命名 + 编译产物缓存」的成熟模式）
  * - 源码按内容 sha256 命名，缓存到 ~/.dove/cache/<prefix>-<hash>
  * - 同内容只编译一次；进程内并发调用共享同一次编译
  * - 无 swiftc / 编译失败 → { ok:false, error }，绝不抛

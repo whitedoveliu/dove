@@ -63,7 +63,7 @@ packages/
     memory/     文件层 · 向量层 · 检索 · 写入 · 睡眠合并
     agents/     子代理运行时 · 后台任务注册表
     projects/   构建 · 预览 · 版本（git）
-  prompts/      11 个提示词段（纯文本，不进代码）
+  prompts/      12 个提示词段（s01–s12；s12 = 项目 AGENTS.md）（纯文本，不进代码）
   server/       HTTP + SSE + 服务装配
 ../control-panel/  React 19 面板（产品界面）
 fixtures/       回归夹具与场景卡
@@ -99,7 +99,7 @@ ON_DEMAND 的每个工具**必须写 `discoverable`**（`ToolSearch` 的描述�
 ## 测试
 
 ```bash
-npm test                      # 59 个核心单测
+npm test                      # 全量 glob：295 项（34 个文件，294 通过 / 1 跳过）
 npm run lint                  # 文件大小 + 依赖方向
 node scripts/smoke-context.ts # 上下文装配 49 项
 node scripts/smoke-memory.ts  # 记忆系统 45 项

@@ -4,6 +4,9 @@
  * 子代理被存成 `kind='subagent'` 的线程（见 agents/subagent-store.ts），
  * 所以这里只做两件事：**列出来** + **把它的过程按主对话的同一形状吐出去**。
  *
+ * 第三件小事：列表里**顺带带出 token 用量**（按 metadata.taskId 反查 TaskRegistry）。
+ * 面板的「这个子代理烧了多少 token」只从这里读 —— 见下面 usageOf。
+ *
  * 过程复用 partsToEvents —— 和主对话的历史回放**完全同一条路径**，
  * 前端不用为子代理再写一套渲染。
  */
@@ -21,6 +24,18 @@ function findProject(svc: Services, key: string) {
     if (hit) proj = { id: hit.id, name: hit.name, path: hit.path, port: hit.port };
   }
   return proj ?? null;
+}
+
+/**
+ * 子线程 metadata.taskId → 后台任务记录里的 token 用量。
+ * 没 taskId（前台子代理 / 老数据）或任务已不在表里 → null（面板显示「未上报」）。
+ */
+function usageOf(svc: Services, taskId: unknown): { inputTokens: number; outputTokens: number } | null {
+  if (typeof taskId !== "string" || !taskId) return null;
+  try {
+    const rec = svc.tasks.get(taskId);
+    return rec?.usage ? { inputTokens: rec.usage.inputTokens, outputTokens: rec.usage.outputTokens } : null;
+  } catch { return null; }   // 任务表异常不该把整张子代理列表打挂
 }
 
 export async function handleSubagentRoutes(
@@ -49,6 +64,13 @@ export async function handleSubagentRoutes(
         startedAt: t.createdAt,
         finishedAt: (t.metadata?.finishedAt as number | undefined) ?? null,
         parts: Number(t.metadata?.parts ?? 0),
+        /**
+         * token 用量（后台任务才有：它在 TaskRegistry 里留档，见 core/agents/task-registry.ts）。
+         * 按子线程 metadata.taskId 反查 —— 面板的「用量」一栏就读它。
+         * provider 没报时是 null（不是 0）：0 会被读成「没花 token」，
+         * 0 与「未上报」在界面上必须是两句话（见 task-registry.ts:finish）。
+         */
+        usage: usageOf(svc, t.metadata?.taskId),
       }));
 
     json(res, 200, { success: true, subagents: subs });

@@ -47,6 +47,26 @@ export function configDir(): string {
   return process.env.DOVE_CONFIG ?? join(homedir(), ".dove");
 }
 
+/**
+ * 本地 API 令牌：读 `<DOVE_CONFIG>/api-token`（0600）。
+ *
+ * 内核给 8790 的 `/api/*` 加了与 8008 同一把锁（见 server/routes.ts 的令牌闸门），
+ * CLI 属于「本机调用方」，读得到这个文件。读不到就**照旧发请求**，
+ * 让内核回 401 并说清缺什么 —— 不在这里猜、也不静默降级。
+ */
+export function apiToken(): string {
+  try {
+    const f = join(configDir(), "api-token");
+    return existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+  } catch { return ""; }
+}
+
+/** 带令牌的请求头（没有令牌就空着，让内核去拒绝） */
+function authHeaders(): Record<string, string> {
+  const tk = apiToken();
+  return tk ? { "X-Dove-Token": tk } : {};
+}
+
 function portFilePath(): string {
   return join(configDir(), "port");
 }
@@ -147,7 +167,7 @@ export async function apiOrNull<T = unknown>(t: Target, path: string, opts: Requ
 }
 
 async function send(t: Target, path: string, opts: RequestOptions): Promise<Response> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...authHeaders() };
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
   const signal = opts.signal ?? (opts.timeoutMs ? AbortSignal.timeout(opts.timeoutMs) : AbortSignal.timeout(30_000));
   try {
@@ -168,7 +188,7 @@ async function send(t: Target, path: string, opts: RequestOptions): Promise<Resp
 export async function openSse(t: Target, path: string, body: unknown, signal: AbortSignal): Promise<Response> {
   const res = await fetch(t.base + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify(body),
     signal,
   });

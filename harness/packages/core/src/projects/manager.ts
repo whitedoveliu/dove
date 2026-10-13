@@ -38,8 +38,21 @@ export class ProjectManager {
     return 3099;
   }
 
+  /**
+   * 自动 id：`p<毫秒>` 不保证唯一 —— 同一毫秒里连着建两个会**撞成同一个项目**
+   * （同一个目录、记录互相覆盖，端口也只剩一个）。撞了就顺延 -2、-3…，
+   * 拿不到空位才抛（绝不静默复用别人的目录）。显式传 id 时按调用方的意思走。
+   */
+  #mintId(): string {
+    const base = `p${Date.now().toString(36)}`;
+    const free = (id: string): boolean => !this.get(id) && !existsSync(join(this.#workspaceRoot, id));
+    if (free(base)) return base;
+    for (let n = 2; n <= 99; n++) if (free(`${base}-${n}`)) return `${base}-${n}`;
+    throw new Error(`项目 id 连续冲突（${base} 到 ${base}-99 都被占用）——先清理工作区里的旧目录`);
+  }
+
   create(opts: { id?: string; name: string; template?: string }): ProjectRecord {
-    const id = opts.id ?? `p${Date.now().toString(36)}`;
+    const id = opts.id ?? this.#mintId();
     const dir = join(this.#workspaceRoot, id);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 

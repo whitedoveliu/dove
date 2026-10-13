@@ -66,11 +66,6 @@ export interface TailContext {
   memoryFiles?: TailMemoryFile[] | string;
   emotion?: TailEmotion | string;
   fatigue?: TailFatigue | number | string;
-  /**
-   * 运行时注入的活动块（问候通道 / 语义通道，见 activity-inject.ts）。
-   * 空串 = 本轮没有可注入的内容；渲染位置固定在时间锚之后、其它块之前。
-   */
-  activity?: string;
   /** 其他附加块（项目状态、崩溃修复交代等） */
   extra?: string;
 }
@@ -140,8 +135,6 @@ export function renderTailContext(t: TailContext): string {
   if (t.time) time.time = t.time;
 
   const blocks: string[] = [renderTimeAnchor(time)];
-  // 活动块必须紧跟时间锚：它是对「现在」的补充（刚才在干嘛），别混进状态块里
-  if (t.activity && t.activity.trim()) blocks.push(clip(t.activity.trim()));
   for (const block of [
     renderTasks(t.tasks),
     renderMemoryFiles(t.memoryFiles),
@@ -162,7 +155,11 @@ export function buildInjectionPrefix(mt: string, memories?: string): string {
   return parts.join("\n\n");
 }
 
-function prependText(content: ChatMessage["content"], prefix: string): ChatMessage["content"] {
+/**
+ * 前缀贴进 content：字符串直接拼在前面，块状 content 则新开一个 text 块。
+ * 导出：wire-history 的重建必须与这里**逐字节一致**（块状的拼法差一点，缓存前缀就断）。
+ */
+export function prependText(content: ChatMessage["content"], prefix: string): ChatMessage["content"] {
   if (!content) return prefix;
   if (typeof content === "string") return `${prefix}\n\n${content}`;
   return [{ type: "text", text: prefix }, ...content] as ContentBlock[];

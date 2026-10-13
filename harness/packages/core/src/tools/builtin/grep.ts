@@ -5,11 +5,19 @@
  */
 import * as path from "node:path";
 import { defineTool, S } from "../types.ts";
-import { guarded, resolvePath, relPath, str, optStr, optNum, optBool, walkFiles, compileGlob, readTextFile } from "./util.ts";
+import type { ToolAccesses } from "../types.ts";
+import { guarded, resolveReadablePath, relPath, str, optStr, optNum, optBool, walkFiles, compileGlob, readTextFile } from "./util.ts";
+import { filterSensitiveEntries, isSensitivePath, sensitiveFilterNote } from "../../security/paths.ts";
 
 const DEFAULT_MAX = 250;
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_LINE_CHARS = 400;
+
+/** 并发调度声明：递归搜一个路径（path 默认工作目录）—— 递归标 true，覆盖其下所有子路径 */
+export function grepAccesses(args: Record<string, unknown>, workdir: string): ToolAccesses {
+  const p = typeof args.path === "string" && args.path.trim() ? args.path : workdir;
+  return { kind: "paths", paths: [{ path: p, operation: "search", recursive: true }] };
+}
 
 function buildInclude(include: string | undefined): ((rel: string) => boolean) | undefined {
   if (!include) return undefined;
@@ -37,9 +45,11 @@ export const GrepTool = defineTool({
   outputTier: "compact",
   approval: "never",
   concurrencySafe: true,
+  accesses: grepAccesses,
   execute: (input, ctx) => guarded(async () => {
     const pattern = str(input, "pattern");
-    const target = resolvePath(optStr(input, "path") ?? ".", ctx.workdir);
+    // 根 / 单个文件都要过护栏：Grep 一个 .env 等于把密钥直接捞出来
+    const target = resolveReadablePath(optStr(input, "path") ?? ".", ctx.workdir);
     const maxResults = Math.max(1, Math.min(2000, Math.floor(optNum(input, "max_results") ?? DEFAULT_MAX)));
 
     let re: RegExp;
@@ -51,10 +61,15 @@ export const GrepTool = defineTool({
 
     const includeMatch = buildInclude(optStr(input, "include"));
     const st = await import("node:fs/promises").then((m) => m.stat(target)).catch(() => null);
-    const single = st?.isFile() ? [target] : (await walkFiles({
+    const walked = st?.isFile() ? [target] : (await walkFiles({
       root: target,
       match: includeMatch ? (_abs, rel) => includeMatch(rel) : undefined,
+      // 敏感目录不递归进去：里面的文件名 / 内容一个都不该出现在结果里
+      pruneDir: (abs) => isSensitivePath(abs, target),
     })).files;
+    // 过滤必须发生在**读文件之前**：先读进内存再过滤，秘密已经在进程里了，
+    // 而且 Grep 是黑名单之外唯一的「批量读内容」通道。
+    const { kept: single, droppedCount } = filterSensitiveEntries(walked, (f) => f, ctx.workdir);
 
     const lines: string[] = [];
     let truncated = false;
@@ -83,10 +98,13 @@ export const GrepTool = defineTool({
       files_searched: searched,
       truncated,
       result: lines.join("\n"),
-      note: truncated
-        ? "已达到 " + maxResults + " 条上限，**这只是摘录覆盖**（匹配可能更多）。" +
-          "请用更窄的 path/include 或更精确的 pattern 分批搜索；不要据此断言「只有这些」或「不存在」。"
-        : lines.length === 0 ? "没有匹配。注意：正则语义、大小写、include 过滤都会影响结果。" : undefined,
+      note: [
+        truncated
+          ? "已达到 " + maxResults + " 条上限，**这只是摘录覆盖**（匹配可能更多）。" +
+            "请用更窄的 path/include 或更精确的 pattern 分批搜索；不要据此断言「只有这些」或「不存在」。"
+          : lines.length === 0 ? "没有匹配。注意：正则语义、大小写、include 过滤都会影响结果。" : undefined,
+        sensitiveFilterNote(droppedCount),
+      ].filter(Boolean).join(" ") || undefined,
     };
   }),
 });

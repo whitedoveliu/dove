@@ -12,6 +12,7 @@
 import { decideGoalContinuation } from "../../core/src/agent/goal-round.ts";
 import type { GoalFeedbackItem } from "../../core/src/agent/goal-round.ts";
 import type { AgentRuntime } from "../../core/src/agent/runtime.ts";
+import type { TurnMode } from "../../core/src/agent/mode-injection.ts";
 import type { GoalPort, GoalView } from "../../core/src/tools/types.ts";
 import type { GoalCriterion, GoalVerdict } from "../../core/src/agents/goal-criteria.ts";
 import { collectRoundEvidence } from "../../core/src/agents/goal-evidence.ts";
@@ -44,6 +45,8 @@ export interface GoalRunOptions {
   model?: string;
   signal?: AbortSignal;
   sink: (e: { type: string; [k: string]: unknown }) => void;
+  /** 这一轮的模式（透传给 runtime.run）：面板从 /api/chat 的 body.mode 传下来 */
+  mode?: TurnMode;
   /** 验收评估器（可注入）。不传 = 用真模型评估器 */
   evaluator?: GoalEvaluator;
 }

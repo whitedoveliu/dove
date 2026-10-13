@@ -2,10 +2,14 @@
  * 子代理运行时（M6 / T6.1–T6.2）
  * 形态：独立的小循环，复用主循环的 step 语义，但：
  *  - 自己的系统提示词（不问身份，只谈任务）
- *  - 工具白名单
+ *  - 工具表**由调用方按角色 + 父线程策略裁剪好**传进来（这里不再套一层默认白名单）
  *  - 步数上限 100
  *  - **最后一步强制作答**：toolChoice="none" + 明确要求写最终答复
  *  - 过程通过回调广播回主线程
+ *
+ * 续跑（resume）：带上 `history`（上一次的完整消息序列）就接着跑，新指令追加为一条 user 消息。
+ * 为什么放在这里而不是上层：只有这里知道「系统提示词 + 历史 + 新 user」的拼法，
+ * 上层负责决定**谁**有资格续跑（作用域缓存 / 归属校验，见 agent/subagent-host.ts）。
  */
 import type { Provider, ChatMessage } from "../providers/types.ts";
 import type { Tool } from "../tools/types.ts";
@@ -24,10 +28,21 @@ export interface SubagentOptions {
    * 目标验收评估器就是这么跑的（它只对着给定证据打分，不能改产物、也不能自己去"找"证据）。
    */
   tools?: Map<string, Tool>;
-  /** 允许使用的工具名；缺省 = general-purpose 白名单 */
+  /**
+   * 再按名单收一次（可选）。
+   * ⚠️ 缺省 = **不再收**（用传进来的工具表）。以前这里缺省套的是「通用子代理白名单」，
+   *    那是「一个白名单管所有子代理」的旧设计 —— 现在裁剪由角色表决定（agents/roles.ts），
+   *    再套一层会让角色白名单被静默改掉（比如 ["*"] 的角色拿不到任何工具）。
+   */
   allowedTools?: string[];
   /** 不传 tools 时也不需要它：没有任何调用会被执行 */
   execDeps?: Omit<ExecDeps, "tools">;
+  /**
+   * 续跑：上一次跑到结束时的完整消息序列（含 system 与最终答复）。
+   * 传了它就不再重建 system/user 头，直接把 prompt 作为新的 user 消息追加在后面 ——
+   * 同一段历史继续跑，前缀缓存也还能命中。
+   */
+  history?: ChatMessage[];
   systemPrompt?: string;
   signal?: AbortSignal;
   /**
@@ -50,13 +65,20 @@ export interface SubagentResult {
   steps: number;
   usage: { inputTokens: number; outputTokens: number };
   endReason: string;
+  /**
+   * 这一轮跑完时的完整消息序列（system + 全部 user/assistant/tool）。
+   * 用途有二：① 续跑要接着它跑；② 父级记账（token 用量之外还能看到它到底跑了多少步）。
+   * 不落库（子代理的过程另有 SubagentTranscript 落盘），只是回传给调用方。
+   */
+  messages: ChatMessage[];
 }
 
-/** 默认白名单（T6.5）：通用目的子代理 */
-export const GENERAL_PURPOSE_TOOLS = [
-  "Bash", "Glob", "Grep", "Read", "Write", "Edit",
-  "WebSearch", "WebFetch", "Skill", "TodoWrite",
-];
+/**
+ * 默认白名单已经搬走了 —— 现在每个角色有自己的工具白名单，单一来源在
+ * `tools/builtin/task.ts` 的 SUBAGENT_ROLES（上层从 agents/roles.ts 取）。
+ * 这里刻意**不留**一份「通用白名单」：留了就会和角色表漂移，而漂移的表现是
+ * 「模型以为能用的工具实际被裁掉」，只能靠人肉对照两处名单才能发现。
+ */
 
 const DEFAULT_SYSTEM = [
   "你是一个通用子代理，被主代理派来独立完成一个明确的任务。",
@@ -70,14 +92,19 @@ const DEFAULT_SYSTEM = [
 ].join("\n");
 
 export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult> {
-  const allow = new Set(opts.allowedTools ?? GENERAL_PURPOSE_TOOLS);
-  const tools = new Map([...(opts.tools ?? new Map<string, Tool>())].filter(([name]) => allow.has(name)));
+  // 工具表由调用方按「父线程策略 ∩ 角色白名单」裁好；allowedTools 只做**显式**再收一次。
+  const allow = opts.allowedTools ? new Set(opts.allowedTools) : undefined;
+  const tools = new Map([...(opts.tools ?? new Map<string, Tool>())].filter(([name]) => !allow || allow.has(name)));
   const wire = toWireSchemas([...tools.values()]);
 
-  const messages: ChatMessage[] = [
-    { role: "system", content: opts.systemPrompt ?? DEFAULT_SYSTEM },
-    { role: "user", content: opts.prompt },
-  ];
+  // 续跑：接着上一次的消息序列跑（这条 prompt 作为新的 user 消息追加在后面）。
+  // 注意要**复制**数组：下面会往里 push，直接改缓存里那份会把续跑前的历史也污染掉。
+  const messages: ChatMessage[] = opts.history && opts.history.length > 0
+    ? [...opts.history, { role: "user", content: opts.prompt }]
+    : [
+        { role: "system", content: opts.systemPrompt ?? DEFAULT_SYSTEM },
+        { role: "user", content: opts.prompt },
+      ];
 
   let totalIn = 0, totalOut = 0, steps = 0;
   let endReason = "stop";
@@ -163,6 +190,6 @@ export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult
   const finalText = [...messages].reverse().find((m) => m.role === "assistant" && m.content)?.content;
   return {
     output: typeof finalText === "string" ? finalText : "(子代理没有产出最终答复)",
-    steps, usage: { inputTokens: totalIn, outputTokens: totalOut }, endReason,
+    steps, usage: { inputTokens: totalIn, outputTokens: totalOut }, endReason, messages,
   };
 }

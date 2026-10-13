@@ -16,8 +16,9 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-// 用相对位置推导 —— 硬编码 /Users/... 会暴露作者的用户名，别人克隆下来也跑不了
-const PANEL_DIR = resolve(import.meta.dirname, "../../../control-panel/dist");
+// 用相对位置推导 —— 硬编码 /Users/... 会暴露作者的用户名，别人克隆下来也跑不了。
+// 往上**两层**才是仓库根（harness/scripts → harness → 仓库根）：三层会指到仓库外，静态服务全 404。
+const PANEL_DIR = resolve(import.meta.dirname, "../../control-panel/dist");
 const STATIC_PORT = 3055;
 const CDP_PORT = 9600 + Math.floor(Math.random() * 300);
 const profile = mkdtempSync(join(tmpdir(), "dove-cp-"));
@@ -95,10 +96,18 @@ for (let i = 0; i < 24; i++) {
 const bodyText = await evalJs("document.body.innerText.slice(0,600)");
 check("control-panel 挂载", mounted, bodyText.slice(0, 120).replace(/\n/g, " / "));
 
-console.log("2) 建一个任务（走兼容层 8008）");
+console.log("2) 取本地令牌 + 建一个任务（走兼容层 8008）");
+// 兼容层除 /api/health 外都要令牌；面板自己会去 8790 的 /api/local-token 取（同源）。
+// 这里的页面是静态服务托管的（3055），所以按内核地址取一次，后面手动带上。
+const TOKEN = await evalJs(`(async () => {
+  try { return (await (await fetch("http://127.0.0.1:8790/api/local-token")).json()).token; }
+  catch { return ""; }
+})()`);
+check("拿到本地令牌", typeof TOKEN === "string" && TOKEN.length >= 32, String(TOKEN).slice(0, 8) + "…");
+
 const created = await evalJs(`(async () => {
   const r = await fetch("http://127.0.0.1:8008/api/projects/create", {
-    method: "POST", headers: {"Content-Type":"application/json"},
+    method: "POST", headers: {"Content-Type":"application/json", "X-Dove-Token": ${JSON.stringify(TOKEN)}},
     body: JSON.stringify({ name: "界面联调" })
   });
   return await r.json();
@@ -110,7 +119,7 @@ check("拿到 port 形式的项目 id", !!PORT_ID, String(PORT_ID));
 console.log("3) 直接打 /api/chat，看 SSE 事件（这是界面真正走的那条）");
 const sse = await evalJs(`(async () => {
   const res = await fetch("http://127.0.0.1:8008/api/chat", {
-    method: "POST", headers: {"Content-Type":"application/json"},
+    method: "POST", headers: {"Content-Type":"application/json", "X-Dove-Token": ${JSON.stringify(TOKEN)}},
     body: JSON.stringify({ project_id: "${PORT_ID}", message: "只回复两个字：你好" })
   });
   const reader = res.body.getReader(); const dec = new TextDecoder();
@@ -135,7 +144,7 @@ check("没有 error 事件", !sse.uniq.includes("error"), JSON.stringify(sse.uni
 
 console.log("4) 界面能列出这个项目吗");
 const listed = await evalJs(`(async () => {
-  const r = await fetch("http://127.0.0.1:8008/api/projects");
+  const r = await fetch("http://127.0.0.1:8008/api/projects", { headers: { "X-Dove-Token": ${JSON.stringify(TOKEN)} } });
   const j = await r.json();
   return j.projects.map(p => p.name);
 })()`);
@@ -143,7 +152,7 @@ check("projects 里有「界面联调」", Array.isArray(listed) && listed.inclu
 
 console.log("5) 历史能读回来吗");
 const hist = await evalJs(`(async () => {
-  const r = await fetch("http://127.0.0.1:8008/api/history?project_id=${PORT_ID}");
+  const r = await fetch("http://127.0.0.1:8008/api/history?project_id=${PORT_ID}", { headers: { "X-Dove-Token": ${JSON.stringify(TOKEN)} } });
   const j = await r.json();
   return { n: j.history.length, firstUser: j.history[0]?.user ?? null, evTypes: [...new Set((j.history[0]?.events ?? []).map(e => e.type))] };
 })()`);

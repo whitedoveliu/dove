@@ -6,9 +6,18 @@
  *
  * 老词表由本文件定义 —— 字段名逐字对齐 control-panel 实际读取的那些。
  */
+// ⚠️ 这里的 AgentEvent 走 server 侧的本地词表（比 core 的 AgentEventType 宽：含 subagent_* /
+//    task_* / tool:* 等 sink 事件）。别改成从 core 引 —— 那会把下面的 case 全判成不可比较。
 import type { AgentEvent } from "../agent/events.ts";
+import type { GoalVerdict } from "../../../core/src/agents/goal-criteria.ts";
+import type { Tool } from "../../../core/src/tools/types.ts";
 import { humanDuration } from "../../../core/src/constants.ts";
 import { goalLegacyEvents } from "./sse-goal.ts";
+import { approvalAskEvents } from "./sse-approval.ts";
+import { turnDiffEvents, type LegacyTurnDiffFile } from "./sse-diff.ts";
+
+// 类型从这里转出去：`LegacyEvent` 的 turn_diff 成员要引用它，routes-* 也从本文件取
+export type { LegacyTurnDiffFile } from "./sse-diff.ts";
 
 /** 老契约里前端会读的事件 */
 export type LegacyEvent =
@@ -22,11 +31,15 @@ export type LegacyEvent =
       /** 子代理线程 id —— 前端按它归户、也按它去拉历史 */
       subagentId?: string;
       label?: string; taskId?: string; content?: string; steps?: number;
-      endReason?: string; background?: boolean; tool?: string; info?: string }
+      endReason?: string; background?: boolean; tool?: string; info?: string;
+      /** 这次运行的 token 用量。provider 没报时**没有这个字段**（不是 0）——面板显示成「未上报」 */
+      usage?: { inputTokens?: number; outputTokens?: number } }
   | { type: "tool_params"; tool: string; params: Record<string, unknown> }
   | { type: "tool_result"; tool: string; result: string }
   | { type: "todo_update"; todos: unknown[]; merge?: boolean }
   | { type: "stats"; rounds: number; is_modified: boolean; model_escalated: boolean; usage: LegacyUsage }
+  /** 本轮净 diff（「这一轮改了什么」）—— files 是逐文件增删统计，diff 是近似文本（放可展开处） */
+  | { type: "turn_diff"; files: LegacyTurnDiffFile[]; truncated?: boolean; diff?: string }
   | { type: "log"; content: string; goal_eval?: LegacyGoalEval }
   | { type: "build_start" }
   | { type: "build_error"; error: string }
@@ -35,7 +48,11 @@ export type LegacyEvent =
   | { type: "interrupted" }
   | { type: "locked" }
   | { type: "error"; message: string }
-  | { type: "ask_user"; tool_use_id: string; question: string; suggestions?: string[] }
+  | { type: "ask_user"; tool_use_id: string; question: string; suggestions?: string[];
+      /** 这是**工具审批**（不是普通提问）——「同意并记住」只对审批有意义；面板按它决定要不要给该选项 */
+      approval?: boolean;
+      /** 「同意并记住」将落下的规则形状（工具自报的参数模式）；算不出来就缺省 = 面板不给该选项 */
+      remember_rule?: string }
   | { type: "done" };
 
 /**
@@ -133,6 +150,14 @@ export interface LegacyCtx {
   hasBuilt: boolean;
   /** 当前是否处在「一串连续工具调用」中间 */
   toolBurst?: boolean;
+  /** 工具表（算「记住的形状」用，见 sse-approval.ts）；拿不到就不给 remember_rule */
+  tools?: Map<string, Tool>;
+  /**
+   * toolCallId → 这次调用的工具与入参。
+   * 为什么需要：tool_approval **只带 toolCallId 和文案**，而「同意并记住」要显示
+   * 这次调用会落成什么形状（参数模式）—— tool_start 时按 id 记下，审批时再算。
+   */
+  toolCalls?: Map<string, { tool: string; input: Record<string, unknown> }>;
 }
 
 /** 把新内核的事件映射成 0..n 个老事件 */
@@ -151,6 +176,10 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
     case "tool_start": {
       const tool = String(e.tool ?? "");
       const params = (e.input ?? {}) as Record<string, unknown>;
+
+      // 按 toolCallId 记下这次调用：审批事件只带 id，而「同意并记住」要算形状（见 LegacyCtx）
+      const callId = String(e.toolCallId ?? "");
+      if (callId) ctx.toolCalls?.set(callId, { tool, input: params });
 
       // 老契约的 tool_params 带完整入参 —— **每个工具都要发**，
       // 前端拿它做「继续生成」和文件树派生，漏了会出问题。
@@ -187,27 +216,10 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
       }];
 
     // ── 工具审批 ────────────────────────────────────────
-    // ⚠️ 这个分支以前**根本没有** —— 内核发 tool_approval，兼容层直接丢掉，
-    //    前端就永远看不到确认框，于是**任何需要审批的工具都只能等超时被自动拒绝**。
-    //    实测表现：用户看到「Bash 失败：[权限] 审批超时，命令已被自动拒绝」，
-    //    而他压根没被问过。
-    //
-    // 复用前端已有的 ask_user 界面（带「允许 / 拒绝」两个按钮），
-    // 回传走 /api/user-input，那边再按 toolCallId 解析成审批决定。
+    // 映射细节（含 approval / remember_rule 两个新字段、形状怎么算）在 sse-approval.ts；
+    // 要点：前端复用已有的 ask_user 界面（「允许 / 拒绝」），回传走 /api/user-input。
     case "tool_approval":
-      return [{
-        type: "ask_user",
-        tool_use_id: String(e.toolCallId ?? ""),
-        question: [
-          String(e.title ?? "需要你的许可"),
-          e.message ? String(e.message).slice(0, 600) : "",
-          e.riskLevel ? `（风险等级：${e.riskLevel}）` : "",
-          // 提前把等待上限说清楚（问题 ⑤）：用户离开工位前就知道不处理会自动拒绝，
-          // 而不是回来只看到一句没头没尾的失败。
-          typeof e.timeoutMs === "number" ? `（${humanDuration(e.timeoutMs)}内未处理将自动拒绝）` : "",
-        ].filter(Boolean).join("\n\n"),
-        suggestions: ["允许", "拒绝"],
-      }];
+      return approvalAskEvents(e, ctx);
 
     // ── 审批超时（问题 ⑤）───────────────────────────
     // 内核在等待超时时专门发这个事件。以前没有它，超时是**完全静默**的：
@@ -271,6 +283,8 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
         steps: Number(e.steps ?? 0),
         endReason: String(e.endReason ?? "stop"),
         subagentId: String(e.subagentId ?? ""),
+        // 内核的运行结果里本来就带 usage —— 原样透传（provider 没报时是 undefined，不是 0）
+        usage: e.usage as { inputTokens?: number; outputTokens?: number } | undefined,
       }];
 
     case "task_start":
@@ -288,15 +302,21 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
         label: String(e.label ?? "子任务"),
         steps: Number(e.steps ?? 0),
         background: true,
+        // 同 subagent_done：内核已带 usage（落任务表的那份同源），别在这里丢掉
+        usage: e.usage as { inputTokens?: number; outputTokens?: number } | undefined,
       }];
 
     case "task_injected":
       return [{ type: "subagent", action: "injected", content: "后台任务结果已注回" }];
 
+    // ── 本轮净 diff（「这一轮改了什么」）——映射细节（空帧怎么挡）在 sse-diff.ts ──
+    case "turn_diff":
+      return turnDiffEvents(e);
+
     case "stats": {
       // 一轮结束 → 关闭工具批次
       ctx.toolBurst = false;
-      const u = (e.usage ?? {}) as { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number };
+      const u = (e.usage ?? {}) as { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number };
       const model = String(e.model ?? "deepseek-flash");
       return [{
         type: "stats",
@@ -311,7 +331,8 @@ export function toLegacy(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] {
             input_tokens: u.inputTokens ?? 0,
             output_tokens: u.outputTokens ?? 0,
             cache_read_tokens: u.cacheReadTokens ?? 0,
-            cache_creation_tokens: 0,
+            // 写桶：以前写死 0，provider 报了也会被丢掉（三个桶的面板口径必须一致）
+            cache_creation_tokens: u.cacheWriteTokens ?? 0,
           }],
         },
       }];

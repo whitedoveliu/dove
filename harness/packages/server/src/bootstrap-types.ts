@@ -14,9 +14,8 @@ import type { TaskRegistry } from "../../core/src/agents/task-registry.ts";
 import type { EmotionService, FatigueService } from "../../core/src/emotion/index.ts";
 import type { CronScheduler } from "../../core/src/scheduler/index.ts";
 import type { SchedulerHeartbeat } from "../../core/src/scheduler/index.ts";
-import type { ActivityRecorder } from "../../core/src/activity/index.ts";
-import type { CaptureHealthSnapshot } from "../../core/src/activity/health.ts";
 import type { McpPort } from "./mcp-wiring.ts";
+import type { ModelSettingsStore } from "./model-settings.ts";
 
 export interface Config {
   port: number;
@@ -56,14 +55,18 @@ export interface Services {
   preview: PreviewManager;
   memory: MemoryService | null;
   tasks: TaskRegistry;
-  /** M6/M7 的服务由子模块注入；未接入时为 undefined，路由要能优雅降级 */
+  /** M6 的服务由子模块注入；未接入时为 undefined，路由要能优雅降级 */
   emotion?: EmotionPort;
   fatigue?: FatiguePort;
   cron?: CronPort;
   heartbeat?: HeartbeatPort;
-  activity?: ActivityPort;
   /** MCP host（T3.12）：外部工具已注册进 tools；未接入时为 undefined */
   mcp?: McpPort;
+  /**
+   * 模型设置（base URL / 模型 / API key）—— 面板「设置」对话框的读写口。
+   * 优先级：存盘文件 <configDir>/model.json > env > 默认，见 model-settings.ts。
+   */
+  modelSettings: ModelSettingsStore;
 }
 
 export interface EmotionPort {
@@ -87,16 +90,4 @@ export interface CronPort {
 export interface HeartbeatPort {
   start(): void; stop(): void;
   tick(): Promise<{ ran: boolean; suppressed?: boolean; output?: string; reason?: string }>;
-}
-export interface ActivityPort {
-  init(): Promise<{ ok: boolean; screenPermission: boolean; note?: string }>;
-  start(): void; stop(): void;
-  captureNow(reason?: string): Promise<{ snapshotId?: string; skipped?: string }>;
-  /** 手动点火一批会话分析（POST /api/activity/analyze），返回处理条数 */
-  analyzePending(limit?: number): Promise<number>;
-  /** 库存统计 + 采集健康度（lastOkAt / lastError / counters，字段只增不改） */
-  stats(): { snapshots: number; bytes: number; lastCaptureAt?: number } & CaptureHealthSnapshot;
-  listSnapshots(date?: string, limit?: number): unknown[];
-  dailyReport(date: string): Promise<string>;
-  weeklyReport(): Promise<string>;
 }

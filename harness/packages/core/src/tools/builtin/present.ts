@@ -11,6 +11,7 @@
 import * as fsp from "node:fs/promises";
 import { defineTool, S } from "../types.ts";
 import { guarded, resolvePath, relPath, optStr } from "./util.ts";
+import { assertReadablePath } from "../../security/paths.ts";
 
 /** 一次最多声明几个（DSH 也是 8，描述里建议 1–2） */
 export const PRESENT_MAX_FILES = 8;
@@ -52,6 +53,11 @@ export const PresentTool = defineTool({
       if (!rawPath.trim()) { skipped.push({ path: "(空路径)", reason: "path 是空的" }); continue; }
       const abs = resolvePath(rawPath, ctx.workdir);
       const shown = relPath(abs, ctx.workdir);
+      // Present 只 stat、不读内容，但它会把**存在性与字节数**回给模型 ——
+      // 对 ~/.ssh/id_rsa 这种目标，能确认存在与大小本身就是泄露。
+      // 因此和 Read 用同一套判定：命中就跳过（理由用护栏自己的文案，不额外透露什么）。
+      try { assertReadablePath(abs, ctx.workdir); }
+      catch (e) { skipped.push({ path: shown, reason: e instanceof Error ? e.message.split("\n")[0]! : "该路径不可展示" }); continue; }
       const st = await fsp.stat(abs).catch(() => null);
       if (!st) { skipped.push({ path: shown, reason: "文件不存在（先把文件写完再声明）" }); continue; }
       if (!st.isFile()) { skipped.push({ path: shown, reason: "不是普通文件" }); continue; }

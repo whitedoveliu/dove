@@ -13,7 +13,7 @@ import * as fsp from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { defineTool, S } from "../types.ts";
 import { IMAGE_MAX_BYTES } from "../../constants.ts";
-import { guarded, resolvePath, relPath, str, optNum, humanBytes, clampNum } from "./util.ts";
+import { guarded, resolveReadablePath, relPath, str, optNum, humanBytes, clampNum } from "./util.ts";
 
 /** 认识这五种：和 context/images.ts 的 MIME 表一一对应 */
 export const IMAGE_MIME: Record<string, string> = {
@@ -48,7 +48,9 @@ export const ReadImageTool = defineTool({
   concurrencySafe: true,
   execute: (input, ctx) => guarded(async () => {
     const raw = str(input, "file_path");
-    const abs = resolvePath(raw, ctx.workdir);
+    // 走带护栏的版本：ReadImage 是另一条「按路径读任意文件」的通道，
+    // 只给 Read 加护栏而漏了它，等于护栏有后门（图片读不出来但能确认到存在与大小也算泄露）。
+    const abs = resolveReadablePath(raw, ctx.workdir);
     const shown = relPath(abs, ctx.workdir);
     const requested = optNum(input, "max_bytes");
     const maxBytes = requested === undefined

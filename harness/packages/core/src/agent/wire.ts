@@ -12,8 +12,6 @@ export interface WireInput {
     memory?: import("./runtime.ts").MemoryPort;
     projectOps?: (id: string) => import("../tools/types.ts").ProjectOps;
     spawnSubagent?: (o: { prompt: string; label?: string; threadId: string }) => Promise<string>;
-    /** 屏幕感知（M7）：提供截图 OCR 的检索能力 */
-    activity?: { searchScreen(q: string, o?: { limit?: number }): import("../tools/types.ts").ScreenHit[] };
     /** 搜索 API 的 key（Tavily）—— 见下面 services 里的转发，漏了 WebSearch 会静默退回抓 Bing */
     webSearchKey?: string;
     /** MCP 资源能力（ListMcpResources / ReadMcpResource）—— server 层接真实客户端 */
@@ -60,13 +58,6 @@ export function buildExecDeps(input: WireInput): Omit<ExecDeps, "tools"> {
       r.usedMemories.map((m) => ({ content: m.content, score: 1, createdAt: Date.now() }))) : undefined,
     remember: svc.memory ? (c, k, s) => svc.memory!.remember(c, k, s) : undefined,
     spawnSubagent: svc.spawnSubagent ? (o) => svc.spawnSubagent!({ ...o, threadId: input.threadId }) : undefined,
-    // 屏幕记忆检索：截图 OCR 的历史（agent 用它回答「我屏幕上看到过什么」）
-    searchScreen: svc.activity
-      ? (q, n) => {
-          try { return svc.activity!.searchScreen(q, { limit: n ?? 5 }); }
-          catch { return []; }
-        }
-      : undefined,
     project,
     // ⚠️ 这个值要在**四个地方**都写对才能生效：
     //   bootstrap 传参 → AgentServices 声明 → runtime 转发 → **这里落到 ToolServices**

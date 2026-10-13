@@ -80,7 +80,7 @@ export const CORE_TOOLS: Tool[] = [
   // 只追加在 CORE 尾部：既有工具的 wire 顺序不变（缓存纪律）
   RuntimeStatusTool,
   // 只追加在 CORE 尾部（缓存纪律）：PTC 要让模型随时能用，所以进常驻段；
-  // 它能不能真的用由线程策略决定（Home / 只读线程里被裁掉，见 agent/tool-policy.ts）
+  // 它能不能真的用由线程策略决定（Home / 只读线程里被裁掉或拦下，见 agent/tool-policy.ts）
   RunScriptTool,
 ];
 
@@ -140,8 +140,24 @@ function renderToolSearchDescription(): string {
 }
 ToolSearchTool.description = renderToolSearchDescription();
 
-/** 目录超过这个数就必须显式传 activeTools，否则强制最小集 */
-export const TOOL_COUNT_INVARIANT = 40;
+/**
+ * 目录超过这个数就必须显式传 activeTools，否则强制最小集。
+ *
+ * ⚠️ 这是一个**绊线**，不是可推导的缓存值：数字必须等于三张表的总和，
+ *    加/删工具时**必须**同步改这里，否则下面会在模块加载时直接抛错。
+ *    原先是写死的 40 而实际有 44 —— 于是任何调用方忘了传 activeTools，
+ *    都会被静默降级成最小集（工具凭空消失，模型只会觉得「我没这个能力」）。
+ */
+export const TOOL_COUNT_INVARIANT = 44;
+{
+  const actual = CORE_TOOLS.length + SYSTEM_TOOLS.length + ON_DEMAND_TOOLS.length;
+  if (actual !== TOOL_COUNT_INVARIANT) {
+    throw new Error(
+      `工具表与 TOOL_COUNT_INVARIANT 不一致：实际 ${actual}（core ${CORE_TOOLS.length} + system ${SYSTEM_TOOLS.length} + on-demand ${ON_DEMAND_TOOLS.length}），常量 ${TOOL_COUNT_INVARIANT}。` +
+      "加/删工具后请同步改 registry.ts 里的 TOOL_COUNT_INVARIANT。",
+    );
+  }
+}
 
 // ── EXTERNAL：MCP 等外部工具（T3.12），**永远追加在尾部** ──
 let externalToolList: Tool[] = [];
@@ -293,6 +309,16 @@ export function toolLayer(name: string): ToolLayer {
 }
 
 /**
+ * exposure === "hidden" 的工具**不上 wire** —— 两轴模型里唯一动可见性的档位（见 tools/types.ts）。
+ * 其余档位一律原样放行：direct / deferred_model_only 只是「不可执行」，那由执行侧
+ * （agent/tool-policy.ts + loop/tool-exec.ts）拦，**不在这里删** —— 删一次就动一次工具表，
+ * 前缀缓存整段作废（文件顶部的缓存纪律）。
+ */
+function wireVisible(list: Tool[]): Tool[] {
+  return list.filter((t) => t.exposure !== "hidden");
+}
+
+/**
  * 上 wire 的 schema。
  * 不变量守卫：目录 > TOOL_COUNT_INVARIANT 且调用方没传 limitTo → 强制最小集。
  * （否则 provider 会把全部工具塞上 wire，token 爆炸）
@@ -301,9 +327,9 @@ export function wireSchemas(limitTo?: string[]): ToolSchema[] {
   const catalog = allTools();
   if (catalog.length > TOOL_COUNT_INVARIANT && !limitTo) {
     console.warn("[INVARIANT] 工具目录 " + catalog.length + " 且未指定 activeTools，已强制最小集");
-    return [...CORE_TOOLS, ...SYSTEM_TOOLS].map(normalizeToolSchema);
+    return wireVisible([...CORE_TOOLS, ...SYSTEM_TOOLS]).map(normalizeToolSchema);
   }
   const list = limitTo ? catalog.filter((t) => limitTo.includes(t.name)) : activeTools();
   // T3.3：上 wire 前必须归一化（MCP 动态注册的工具会带脏字段）
-  return list.map(normalizeToolSchema);
+  return wireVisible(list).map(normalizeToolSchema);
 }

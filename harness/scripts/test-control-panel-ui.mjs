@@ -64,9 +64,11 @@ const title = await ev("document.title");
 check("标题是 control-panel", /Dove/.test(title), title);
 
 console.log("2) 建任务并用 localStorage 进入（界面自己恢复项目就是这么走的）");
+// 兼容层除 /api/health 外都要本地令牌；页面就在内核上（8790），同源取一次即可
 const made = await ev(`(async () => {
+  const t = (await (await fetch("/api/local-token")).json()).token;
   const r = await fetch("http://127.0.0.1:8008/api/projects/create", {
-    method: "POST", headers: {"Content-Type":"application/json"},
+    method: "POST", headers: {"Content-Type":"application/json", "X-Dove-Token": t},
     body: JSON.stringify({ name: "UI 实打实" })
   });
   return (await r.json()).project.port;

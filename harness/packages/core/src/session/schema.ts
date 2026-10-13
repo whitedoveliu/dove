@@ -2,10 +2,10 @@
  * SQLite 表定义（T0.3；计划 §2.2）
  * 真相源是事件日志；SQLite 只是派生视图（加速查询）。
  */
-// v2：M6 cron_* / M7 activity_* 新表
-// v3：activity_ocr_terms —— 屏幕内容的倒排索引，补上「OCR 存了但检索不到」这一环
+// v2：M6 cron_* 新表
 // v4：goals —— 长期目标（每线程至多一个），跨轮自动续跑靠它
-export const SCHEMA_VERSION = 4;
+// v5：移除 M7 感知层（activity_* 全部表）；旧库里的残留由 DROP_LEGACY_SQL 清理
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -146,89 +146,6 @@ CREATE TABLE IF NOT EXISTS cron_history (
 );
 CREATE INDEX IF NOT EXISTS idx_cron_history_job ON cron_history(job_id, started_at DESC);
 
--- ── 感知层 / 活动记录器（M7 / T7.1–T7.10）────────────────────
-
-CREATE TABLE IF NOT EXISTS activity_snapshots (
-  id            TEXT PRIMARY KEY,
-  session_id    TEXT,
-  timestamp     INTEGER NOT NULL,
-  file_path     TEXT NOT NULL,
-  width         INTEGER NOT NULL DEFAULT 0,
-  height        INTEGER NOT NULL DEFAULT 0,
-  size_bytes    INTEGER NOT NULL DEFAULT 0,
-  trigger       TEXT NOT NULL DEFAULT 'heartbeat',   -- heartbeat | visual_change | app_focus | click | typing_pause | manual
-  app_name      TEXT,
-  window_title  TEXT,
-  hash_hex      TEXT,                                -- 判重位图指纹（同一尺度才可比）
-  histogram     TEXT,                                -- 32 桶直方图 JSON
-  diff_pct      REAL,
-  storage_tier  TEXT NOT NULL DEFAULT 'hot',         -- hot | warm | cold
-  created_at    INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_activity_snapshots_ts ON activity_snapshots(timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_activity_snapshots_session ON activity_snapshots(session_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_activity_snapshots_tier ON activity_snapshots(storage_tier, timestamp);
-
-CREATE TABLE IF NOT EXISTS activity_ocr_frames (
-  id           TEXT PRIMARY KEY,
-  snapshot_id  TEXT NOT NULL,
-  session_id   TEXT,
-  text         TEXT NOT NULL,                        -- 已脱敏
-  char_count   INTEGER NOT NULL DEFAULT 0,
-  created_at   INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_activity_ocr_session ON activity_ocr_frames(session_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_activity_ocr_snapshot ON activity_ocr_frames(snapshot_id);
-
-CREATE TABLE IF NOT EXISTS activity_events (
-  id          TEXT PRIMARY KEY,
-  session_id  TEXT,
-  timestamp   INTEGER NOT NULL,
-  kind        TEXT NOT NULL,                         -- app_focus | click | typing_pause | ...
-  app_name    TEXT,
-  data        TEXT NOT NULL DEFAULT '{}',
-  created_at  INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_activity_events_session ON activity_events(session_id, timestamp);
-
-CREATE TABLE IF NOT EXISTS activity_sessions (
-  id            TEXT PRIMARY KEY,
-  started_at    INTEGER NOT NULL,
-  ended_at      INTEGER,
-  trigger_kind  TEXT NOT NULL DEFAULT 'heartbeat',
-  summary       TEXT,                                -- AnalysisResult JSON
-  analyzed_at   INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_activity_sessions_started ON activity_sessions(started_at DESC);
-
-CREATE TABLE IF NOT EXISTS activity_summaries (
-  id          TEXT PRIMARY KEY,
-  kind        TEXT NOT NULL,                         -- daily | weekly
-  date_key    TEXT NOT NULL,
-  summary     TEXT NOT NULL,
-  stats       TEXT NOT NULL DEFAULT '{}',
-  model       TEXT,
-  is_partial  INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_summaries_key ON activity_summaries(kind, date_key);
-
--- 屏幕内容倒排索引（v3）：中文 2-gram + 西文词。
--- 为什么不用 FTS5：实测 node:sqlite 的 FTS5 对中文几乎无效
--- （默认分词器查「飞书」0 行；trigram 分词器要 ≥3 字，「飞书」仍 0 行）。
-CREATE TABLE IF NOT EXISTS activity_ocr_terms (
-  term        TEXT NOT NULL,
-  frame_id    TEXT NOT NULL,
-  snapshot_id TEXT NOT NULL,
-  session_id  TEXT,
-  occurrences INTEGER NOT NULL DEFAULT 1,
-  at          INTEGER NOT NULL,
-  PRIMARY KEY (term, frame_id)
-);
-CREATE INDEX IF NOT EXISTS idx_ocr_terms_term ON activity_ocr_terms(term);
-CREATE INDEX IF NOT EXISTS idx_ocr_terms_at ON activity_ocr_terms(at DESC);
-CREATE INDEX IF NOT EXISTS idx_ocr_terms_frame ON activity_ocr_terms(frame_id);
-
 -- 长期目标（v4）：一个线程至多一个 goal；revision 做乐观并发。
 -- phase: active | paused | blocked | complete
 CREATE TABLE IF NOT EXISTS goals (
@@ -244,4 +161,17 @@ CREATE TABLE IF NOT EXISTS goals (
   updated_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_goals_thread ON goals(thread_id, updated_at DESC);
+`;
+
+/**
+ * v5 清理：M7 感知层已整体移除，旧库里残留的 activity_* 表（连同索引）在这里一次性清掉 ——
+ * 否则它们会变成没人认识、也永远不会再被写入的孤儿表。DROP TABLE 幂等，新库上是空操作。
+ */
+export const DROP_LEGACY_SQL = `
+DROP TABLE IF EXISTS activity_snapshots;
+DROP TABLE IF EXISTS activity_ocr_frames;
+DROP TABLE IF EXISTS activity_ocr_terms;
+DROP TABLE IF EXISTS activity_events;
+DROP TABLE IF EXISTS activity_sessions;
+DROP TABLE IF EXISTS activity_summaries;
 `;

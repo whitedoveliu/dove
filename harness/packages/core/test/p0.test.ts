@@ -28,7 +28,6 @@ import { allTools, getTool } from "../src/tools/registry.ts";
 import { convertMessages } from "../src/context/convert.ts";
 import { toWireHistory } from "../src/agent/wire-history.ts";
 import { hydrateImages, MAX_IMAGE_BYTES } from "../src/context/images.ts";
-import { renderTextImage } from "../src/activity/ocr.ts";
 import { CronScheduler } from "../src/scheduler/cron.ts";
 import { makeCronOps } from "../src/scheduler/cron-ops.ts";
 import { defineTool, S } from "../src/tools/types.ts";
@@ -62,12 +61,17 @@ function ctxWith(services: ToolServices): ToolContext {
 
 function tempDir(tag: string): string { return mkdtempSync(join(tmpdir(), "dove-p0-" + tag + "-")); }
 
+/** 一张真实有效的 1×1 PNG（已知字节，不依赖任何外部工具/权限渲染） */
+const PNG_1X1 = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+  "base64",
+);
+
 // ── 1. ReadImage：真实读取 → 落库 → 装配出 image_url ─────────────
 test("ReadImage：真实 PNG 走完整链路，模型最终看到 image_url block", async () => {
   const dir = tempDir("img");
   const png = join(dir, "line.png");
-  const rendered = await renderTextImage(png, "DOVE-42");
-  assert.ok(rendered.ok, "renderTextImage 失败，真实图像链路无法验证：" + (rendered.error ?? "未知"));
+  writeFileSync(png, PNG_1X1);
 
   // 假 provider：第一步要求 ReadImage，之后的每一步检查「有没有收到图」
   let step = 0;
@@ -120,7 +124,7 @@ test("ReadImage：真实 PNG 走完整链路，模型最终看到 image_url bloc
   assert.equal(calls, results, "tool_calls 与 tool 结果必须配对");
   assert.equal(typeof wire.find((m) => m.role === "tool")!.content, "string", "role:tool 的 content 必须是字符串");
   // ⑤ 真实运行路径（runtime 用的是 toWireHistory，不是 convertMessages）
-  const realWire = toWireHistory(msgs, "", "th_img", true);
+  const realWire = toWireHistory(msgs, "th_img", true);
   assert.ok(hasImageBlock(realWire), "toWireHistory（真实装配路径）没装配出 image_url");
 
   console.log("  证据：image_url 前缀 " + String(imageUrl).slice(0, 30)
@@ -247,12 +251,13 @@ test("子代理控制面：追加消息真注入、中断只掐一个、结束�
   assert.ok(await waitFor(() => host.list().find((x) => x.id === rowA!.id)?.status !== "running"), "子代理没有跑完");
   assert.match(seenInjected, /补充：请顺便报一下时间/, "注入的消息没有被子代理读到");
 
-  // 结束后追加 → 带着旧结论新起一个子代理续跑
+  // 结束后追加 → **重挂同一个子代理**续跑（同 id、同一段历史）。
+  // 只有作用域缓存被淘汰 / 跨进程 / 只剩库里留档时，才会退回「新起一个 + 旧结论当种子」。
   hold = false;
   const resumed = await host.send(rowA!.id, "再补一个点");
   assert.equal(resumed.mode, "resumed");
   assert.match(String(resumed.output), /结论：完成了/, "续跑没有产出结论");
-  assert.notEqual(resumed.subagentId, rowA!.id, "续跑应当是新的子代理");
+  assert.equal(resumed.subagentId, rowA!.id, "续跑应当重挂同一个子代理，而不是新起一个");
 
   // 中断：只掐一个，兄弟不受影响
   hold = true;

@@ -12,6 +12,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
+import { isRunnableDoc, PREVIEW_DOC_CSP } from "./preview-path.ts";
 
 export type JsonResponder = (res: ServerResponse, code: number, data: unknown) => void;
 
@@ -267,6 +268,10 @@ export async function handleProxy(url: URL, req: IncomingMessage, res: ServerRes
   }
 
   const headers = passthroughHeaders(upstream, contentType);
+  // 外站文档同样是「不可信内容」，而且**它跑在面板同源**（代理就是为了绕过 frame 限制才同源的）——
+  // 不加沙箱的话，用户随手打开的任何公网页面都能 `fetch('/api/local-token')` 读走令牌。
+  // 判据与理由见 preview-path.ts 的 PREVIEW_DOC_CSP（面板里 8790 的两条预览路由用的是同一个常量）。
+  if (isRunnableDoc(contentType)) headers["content-security-policy"] = PREVIEW_DOC_CSP;
   const isHtml = /^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType);
   if (isHtml) {
     headers["content-type"] = contentType.replace(/;\s*charset=[^;]*/i, "") + "; charset=utf-8";

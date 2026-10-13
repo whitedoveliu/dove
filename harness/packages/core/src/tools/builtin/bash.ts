@@ -115,6 +115,13 @@ function runForeground(
   });
 }
 
+/**
+ * ⚠️ Bash **故意不声明 accesses**（并发调度会保守地把它当独占，和所有工具都冲突）。
+ * 为什么：命令内容不可静态判定 —— `cat a.txt` 与 `rm -rf ~` 长得一样，
+ * 想「聪明地」解析出它碰哪些路径，就得实现一个 shell 解析器；解析错的方向是
+ * **把冲突判成不冲突**（同批次里读和写重叠），那是数据损坏级的错。
+ * TerminalSend 同理（往会话里发什么都可能）。等真有人需要并行 Bash 再说。
+ */
 export const BashTool = defineTool({
   name: "Bash",
   description:
@@ -133,6 +140,8 @@ export const BashTool = defineTool({
   outputTier: "compact",
   approval: "heuristic",
   concurrencySafe: false,
+  // 「同意并记住」的参数模式 = 整条命令（Bash 的风险全在命令里，没有更细的粒度）
+  approvalRule: (args) => (typeof args.command === "string" ? args.command : undefined),
   timeoutMs: TOOL_TIMEOUT_MS,
   execute: (input, ctx) => guarded(async () => {
     const command = str(input, "command");

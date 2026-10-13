@@ -5,11 +5,25 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { defineTool, S } from "../types.ts";
+import type { ToolAccesses } from "../types.ts";
 import { extractDocument, isDocumentPath } from "../../docs/index.ts";
-import { guarded, resolvePath, relPath, str, optNum, readTextFile, humanBytes } from "./util.ts";
+import { guarded, resolveReadablePath, relPath, str, optNum, readTextFile, humanBytes } from "./util.ts";
 
 const DEFAULT_LIMIT = 2000;
 const MAX_LINE_CHARS = 2000;
+
+/**
+ * 并发调度声明：读**一个路径**。目录要标 recursive —— Read 传目录时返回的是整层子树的内容，
+ * 不标就会和「往该目录里写文件」判成不冲突（实测会漏）。
+ * 路径用 path.resolve 自己算（不抛）：声明函数在调度前调用，抛错会把整个批次拖垮。
+ */
+export function readAccesses(args: Record<string, unknown>, workdir: string): ToolAccesses {
+  const p = args.file_path ?? args.path;
+  if (typeof p !== "string" || !p.trim()) return { kind: "all" };
+  let recursive = false;
+  try { recursive = fsp.statSync(path.resolve(workdir, p)).isDirectory(); } catch { /* 不存在 → 当文件看 */ }
+  return { kind: "paths", paths: [{ path: p, operation: "read", recursive }] };
+}
 
 /** 目录 → 列表文本 */
 async function listDir(abs: string, workdir: string): Promise<Record<string, unknown>> {
@@ -43,8 +57,14 @@ export const ReadTool = defineTool({
   outputTier: "exact",
   approval: "never",
   concurrencySafe: true,
+  accesses: readAccesses,
   execute: (input, ctx) => guarded(async () => {
-    const abs = resolvePath(str(input, "file_path"), ctx.workdir);
+    // 路径护栏（**刻意最小化**）：只拦私钥 / 凭据类路径，工作区语义一个字都没动 ——
+    // dove 允许读工作区外的文件（系统头文件、依赖源码、/tmp 产物），那是既有工作流。
+    // 这里补的是「秘密文件不该被读进上下文」：Read 是 approval:"never" 且路径原先不判定，
+    // 模型可以无声无息地读走 ~/.ssh/id_rsa 或 ~/.aws/credentials。
+    // 覆盖范围 = constants.ts 的敏感路径常量表；裸名 env 这类不在表里（要加得改常量，不在这儿私加规则）。
+    const abs = resolveReadablePath(str(input, "file_path"), ctx.workdir);
     const st = await fsp.stat(abs).catch(() => null);
     if (!st) throw new Error("路径不存在：" + relPath(abs, ctx.workdir));
 

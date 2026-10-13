@@ -10,7 +10,7 @@
  */
 import { flagBool, flagNum, parseArgs, UsageError, type Args } from "./args.ts";
 import { ApiError, NoKernelError, resolveTarget } from "./client.ts";
-import { cmdHealth, cmdLogs, cmdStatus, cmdSteer, cmdStop, cmdUp, cmdVersion } from "./admin.ts";
+import { cmdHealth, cmdLogs, cmdStatus, cmdSteer, cmdStop, cmdUp, cmdUndo, cmdVersion } from "./admin.ts";
 import { cmdAnswer, cmdApprove, cmdPending } from "./approvals.ts";
 import { cmdChat } from "./chat.ts";
 import { cmdGoal, cmdGoals, cmdSkills, cmdTools } from "./inspect.ts";
@@ -21,7 +21,7 @@ import { cmdThreads } from "./threads.ts";
 
 const COMMANDS = new Set([
   "health", "status", "version", "up", "logs", "threads", "run", "chat",
-  "stop", "steer", "approve", "pending", "answer", "tools", "skills", "goals", "goal", "help",
+  "stop", "steer", "approve", "pending", "answer", "tools", "skills", "goals", "goal", "undo", "help",
 ]);
 
 export async function main(argv: string[]): Promise<void> {
@@ -80,6 +80,7 @@ async function dispatch(a: Args): Promise<number> {
     case "chat": return cmdChat(t, a);
     case "stop": return cmdStop(t, a);
     case "steer": return cmdSteer(t, a);
+    case "undo": return cmdUndo(t, a);
     case "approve": return cmdApprove(t, a);
     case "pending": return cmdPending(t, a);
     case "answer": return cmdAnswer(t, a);

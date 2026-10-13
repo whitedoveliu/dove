@@ -5,9 +5,17 @@
 import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 import { defineTool, S } from "../types.ts";
-import { guarded, resolvePath, relPath, str, optStr, optNum, walkFiles, compileGlob } from "./util.ts";
+import type { ToolAccesses } from "../types.ts";
+import { guarded, resolveReadablePath, relPath, str, optStr, optNum, walkFiles, compileGlob } from "./util.ts";
+import { filterSensitiveEntries, isSensitivePath, sensitiveFilterNote } from "../../security/paths.ts";
 
 const MAX_RESULTS = 200;
+
+/** 并发调度声明：递归搜一个路径（path 默认工作目录）—— 递归标 true，覆盖其下所有子路径 */
+export function globAccesses(args: Record<string, unknown>, workdir: string): ToolAccesses {
+  const p = typeof args.path === "string" && args.path.trim() ? args.path : workdir;
+  return { kind: "paths", paths: [{ path: p, operation: "search", recursive: true }] };
+}
 
 /** 把绝对 pattern 收敛到 root 之下；不含 / 的模式按「任意层级的文件名」处理 */
 function buildMatcher(pattern: string, root: string, workdir: string): (rel: string) => boolean {
@@ -37,17 +45,26 @@ export const GlobTool = defineTool({
   outputTier: "compact",
   approval: "never",
   concurrencySafe: true,
+  accesses: globAccesses,
   execute: (input, ctx) => guarded(async () => {
     const pattern = str(input, "pattern");
-    const root = resolvePath(optStr(input, "path") ?? ".", ctx.workdir);
+    // 搜索根也要过护栏：把 ~/.ssh 当根去 glob，等于让模型点名枚举密钥库
+    const root = resolveReadablePath(optStr(input, "path") ?? ".", ctx.workdir);
     const limit = Math.max(1, Math.min(2000, Math.floor(optNum(input, "max_results") ?? MAX_RESULTS)));
 
     const match = buildMatcher(pattern, root, ctx.workdir);
     // walkFiles 的回调签名是 (abs, rel)：这里必须用相对路径匹配，否则 '**/*.ts' 这类模式永远不命中
-    const { files, scanned, capped } = await walkFiles({ root, match: (_abs, rel) => match(rel) });
+    const { files, scanned, capped } = await walkFiles({
+      root,
+      match: (_abs, rel) => match(rel),
+      // 敏感目录**不递归进去**：否则 `**/*` 会把 .ssh 里的文件名一个个枚举出来（名字本身就是情报）
+      pruneDir: (abs) => isSensitivePath(abs, root),
+    });
+    const { kept, droppedCount } = filterSensitiveEntries(files, (f) => f, ctx.workdir);
+    const filterNote = sensitiveFilterNote(droppedCount);
 
     const withTime: { rel: string; mtime: number }[] = [];
-    for (const abs of files) {
+    for (const abs of kept) {
       const st = await fsp.stat(abs).catch(() => null);
       withTime.push({ rel: relPath(abs, ctx.workdir), mtime: st ? st.mtimeMs : 0 });
     }
@@ -61,10 +78,13 @@ export const GlobTool = defineTool({
       count: withTime.length,
       files: picked,
       truncated,
-      note: truncated
-        ? "只返回了前 " + picked.length + " 条（匹配共 " + withTime.length + " 条，扫描 " + scanned + " 个文件）。" +
-          "这是**摘录覆盖**，不代表只有这些文件；请收窄 pattern 或指定 path 再查。"
-        : capped ? "扫描达到上限提前停止，结果可能不完整（请指定更小的 path）。" : undefined,
+      note: [
+        truncated
+          ? "只返回了前 " + picked.length + " 条（匹配共 " + withTime.length + " 条，扫描 " + scanned + " 个文件）。" +
+            "这是**摘录覆盖**，不代表只有这些文件；请收窄 pattern 或指定 path 再查。"
+          : capped ? "扫描达到上限提前停止，结果可能不完整（请指定更小的 path）。" : undefined,
+        filterNote,
+      ].filter(Boolean).join(" ") || undefined,
     };
   }),
 });
