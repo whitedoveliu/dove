@@ -7,48 +7,6 @@ use tauri::Manager;
 /// 持有 sidecar 子进程句柄，app 退出时回收
 struct AgentSidecar(Mutex<Option<Child>>);
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGPreflightScreenCaptureAccess() -> bool;
-    fn CGRequestScreenCaptureAccess() -> bool;
-}
-
-/// 屏幕录制权限：**由 App 自己申请**，不让内核里的临时 helper 去申请。
-///
-/// 为什么必须这样（用户反馈"每次重启都问一遍"的根因）：
-/// macOS 的 TCC 把授权记在**发起申请的那个进程**头上。内核原来是用 swiftc
-/// **运行时编译**出来的 helper（~/.dove/cache/screen-permission-<hash>）去调
-/// CGRequestScreenCaptureAccess()，系统记的是那个临时二进制，不是 Dove.app；
-/// 于是下一次换一个身份来问，系统又弹一遍 —— 用户永远点不完。
-///
-/// 在 App 里申请，授权就落在 Dove.app 上。注意 adhoc 签名的 app，TCC 绑的是
-/// cdhash：**只要不替换这个二进制**，授权就一直在（所以装好之后别乱覆盖）。
-///
-/// 另外：CGRequestScreenCaptureAccess() 在"未决定"状态下每次调用都会弹，
-/// 所以用一个标记文件保证**只问一次**，之后只在日志里引导用户去系统设置。
-fn ensure_screen_permission() {
-    unsafe {
-        if CGPreflightScreenCaptureAccess() {
-            println!("[dove] 屏幕录制权限: 已有");
-            return;
-        }
-        let marker = std::env::var("HOME").ok()
-            .map(|h| PathBuf::from(h).join(".dove").join(".screen-permission-requested"));
-        if let Some(m) = &marker {
-            if m.exists() {
-                println!("[dove] 屏幕录制权限: 之前申请过仍未授权 —— 不再弹窗，需要时去「系统设置 → 隐私与安全性 → 屏幕录制」手动打开");
-                return;
-            }
-        }
-        let granted = CGRequestScreenCaptureAccess();
-        if let Some(m) = &marker {
-            if let Some(dir) = m.parent() { let _ = std::fs::create_dir_all(dir); }
-            let _ = std::fs::write(m, "{\"source\":\"Dove.app\"}\n");
-        }
-        println!("[dove] 屏幕录制权限: 申请结果 granted={}", granted);
-    }
-}
-
 /// 启动器已在跑 agent API 时会设置 DOVE_NO_SIDECAR=1，
 /// 避免第二个实例去抢端口（抢不到还会触发一次无谓的退出清理）
 fn sidecar_disabled() -> bool {
@@ -181,10 +139,6 @@ fn spawn_harness(harness_dir: &Path) -> Option<Child> {
         .current_dir(harness_dir)
         // 内核自己盯着我们：App 被杀/崩溃时它跟着退出，不留孤儿进程占着端口
         .env("DOVE_EXIT_WITH_PARENT", "1")
-        // 屏幕录制权限的**申请**归 App（见 ensure_screen_permission）：
-        // 内核只做不弹窗的预检，绝不再自己申请 —— 否则 TCC 会把授权记在
-        // 运行时编译的临时 helper 头上，导致每次启动都重问一遍。
-        .env("DOVE_APP_OWNS_SCREEN_PERMISSION", "1")
         .spawn()
     {
         Ok(child) => {
@@ -250,9 +204,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // 先把屏幕录制权限要清楚（只在没问过时弹一次），再拉内核 ——
-            // 内核起来后会读同一个 TCC 状态，不用再问。
-            ensure_screen_permission();
             let (child, spawn_err) = spawn_agent_sidecar(app);
             app.manage(AgentSidecar(Mutex::new(child)));
 
