@@ -19,6 +19,8 @@ interface Chunk {
   usage?: {
     prompt_tokens?: number; completion_tokens?: number; total_tokens?: number;
     prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number;
+    /** 写缓存桶：少数网关会报（DeepSeek 不报），报了就要单独记 */
+    prompt_cache_write_tokens?: number;
     prompt_tokens_details?: { cached_tokens?: number };
   } | null;
 }
@@ -104,11 +106,23 @@ export class OpenAICompatProvider implements Provider {
         try { chunk = JSON.parse(payload) as Chunk; } catch { continue; }
 
         if (chunk.usage) {
+          // prompt 侧三个桶**互不相交**（DeepSeek / OpenAI 兼容的 prompt_tokens 已经把命中算进去了）：
+          //   inputTokens = 未命中部分，cacheReadTokens = 命中部分，cacheWriteTokens = 写缓存部分；
+          //   计费 prompt = 三者之和。
+          // ⚠️ 以前 inputTokens 直接取 prompt_tokens，命中又被记进 cacheReadTokens ——
+          //    同一批 token 数了两遍：命中率分母虚高（真实 80% 显示成 44%），
+          //    compact 的「真实用量」、面板的成本估算、上下文余量全跟着一起偏。
+          const prompt = chunk.usage.prompt_tokens ?? 0;
+          const rawHit = chunk.usage.prompt_cache_hit_tokens ?? chunk.usage.prompt_tokens_details?.cached_tokens;
+          const rawMiss = chunk.usage.prompt_cache_miss_tokens;
+          const hit = Math.max(0, rawHit ?? (rawMiss !== undefined ? prompt - rawMiss : 0));
+          const miss = Math.max(0, rawMiss ?? prompt - hit);
           usage = {
-            inputTokens: chunk.usage.prompt_tokens ?? 0,
+            inputTokens: miss,
             outputTokens: chunk.usage.completion_tokens ?? 0,
-            cacheReadTokens: chunk.usage.prompt_cache_hit_tokens ?? chunk.usage.prompt_tokens_details?.cached_tokens ?? 0,
-            cacheWriteTokens: 0,
+            cacheReadTokens: hit,
+            // 只有部分网关会报写桶（DeepSeek 不报）—— 报了就必须单独记，不能并进 inputTokens
+            cacheWriteTokens: Math.max(0, chunk.usage.prompt_cache_write_tokens ?? 0),
           };
         }
 

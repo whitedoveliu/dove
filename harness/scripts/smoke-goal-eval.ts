@@ -20,6 +20,7 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { loadConfig, bootstrap } from "../packages/server/src/bootstrap.ts";
 import { startLegacyServer } from "../packages/server/src/legacy/server.ts";
+import { loadOrMintToken } from "../packages/server/src/local-token.ts";
 import { finish } from "./_lifecycle.ts";
 import { GoalStore } from "../packages/core/src/agents/goal-store.ts";
 import { CreateGoalTool } from "../packages/core/src/tools/builtin/goal-create.ts";
@@ -170,7 +171,9 @@ function makeStub(score: (input: GoalEvaluationInput) => CriterionScore[]): Stub
 // ── 服务 ────────────────────────────────────────────
 const svc = await bootstrap(loadConfig());
 const goals = new GoalStore(svc.db);
-const legacy = await startLegacyServer(svc, 8871);
+// 兼容层除 /api/health 外都要令牌（和 main.ts 同一条路径），这里自己取一把
+const token = loadOrMintToken(svc.cfg.configDir);
+const legacy = await startLegacyServer(svc, 8871, token);
 check("面板契约层起在 8871", legacy?.port === 8871, "port=" + (legacy?.port ?? "null"));
 
 type ToolCallCtx = never;
@@ -257,8 +260,10 @@ const badCreate = await runTool(CreateGoalTool as AnyTool, {
 check("建目标时非法的 criteria 被拒（GOAL_BAD_INPUT）",
   badCreate.ok === false && badCreate.code === "GOAL_BAD_INPUT", String(badCreate.error ?? "").slice(0, 60));
 
-// 面板契约回读（真 HTTP）
-const gres = await fetch("http://127.0.0.1:8871/api/projects/" + r1.projectId + "/goal");
+// 面板契约回读（真 HTTP）—— 带令牌，和面板走同一条路
+const gres = await fetch("http://127.0.0.1:8871/api/projects/" + r1.projectId + "/goal", {
+  headers: { "X-Dove-Token": token },
+});
 const gbody = await gres.json() as { goal?: { criteria?: GoalCriterion[]; last_eval?: { pass?: boolean } } };
 check("HTTP /goal 回读 criteria（面板那条路）",
   gres.status === 200 && (gbody.goal?.criteria?.length ?? 0) === 2 && gbody.goal?.criteria?.[0]?.id === "c1",

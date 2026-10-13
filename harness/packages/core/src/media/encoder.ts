@@ -1,7 +1,7 @@
 /**
  * 视频编码器（媒体层）：Swift + AVFoundation 的运行时编译与调用。
  *
- * 思路与 activity/ocr.ts 完全一致：
+ * 思路：
  * - 源码 = 同目录的 encoder.swift；按内容 sha256 命名，编译产物缓存到 ~/.dove/cache/video-encoder-<hash>
  * - 已有可执行文件直接复用；没有才编译（首次约 5–15 秒；同内容只编译一次，进程内并发共享同一次编译）
  * - 无 swiftc / 编译失败 / 编码失败 → 结构化结果（ok:false + error），绝不抛

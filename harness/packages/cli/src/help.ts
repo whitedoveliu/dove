@@ -24,6 +24,8 @@ export const MAIN_HELP = `dove —— 内核（常驻服务）的命令行客户
   chat                交互 REPL（/exit /new /threads /stop）
   stop [--thread <id>]   停掉正在跑的回合（默认 home 线程）
   steer "<消息>"         给正在跑的回合插话（下一个 step 生效）
+  undo [--turns <n>] [--thread <id>]
+                      撤销最近 n 轮对话（默认 1）。**不删数据** —— 只标记，日志追加一条记录
   approve [--allow|--deny|--tool-call-id <id>]
                       列出待审批并在终端里允许/拒绝
   pending             只列待审批，不做决定
@@ -55,7 +57,8 @@ const COMMANDS: Record<string, string> = {
   chat: `dove chat [--thread <id> | --new | --home] [--quiet]\n\n  交互式对话，同一个线程连着聊多轮。\n  /exit /quit    退出\n  /new [标题]    换个新线程接着聊\n  /threads       列出线程（● 是当前）\n  /stop          停掉当前线程在跑的回合\n  Ctrl+C：回合跑着时 = 停这一轮；在提示符上 = 退出。`,
   stop: `dove stop [--thread <id>] [--json]\n\n  停掉某个线程正在跑的回合（默认 home）。没有在跑的回合不算失败（幂等）。`,
   steer: `dove steer "<消息>" [--thread <id>] [--json]\n\n  给正在跑的回合插话：内核会在下一个 step 把它读进去，不用等这一轮结束。`,
-  approve: `dove approve [--allow | --deny | --tool-call-id <id> [--deny]] [--reason <文本>] [--json]\n\n  列出待审批的工具调用，并让你在终端里表态。\n  不给任何选项时：TTY 下逐条问（先问「全部允许？」），非 TTY 只列出来。\n  --allow/--deny 批量表态（无人值守用它）。\n  审批等待默认 5 分钟就超时并按拒绝处理（DOVE_APPROVAL_TIMEOUT_MS 可调）。`,
+  undo: `dove undo [--turns <n>] [--thread <id>] [--json]\n\n  撤销最近 n 轮对话（默认 1 轮），把那些消息从「模型看得见的历史」里拿掉。\n  纪律：**磁盘上什么都不删、什么都不改写** —— 只给消息打一个已撤销标记，\n  并在该线程的日志里追加一条 context.undo。撤销不了（轮数不够 / 没有真实用户消息）\n  会明确告诉你差多少，退出码非 0（脚本能判断），不会假装成功。`,
+  approve: `dove approve [--allow | --deny | --tool-call-id <id> [--deny]] [--reason <文本>] [--json]\n\n  列出待审批的工具调用，并让你在终端里表态。\n  不给任何选项时：TTY 下逐条问（先问「全部允许？」），非 TTY 只列出来。\n  --allow/--deny 批量表态（无人值守用它）。\n  审批等待默认 5 分钟就超时并按拒绝处理（DOVE_APPROVAL_TIMEOUT_MS 可调）。\n  --remember 与 --allow 同用：这次同意**并记住**这个形状（按工具自报的参数模式记，例如 Bash(rm *) 这种）。`,
   pending: `dove pending [--json]\n\n  只列待审批，不做决定。`,
   answer: `dove answer [--id <toolCallId>] "<文本>" [--json]\n\n  回答 AskUserQuestion。不给 --id 就用「最近一次提问」\n  （由 dove run 看到提问事件时记下来的）。`,
   tools: `dove tools [--json]\n\n  工具清单（GET /api/tools/list）。内核较旧、没有这个端点时给一句提示并返回 0 ——\n  因为它只影响「看得见多少」，不影响干活。`,

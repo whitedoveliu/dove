@@ -128,58 +128,12 @@ export const MEMORY_SLEEP_DEFAULTS = {
  *   只有 **0.367**，比「谢谢」的 0.433 还低。这种对任何单阈值都无解，
  *   属于 embedding 模型的能力边界（bge-small-zh 对「打包/build」这组同义词不够敏感）。
  *   要解决得换更大的模型（bge-base / bge-m3，代价是体积 98MB / 542MB），或加查询改写。
- *
- *   注意「谢谢」这类客套语 isGreeting() 判为 false（它是感谢不是问候），
- *   所以靠「问候走问候通道」并不能把它从记忆通道排除掉。
  * - hash-1024 降级（没装 onnxruntime / 没下模型）：
  *   相关 0.13~0.39，无关 ≤0.064 → 取 **0.12**。
  * 选哪一档由 embedder.id 决定（hash-* → 降级档），见 memory/index.ts 的 injectThresholdFor。
  */
 export const MEMORY_INJECT_THRESHOLD = 0.44;
 export const MEMORY_INJECT_THRESHOLD_HASH = 0.12;
-
-// ── 运行时活动注入：三条通道（问候 / 语义 / 记忆） ─────
-export const ACTIVITY_INJECT = {
-  /** ① 问候通道：trim 后字符数上限（超过就当普通消息） */
-  greetingMaxChars: 30,
-  /** ① 问候通道：最近活动摘要回看窗口 */
-  greetingWindowMs: 48 * 60 * 60 * 1000,
-  /** ① 问候通道：摘要字符上限（每轮都发，必须小） */
-  greetingSummaryChars: 900,
-  /** ② 语义通道：最短触发长度（字符） */
-  semanticMinChars: 4,
-  /** ② 语义通道：只搜最近这么久以内的 OCR 帧 */
-  semanticWindowMs: 24 * 60 * 60 * 1000,
-  /**
-   * ② 语义通道 · **向量通道**阈值（真 ONNX 向量，BGE-small-zh-v1.5）。
-   * 用真实屏幕 OCR 内容标定：相关 query 最高分 0.539 / 0.472 / 0.387 / 0.670（最低 0.387），
-   * 无关 query 最高分 0.217 / 0.287 / 0.399 / 0.245（最高 0.399）——
-   * 重叠带 [0.387, 0.399]，取 0.40 卡在带子中间。
-   * ⚠️ 别抄 Alma 的 0.75：那是他们模型的尺度；BGE-zh 上正确匹配只有 0.43~0.63，卡 0.75 会全部漏掉。
-   */
-  semanticThreshold: 0.40,
-  /**
-   * ② 语义通道 · **词袋降级通道**阈值（没有真向量时用本地 2-gram 打分）。
-   * 两个通道的分数不在一个量级，必须分开：
-   * relevance = 命中查询词权重 / min(查询词权重, semanticQueryCap)，
-   * 实测相关消息 0.33~0.58、仅蹭到一个通用词的消息 0.14 —— 0.25 卡在中间。
-   */
-  semanticThresholdLexical: 0.25,
-  /** ② 向量通道：候选帧上限（按时间倒序取最近 N 帧算余弦） */
-  semanticVectorFrames: 40,
-  /** ② 向量通道：帧向量内存缓存条数（只缓存，不落库；避免每轮重算同一帧） */
-  semanticVectorCache: 400,
-  /** ② 语义通道：查询词权重分母的封顶（长消息不该被自身长度惩罚） */
-  semanticQueryCap: 12,
-  /** ② 语义通道：最多注入几条 */
-  semanticTopK: 3,
-  /** ② 语义通道：单条片段字符上限 */
-  semanticSnippetChars: 180,
-  /** ② 语义通道：超时（毫秒）—— 超时即放弃，绝不拖慢发送 */
-  semanticTimeoutMs: 350,
-  /** 单条查询词权重：单字命中不可靠，降权 */
-  singleCharWeight: 0.35,
-} as const;
 
 // ── 子代理 ────────────────────────────────────────────
 export const SUBAGENT_MAX_STEPS = 100;
@@ -230,6 +184,101 @@ export const HEARTBEAT_ACTIVE_HOURS = [8, 23] as const;
 
 // ── 事件日志 ──────────────────────────────────────────
 export const EVENT_LOG_FLUSH_INTERVAL_MS = 200;
+
+// ── 工具输出整形（行内截断 → 预算 → 外置） ─────────────
+/**
+ * 单行上限：先把超长行**折行内截断**，再判总预算。
+ * 为什么顺序不能反：grep/find 这类输出「行多、每行信息密度高」，
+ * 直接按总字符砍会把模型真正需要的尾部整段丢掉；先修长行能保住更多**不同**的事实。
+ */
+export const OUTPUT_LINE_MAX_CHARS = 2_000;
+/** 外置/预览时保留的头尾（头多尾少：开头通常是命令与结论，结尾是错误摘要） */
+export const OUTPUT_PREVIEW_HEAD_CHARS = 4_096;
+export const OUTPUT_PREVIEW_TAIL_CHARS = 1_024;
+/**
+ * 工具结果**老化**：超过这么多步之后，把老结果的正文换成 spill 指针。
+ * 四家（CC microcompaction / Codex compact_retained_tool_outputs / Kimi 50k 外置）唯一收敛的省 token 手段。
+ * 只换正文、不动结构 —— 配对关系与顺序必须原样保留，否则前缀缓存整段作废。
+ */
+export const TOOL_RESULT_AGING_AFTER_STEPS = 6;
+/** 小于这个长度的结果不值得换成指针（指针本身也要花 token） */
+export const TOOL_RESULT_AGING_MIN_CHARS = 1_500;
+
+// ── 读侧路径护栏（写侧是 resolveInsideWorkspace，读侧原先完全没有） ──
+/** 路径里出现这些目录名（任意一段）直接拒绝读取：SSH / 云凭证 / 包管理器令牌 */
+export const SENSITIVE_DIR_SEGMENTS: readonly string[] = [
+  ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".netrc", ".config/gcloud",
+];
+/** 文件名命中即拒绝（跨目录通用） */
+export const SENSITIVE_FILE_NAMES: readonly string[] = [
+  ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519", "id_ecdsa",
+  "credentials", "credentials.json", ".npmrc", ".pypirc", ".htpasswd",
+  "shadow", "master.key", "secrets.yml", "secrets.yaml",
+  /**
+   * 裸名 `env` —— 这条不是通用惯例，是**本仓库自己的惯例**：
+   * README 第 1 步就是 `echo 'ANTHROPIC_API_KEY=…' > env`（仓库根一个叫 env 的文件装真钥匙）。
+   * 拦了 `.env` 却放着 `env` 不拦，等于护栏有个正好对着自家钥匙的门。
+   * 只按「末尾一段全等」命中，`src/env.ts` / `env/foo` 都不受影响。
+   */
+  "env",
+];
+/**
+ * 这些后缀是**模板/样板**，不是真钥匙 —— 命中即放行（见 sensitiveHitOf 的 ⓪）。
+ * `.env.example` 拦下来的唯一效果是模型读不到该配哪些变量。
+ */
+export const SENSITIVE_NAME_EXEMPT_SUFFIXES: readonly string[] = [".example", ".sample", ".template", ".dist"];
+/** 文件名的前后缀命中即拒绝（如 xxx.pem / service-account-yyy.json） */
+export const SENSITIVE_FILE_SUFFIXES: readonly string[] = [".pem", ".key", ".p12", ".pfx", ".keystore"];
+export const SENSITIVE_FILE_PREFIXES: readonly string[] = ["service-account-"];
+
+// ── 审批规则（会话级「同意并记住」） ────────────────────
+/** 一条会话规则最长多少个字符（防模型/用户塞进来一个巨型 glob） */
+export const APPROVAL_RULE_MAX_CHARS = 200;
+/** 单个线程最多记住多少条会话规则（超出丢最老的一条） */
+export const APPROVAL_SESSION_RULE_MAX = 100;
+
+// ── 工具并发调度（路径冲突图） ────────────────────────
+/** 未声明 accesses 的工具一律按「与所有工具冲突」处理（串行）—— 保守优先 */
+export const SCHEDULER_DEFAULT_SERIAL = true;
+
+// ── 重复断路器（同一工具 + 同一参数反复重试） ──────────
+/**
+ * 分级干预门槛：到第 3 次先提醒、第 5 次再提醒一次（措辞更硬）、
+ * 第 8 次强制停批、第 12 次直接失败。四家都有一版这种东西，dove 之前只有「续跑次数」计数。
+ */
+export const REPEAT_BREAKER_LEVELS = [3, 5, 8, 12] as const;
+
+// ── 子代理角色（白名单 + 能力） ───────────────────────
+/** 子代理默认 2 小时超时（抄 Kimi；后台任务本来就是长活） */
+export const SUBAGENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+/** 子代理作用域缓存：超过这个数就淘汰最老的（被占用的会顺延） */
+export const SUBAGENT_SCOPE_CACHE_SIZE = 32;
+/** 一次派发最多允许同时跑几个子代理 */
+export const SUBAGENT_MAX_CONCURRENT = 6;
+
+// ── 回合净 diff（「这轮改了什么」+ 「回退这一轮」的地基） ──
+export const TURN_DIFF_TIMEOUT_MS = 100;
+/** 净 diff 最多记住多少个文件（防一轮改几百个文件把内存撑爆） */
+export const TURN_DIFF_MAX_FILES = 200;
+
+// ── 压缩：保住「用户真正说过的话」 ─────────────────────
+/**
+ * 压缩后保留的**真实用户消息**总 token 预算。
+ * 20_000 这个数不是我拍的：Kimi（COMPACT_USER_MESSAGE_MAX_TOKENS）与
+ * Codex（COMPACT_USER_MESSAGE_MAX_TOKENS = 20_000）两份独立实现收敛到同一个值。
+ * 头预算小的那部分用来保住**最早**那条需求（否则工具密集的回合会把最初诉求挤掉）。
+ */
+export const COMPACT_KEEP_USER_TOKENS = 20_000;
+export const COMPACT_KEEP_USER_HEAD_TOKENS = 2_000;
+/** 压缩后重新挂一遍「当前回合的提醒」（plan / goal / 未注入的 AGENTS.md） */
+export const COMPACT_REARM_REMINDERS = true;
+
+// ── 项目指令文件（AGENTS.md） ─────────────────────────
+/** 与 Codex 同值：32 KiB，超出**警告**（不硬截断，否则模型看到半截规则更危险） */
+export const AGENTS_MD_MAX_BYTES = 32 * 1024;
+export const AGENTS_MD_PLAIN_NAMES: readonly string[] = ["AGENTS.md", "agents.md"];
+/** 每个文件前面加的来源锚点，也是「反查某段指令来自哪个文件」的依据 */
+export const AGENTS_MD_ANCHOR = (p: string): string => `<!-- From: ${p} -->`;
 
 // ── 段落注册：静态 / 动态纪律（T2.2） ──────────────────
 export type SegmentKind = "static" | "semi" | "dynamic";

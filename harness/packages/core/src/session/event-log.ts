@@ -12,7 +12,11 @@ export type EventType =
   | "session_start" | "turn_start" | "step_start" | "assistant_text" | "reasoning"
   | "tool_call" | "tool_result" | "tool_approval" | "steering"
   | "compaction" | "checkpoint" | "runtime_error" | "turn_end" | "run_end"
-  | "usage" | "repair";
+  | "usage" | "repair"
+  /** 宿主按「这一轮的模式」注入了一条独立消息（见 agent/mode-injection.ts） */
+  | "mode_injection" | "task_injection" | "image_injected"
+  /** 每线程 journal 写失败（第一份日志照写；这条是它的出口，见 agent/run-log.ts） */
+  | "journal_failed";
 
 export interface LogRecord {
   v: 1;

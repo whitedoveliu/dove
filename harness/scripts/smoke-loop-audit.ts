@@ -146,8 +146,8 @@ for (const allow of [true, false]) {
   const child = p.log.find((l) => l.role === "child")!;
   check("子代理的工具跑在**父线程**的上下文里（两条路径审批元数据一致的根因）", childThread === th, childThread);
   check("子代理的工具表是白名单裁过的，不是主线程那张（27 项）", child.wire.length < 15, child.wire.length + " 项：" + child.wire.join(","));
-  check("子代理拿不到 RunScript / BashOutput（代码执行与后台读取都不下放）",
-    !child.wire.includes("RunScript") && !child.wire.includes("BashOutput"));
+  // 2026-10-13 刻意变：子代理**可以**用 RunScript（放开了 PTC），但 BashOutput 仍不下放（后台控制面归父线程）
+  check("子代理：放开 RunScript（PTC 是决定，不是漏洞）但仍不给 BashOutput", child.wire.includes("RunScript") && !child.wire.includes("BashOutput"), child.wire.join(","));
   check("子代理拿不到派活类工具（不能自己再派子代理）", !child.wire.includes("Task") && !child.wire.includes("DispatchToProject"));
   check("子代理有 Bash —— 所以上面那条审批断言测的是真实路径", child.wire.includes("Bash"));
 }

@@ -13,7 +13,6 @@
     "typecheck": "tsc --noEmit",
     "test": "node --no-warnings --test packages/core/test/*.test.ts",
     "smoke:routes": "node --no-warnings scripts/smoke-routes.mjs",
-    "smoke:screen": "node --no-warnings scripts/smoke-screen-memory.ts",
     "smoke:mcp-resources": "node --no-warnings scripts/smoke-mcp-resources.ts",
     "smoke:cli": "node --no-warnings scripts/smoke-cli.mjs",
     "smoke:ptc": "node --no-warnings scripts/smoke-ptc.ts",

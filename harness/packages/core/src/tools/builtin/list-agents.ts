@@ -62,7 +62,7 @@ export const ListAgentsTool = defineTool({
       })),
       note: all.length === 0
         ? "这个线程还没有派过子代理。"
-        : "running 的可以用 InterruptAgent 中断、SendMessage 追加消息；已结束的用 SendMessage 会**新起一个**子代理续跑。",
+        : "running 的可以用 InterruptAgent 中断、SendMessage 追加消息；已结束的用 SendMessage 会**重挂它那段历史**继续跑。",
     };
   }),
 });

@@ -7,6 +7,12 @@ import type { Db } from "../session/db.ts";
 
 export type TaskStatus = "running" | "done" | "error" | "canceled";
 
+/** 后台任务的 token 用量（形状对齐 agents/subagent.ts 的 SubagentResult.usage） */
+export interface TaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export interface TaskRecord {
   id: string;
   threadId: string;
@@ -18,6 +24,18 @@ export interface TaskRecord {
   injected: boolean;
   createdAt: number;
   finishedAt?: number;
+  /** provider 报的 token 用量；**没报时是 undefined**（见 finish 的注释） */
+  usage?: TaskUsage;
+}
+
+/** 坏 JSON / 缺字段一律当「没报」——一行脏数据不该把整张任务列表打挂 */
+function parseUsage(raw: unknown): TaskUsage | undefined {
+  if (typeof raw !== "string" || !raw) return undefined;
+  try {
+    const u = JSON.parse(raw) as Partial<TaskUsage>;
+    if (typeof u?.inputTokens !== "number" || typeof u?.outputTokens !== "number") return undefined;
+    return { inputTokens: u.inputTokens, outputTokens: u.outputTokens };
+  } catch { return undefined; }
 }
 
 function rowToTask(r: Record<string, unknown>): TaskRecord {
@@ -30,6 +48,7 @@ function rowToTask(r: Record<string, unknown>): TaskRecord {
     injected: Number(r.injected) === 1,
     createdAt: Number(r.created_at),
     finishedAt: r.finished_at ? Number(r.finished_at) : undefined,
+    usage: parseUsage(r.usage),
   };
 }
 
@@ -50,8 +69,15 @@ export class TaskRegistry {
     return rec;
   }
 
-  finish(id: string, result: string, status: TaskStatus = "done"): void {
-    this.#db.run("UPDATE tasks SET status=?, result=?, finished_at=? WHERE id=?", status, result, Date.now(), id);
+  /**
+   * 收尾。usage 可选：provider 没报就**存 NULL**，绝不填一个 0 假数据。
+   * 「全 0 = 没报」是这里的判据：子代理每次 stream 都至少带一段 prompt，真报了不可能
+   * input 与 output 同时为 0；而 openai-compat 在没拿到 usage chunk 时回的就是全 0
+   * （初值见 providers/openai-compat.ts），把它当数据存进去就是编造。
+   */
+  finish(id: string, result: string, status: TaskStatus = "done", usage?: TaskUsage): void {
+    const u = usage && (usage.inputTokens > 0 || usage.outputTokens > 0) ? JSON.stringify(usage) : null;
+    this.#db.run("UPDATE tasks SET status=?, result=?, finished_at=?, usage=? WHERE id=?", status, result, Date.now(), u, id);
   }
 
   get(id: string): TaskRecord | undefined {
@@ -79,4 +105,21 @@ export class TaskRegistry {
     for (const t of tasks) this.#db.run("UPDATE tasks SET injected = 1 WHERE id = ?", t.id);
     return tasks;
   }
+}
+
+/**
+ * 任务结果注回的正文（runtime 把它并进当轮尾上下文）。
+ * 从 agent/runtime.ts 搬过来（那边贴着 400 行硬约束）：写的是这张记录表的呈现，和状态机同处一室。
+ * 措辞是纪律不是文案：结果用户已在界面上看过，模型**不许原样复述**。
+ */
+export function renderTaskInjection(tasks: TaskRecord[]): string {
+  return [
+    "<system-reminder>",
+    "你之前派出去的后台任务有结果了：",
+    "",
+    ...tasks.map((t, i) => `【${i + 1}｜${t.kind}】\n${t.result ?? "(无结果)"}`),
+    "",
+    "这些结果用户已经在界面上看到了。**不要原样复述**，只在需要时基于它们继续推进任务。",
+    "</system-reminder>",
+  ].join("\n");
 }

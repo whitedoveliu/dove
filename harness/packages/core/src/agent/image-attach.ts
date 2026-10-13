@@ -20,6 +20,12 @@
  *
  * 配对纪律不受影响：图片消息是独立的 user 消息，assistant.tool_calls 与
  * role:"tool" 的结果仍然一一配对。
+ *
+ * ⚠️ 挂载时刻的 createdAt 有一个必须知道的后果：回合中途压缩落检查点时，图片消息的 createdAt
+ *    **早于**检查点的 at —— `historyForWire` 的 `created_at > at` 永远取不回它，所以它只能靠
+ *    「留在检查点里」活着（agent/history-assembly.ts 的 persistCompactedHistory 只剥循环自己推的消息，
+ *    图片是运行时 append 的，正好不在其中）。⚠️ 反过来说：谁要是把图片改走循环的 pushMsg 通道，
+ *    它就会被当成在飞段剥掉，模型此后每一轮都看不到这张图，而工具结果里写着「图片已经挂进这次对话了」。
  */
 import { randomUUID } from "node:crypto";
 import type { ChatMessage } from "../providers/types.ts";

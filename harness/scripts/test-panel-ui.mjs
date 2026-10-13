@@ -168,12 +168,10 @@ const detail = await evalJs(`(() => {
     hasStats: /↑|↓|⚡|时长|step|token/i.test(t),
     hasEmotion: t.includes("情绪"),
     hasFatigue: t.includes("疲劳"),
-    hasActivity: t.includes("感知") || t.includes("快照"),
   };
 })()`);
 check("用户消息出现在界面上", detail.hasUserMsg);
 check("状态条渲染（情绪/疲劳）", detail.hasEmotion && detail.hasFatigue, JSON.stringify(detail));
-check("感知区块渲染", detail.hasActivity);
 check("无未捕获的页面异常", consoleErrors.length === 0, consoleErrors.slice(0, 2).join(" | "));
 
 // ── 收尾 ───────────────────────────────────────────────

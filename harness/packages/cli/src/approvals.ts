@@ -24,9 +24,14 @@ function describe(p: Pending): string {
 }
 
 /** 投一次审批决定。内核回 ok:false = 这条已经不在等待表里了（超时/已被处理） */
-export async function decideApproval(t: Target, id: string, approved: boolean, reason?: string): Promise<boolean> {
+/**
+ * @param remember 只对 approved 有意义：「同意并**记住**」——
+ *   内核会把这次调用的参数模式（工具自报的 approvalRule）记进会话规则表，之后同形状的调用直接放行。
+ *   默认 false：不问自记等于偷偷扩大授权，必须由用户显式要求。
+ */
+export async function decideApproval(t: Target, id: string, approved: boolean, reason?: string, remember?: boolean): Promise<boolean> {
   const r = await api<{ ok?: boolean }>(t, "/api/approve", {
-    body: { toolCallId: id, approved, ...(reason ? { reason } : {}) }, timeoutMs: 8_000,
+    body: { toolCallId: id, approved, ...(reason ? { reason } : {}), ...(remember && approved ? { remember: true } : {}) }, timeoutMs: 8_000,
   });
   return r.ok === true;
 }
@@ -39,7 +44,7 @@ export async function cmdApprove(t: Target, a: Args): Promise<number> {
 
   if (one) {
     const approved = !flagBool(a, "deny");
-    const ok = await decideApproval(t, one, approved, reason);
+    const ok = await decideApproval(t, one, approved, reason, flagBool(a, "remember"));
     if (flagBool(a, "json")) { out(JSON.stringify({ toolCallId: one, approved, ok })); return ok ? EXIT.ok : EXIT.fail; }
     if (!ok) {
       note(red("✗ ") + `内核里没有 ${one} 这条待审批（可能已超时或被处理过）`);

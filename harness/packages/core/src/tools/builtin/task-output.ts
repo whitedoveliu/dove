@@ -4,6 +4,16 @@
 import { defineTool } from "../types.ts";
 import { guarded, str } from "./util.ts";
 
+/**
+ * usage 的展示形状：provider 没报时给字符串「未上报」，**绝不给 0** ——
+ * 0 会被读成「没花 token」，那是编数据（见 agents/task-registry.ts:finish 的判据）。
+ */
+function usageField(
+  u?: { inputTokens: number; outputTokens: number },
+): { input_tokens: number; output_tokens: number } | "未上报" {
+  return u ? { input_tokens: u.inputTokens, output_tokens: u.outputTokens } : "未上报";
+}
+
 export const TaskOutputTool = defineTool({
   name: "TaskOutput",
   discoverable: "查看后台子任务的状态与结果",
@@ -11,6 +21,7 @@ export const TaskOutputTool = defineTool({
     "查看一个后台子任务的状态和结果。",
     "block=true 时会等它结束（最多 30 秒）—— 只在你**确实需要结果才能继续**时才用，否则别阻塞。",
     "注意：后台任务完成后，它的结论会**自动**出现在对话里；如果你已经看到了，就不用再查。",
+    "usage 是它烧掉的 token（input_tokens/output_tokens）；显示「未上报」= provider 没给数，别当成 0。",
   ].join("\n"),
   parameters: {
     type: "object",
@@ -35,6 +46,8 @@ export const TaskOutputTool = defineTool({
         return {
           taskId, label: t.label, status: t.status,
           result: t.status === "running" ? "(还在跑，暂无结果)" : (t.result ?? "(无结果)"),
+          // 追加字段（既有字段一个没动）：拿到结果时能看到它值不值
+          usage: usageField(t.usage),
           note: t.status === "running" ? "它还在跑。别阻塞，先做别的，结果会自动回来。" : "任务已结束。",
         };
       }

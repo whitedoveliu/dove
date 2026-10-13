@@ -34,7 +34,10 @@ await sleep(4000);
 console.log("=== 界面上的按钮们 ===");
 console.log(JSON.stringify(await ev("Array.from(document.querySelectorAll('button')).map((b,i)=>({i, txt:b.innerText.trim().slice(0,14), dis:b.disabled, title:b.title||'', aria:b.getAttribute('aria-label')||''}))"), null, 1));
 
-const PORT = await ev(`(async()=>{const r=await fetch("http://127.0.0.1:8008/api/projects/create",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:"诊断任务"})});return (await r.json()).project.port;})()`);
+const PORT = await ev(`(async()=>{
+  const t = (await (await fetch("/api/local-token")).json()).token;
+  const r = await fetch("http://127.0.0.1:8008/api/projects/create",{method:"POST",headers:{"Content-Type":"application/json","X-Dove-Token":t},body:JSON.stringify({name:"诊断任务"})});
+  return (await r.json()).project.port;})()`);
 await ev(`localStorage.setItem("dove_port", "${PORT}"); "ok"`);
 await send("Page.navigate",{url:URL_BASE}); await sleep(4500);
 console.log("进入项目后 URL/标题:", await ev("document.title"), "| 有 textarea:", await ev("!!document.querySelector('textarea')"));

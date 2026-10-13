@@ -46,6 +46,17 @@ export function noOutputNote(endReason: string, aborted: boolean): string {
         ? "这一轮出错了（模型或网络没能返回结果）"
         : endReason === "length"
           ? "这一轮被长度上限截断，没来得及写下答复"
-          : "模型这一轮没有产出答复";
-  return `⚠️ ${why}。你可以直接重试，或补充一句你想让我做什么。`;
+          // 重复断路器终止：模型在反复重试同一个调用，循环主动把它掐了。
+          // 这时候说「你可以直接重试」是**帮倒忙** —— 再点一次大概率还是同一个死循环，
+          // 所以这里的措辞必须指向「换个说法 / 补一条信息」，而不是重试。
+          : endReason === "repeat-breaker"
+            ? "模型反复重试同一个调用，被重复断路器终止了"
+            // hook 否决：某个监听者（策略 / 外部钩子）明确拦下了这一轮。
+            : endReason === "hook-veto"
+              ? "这一轮被一条钩子（策略）拦下了"
+              : "模型这一轮没有产出答复";
+  const tail = endReason === "repeat-breaker" || endReason === "hook-veto"
+    ? "把需求拆小一点、或补一句约束（比如「不要重复同一个调用」），再发一次。"
+    : "你可以直接重试，或补充一句你想让我做什么。";
+  return `⚠️ ${why}。${tail}`;
 }

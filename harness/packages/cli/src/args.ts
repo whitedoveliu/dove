@@ -11,12 +11,14 @@
 const VALUE_FLAGS = new Set([
   "port", "thread", "id", "tool-call-id", "reason", "title", "kind", "model",
   "limit", "tail", "level", "objective", "max-rounds", "timeout", "workspace", "text",
+  "turns",   // dove undo --turns <n>
 ]);
 
 /** 纯开关 */
 const BOOL_FLAGS = new Set([
   "help", "json", "quiet", "verbose", "home", "new", "all", "allow", "deny", "yes",
   "force", "no-color", "no-inline-approve", "local", "clear", "pause", "resume", "complete", "blocked", "follow",
+  "remember",   // dove approve --remember：这次同意并记住（按工具自报的参数模式）
 ]);
 
 /** 单字母别名（只留最常用的几个，避免了 -p 这种一眼看不出来的暗号扩散） */

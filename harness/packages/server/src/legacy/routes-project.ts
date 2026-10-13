@@ -8,13 +8,14 @@
  *  ③ 时间格式必须是 "YYYY-MM-DD HH:MM:SS"（非 ISO）
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, statSync, rmSync } from "node:fs";
-import { join, extname, relative, resolve, dirname, basename } from "node:path";
+import { existsSync, mkdirSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { join, resolve, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import type { Services } from "../bootstrap.ts";
 
 import { json, readBody, toLegacyProject, projectIdToPort, portToProject } from "./server.ts";
-import { LANG, HIDDEN, localTime, partsToEvents, didModify } from "./routes-project-parts.ts";
+import { localTime, partsToEvents, didModify } from "./routes-project-parts.ts";
+import { loadTurnFiles, clearTurnFilesForThread, appendTurnFiles } from "./turn-files-store.ts";
 
 
 export async function handleProjectRoutes(
@@ -67,55 +68,6 @@ export async function handleProjectRoutes(
     return true;
   }
 
-  // ── GET /api/projects/{port}/files?path= ───────────
-  const filesMatch = /^\/api\/projects\/([^/]+)\/files$/.exec(path);
-  if (filesMatch && req.method === "GET") {
-    const proj = portToProject(svc, Number(filesMatch[1]));
-    if (!proj) { json(res, 404, { success: false, message: `项目 ${filesMatch[1]} 不存在` }); return true; }
-    const sub = url.searchParams.get("path") ?? "";
-    const dir = sub ? join(proj.path, sub) : proj.path;
-    if (!existsSync(dir) || !statSync(dir).isDirectory()) {
-      json(res, 404, { success: false, message: `目录不存在: ${sub}` });
-      return true;
-    }
-    try {
-      const names = readdirSync(dir).filter((n) => !HIDDEN.has(n) && !n.startsWith(".sb-"));
-      const entries = names.map((n) => {
-        const abs = join(dir, n);
-        const st = statSync(abs);
-        const rel = relative(proj.path, abs).split("\\").join("/");
-        return st.isDirectory()
-          ? { name: n, path: rel, type: "dir" as const, has_children: readdirSync(abs).some((x) => !HIDDEN.has(x)) }
-          : { name: n, path: rel, type: "file" as const, size: st.size, modified: Math.floor(st.mtimeMs / 1000), language: LANG[extname(n).toLowerCase()] ?? null };
-      });
-      // 目录在前、文件在后，组内按名字小写升序（前端依赖这个顺序）
-      entries.sort((a, b) => (a.type === b.type ? a.name.toLowerCase().localeCompare(b.name.toLowerCase()) : a.type === "dir" ? -1 : 1));
-      json(res, 200, { success: true, port: String(filesMatch[1]), path: sub, entries, truncated: entries.length > 2000 });
-    } catch (e) {
-      json(res, 500, { success: false, message: e instanceof Error ? e.message : String(e) });
-    }
-    return true;
-  }
-
-  // ── GET /api/projects/{port}/file?path= ────────────
-  const fileMatch = /^\/api\/projects\/([^/]+)\/file$/.exec(path);
-  if (fileMatch && req.method === "GET") {
-    const proj = portToProject(svc, Number(fileMatch[1]));
-    if (!proj) { json(res, 404, { success: false, message: "项目不存在" }); return true; }
-    const sub = url.searchParams.get("path") ?? "";
-    if (!sub) { json(res, 400, { success: false, message: "缺少 path" }); return true; }
-    const abs = join(proj.path, sub);
-    if (!existsSync(abs)) { json(res, 404, { success: false, message: `文件不存在: ${sub}` }); return true; }
-    const st = statSync(abs);
-    if (st.size > 512 * 1024) { json(res, 413, { success: false, message: "文件超过 512KB，不预览" }); return true; }
-    json(res, 200, {
-      success: true, path: sub, name: sub.split("/").pop() ?? sub, size: st.size,
-      language: LANG[extname(sub).toLowerCase()] ?? null,
-      content: readFileSync(abs, "utf8"),
-    });
-    return true;
-  }
-
   // ── POST /api/projects/{port}/delete ───────────────
   //
   // **彻底删除**：项目目录（含 .git 版本、.logs、.spill）+ 数据库记录。
@@ -126,8 +78,8 @@ export async function handleProjectRoutes(
   //       只清数据库（宁可留垃圾也不能误删）。
   //    ② 前端有二次确认，文案写明不可恢复。
   //
-  // 刻意**不删** memories / activity_* —— 那些是跨项目的全局数据
-  // （用户的长期记忆、屏幕历史），删一个任务不该连带清掉。
+  // 刻意**不删** memories —— 那是跨项目的全局数据（用户的长期记忆），
+  // 删一个任务不该连带清掉。
   const delMatch = /^\/api\/projects\/([^/]+)\/delete$/.exec(path);
   if (delMatch && req.method === "POST") {
     const key = decodeURIComponent(delMatch[1]!);
@@ -149,7 +101,7 @@ export async function handleProjectRoutes(
     let threads = 0;
     try {
       const ids = svc.db.all("SELECT id FROM threads WHERE project_id = ?", proj.id);
-      for (const r of ids) { svc.store.deleteThread(String(r.id)); threads++; }
+      for (const r of ids) { svc.store.deleteThread(String(r.id)); clearTurnFilesForThread(svc, String(r.id)); threads++; }
     } catch { /* ignore */ }
 
     // 文件系统：先校验再删
@@ -241,7 +193,10 @@ export async function handleProjectRoutes(
     const proj = port !== null ? portToProject(svc, port) : null;
     if (!proj) { json(res, 404, { error: "项目不存在" }); return true; }
     let files = 0;
-    try { files = readdirSync(proj.path).length; } catch { /* ignore */ }
+    // 直接 readdirSync，不走 svc.projects.tree()：tree() 会过滤 node_modules/.git/dist/.logs/.spill
+    // 且最多走 4 层 —— 那是「面板文件树」的语义，换过来 file_count 会**悄悄变小**。
+    // （本轮曾经把 readdirSync 的 import 一起删了：ReferenceError 被这个 catch 吞掉 → 恒为 0。）
+    try { files = readdirSync(proj.path).length; } catch { /* 目录读不到就是 0，别让整个响应挂掉 */ }
     json(res, 200, { file_count: files, current_version: 0, react_app_path: proj.path, project_id: String(port) });
     return true;
   }
@@ -273,6 +228,9 @@ export async function handleProjectRoutes(
     const history: Record<string, unknown>[] = [];
     let cur: Record<string, unknown> | null = null;
     let modCount = 0;
+    // 每轮改了哪些文件：内核的 turn_diff **不落库**，legacy 层在收到 SSE 时按消息 id 存了一份
+    // （见 turn-files-store.ts）—— 这里按 assistant 消息 id 取回来并进那一轮的记录。
+    const turnFiles = loadTurnFiles(svc, msgs.filter((m) => m.role === "assistant").map((m) => m.id));
     for (const m of msgs) {
       if (m.role === "user") {
         const text = m.parts.filter((x) => (x as { type: string }).type === "text").map((x) => (x as { text: string }).text).join("");
@@ -283,11 +241,30 @@ export async function handleProjectRoutes(
           user: text,
           events: [],
           is_modified: false,
+          // 宿主注入的消息（如每轮的 swarm 模式提醒）不是用户说的话：
+          // 面板按 origin === "injection" 把它挡在用户气泡之外，但数据照传，别在这里丢。
+          ...(m.origin ? { origin: m.origin } : {}),
+          ...(m.variant ? { variant: m.variant } : {}),
         };
         history.push(cur);
       } else if (m.role === "assistant" && cur) {
         (cur.events as Record<string, unknown>[]).push(...partsToEvents(m as unknown as { parts: unknown[] }));
         cur.end_time = localTime(m.createdAt);
+        // 这一轮改了哪些文件，两个来源（前者优先）：
+        //  ① 内核自己写进 assistant 消息 metadata 的 `turnDiff`（新内核有，权威）；
+        //  ② legacy 层在收到 SSE 时按消息 id 落盘的那份（老内核 / 走历史接口补的回合，
+        //     而且**只有它带 diff 正文**——内核的 turnDiff 快照不含正文）。
+        const tf = turnFiles.get(m.id);
+        const core = (m as unknown as { turnDiff?: { files?: unknown[]; truncated?: boolean } }).turnDiff;
+        const coreFiles = Array.isArray(core?.files) ? (core!.files as { path: string; added: number; removed: number; created?: boolean; deleted?: boolean }[]) : [];
+        if (coreFiles.length > 0) {
+          // truncated 两个来源取**或**：内核的 turnDiff 快照只记「文件条目被截断」，
+          // 而 20k 的**正文**上限只体现在 SSE（→ legacy 落盘的那份）里 ——
+          // 只报前者会让刷新后的卡片把半截正文标成完整（同 CONTRACT「条目或正文」这条契约）。
+          appendTurnFiles(cur, { files: coreFiles, truncated: core?.truncated === true || tf?.truncated === true, diff: tf?.diff ?? "" });
+        } else if (tf) {
+          appendTurnFiles(cur, tf);
+        }
         // ★ is_modified 决定前端版本号；commit_hash 决定版本条能不能点
         if (didModify(m as unknown as { parts: unknown[] })) {
           cur.is_modified = true;
@@ -350,6 +327,7 @@ export async function handleProjectRoutes(
     if (proj) {
       const th = svc.store.getOrCreateProjectThread(proj.id, proj.name);
       svc.store.deleteThread(th.id);
+      clearTurnFilesForThread(svc, th.id);   // 线程重建（id 固定 th_<projectId>）：旧的每轮文件记录必须清掉
       json(res, 200, { success: true, message: `项目 ${port} 重置成功`, project_path: proj.path });
     } else json(res, 500, { success: false, message: "项目不存在" });
     return true;

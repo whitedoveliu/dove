@@ -31,7 +31,9 @@ const thread: Thread = {
 // ── 1. 系统提示词装配 ────────────────────────────────────────
 console.log("\n=== 1. assembleSystemPrompt ===");
 assertSegmentDiscipline();
-check("段落注册表通过纪律检查", SEGMENTS.length === 11, `共 ${SEGMENTS.length} 段`);
+// ⚠️ 这是个**绊线**：加/删段落时必须同步改这个数字（与 tools/registry.ts 的 TOOL_COUNT_INVARIANT 同一个用意）。
+// s12 = 项目指令（AGENTS.md），2026-10-13 加的 —— 它一加，这条断言就红了，而它当时不在 verify.sh 里，没人发现。
+check("段落注册表通过纪律检查", SEGMENTS.length === 12, `共 ${SEGMENTS.length} 段`);
 // 纪律检查的反例：动态段缺 reason 必须抛错（照抄 CCB 的 DAS_uncached 纪律）
 let disciplineError = "";
 const savedSegments = SEGMENTS.slice();
@@ -141,7 +143,12 @@ const okCompact = await compact(longHistory, {
   contextWindow: 200_000,
 });
 check("压缩后有摘要消息", okCompact.messages[0]!.content!.toString().includes("更早的对话已被压缩"));
-check("保留最近 4 个回合（8 条）", okCompact.messages.length === 9, `实际 ${okCompact.messages.length}`);
+// 保留策略在 2026-10-13 变了：尾部（默认 4 回合）之外，还会**按 token 预算捞回真实用户消息**
+// （Kimi 与 Codex 两份独立实现都收敛到「保住用户说过的话」这条规则）。所以条数不再固定 ——
+// 把条数写死成不变式，等于把「实现细节」当成契约。下面三条才是契约。
+check("最近 4 回合（末尾 8 条）逐条原样保留", okCompact.messages.slice(-8).every((m, i) => m.content === longHistory[12 + i]!.content), `实际 ${okCompact.messages.length} 条`);
+check("**最早那条用户需求**被捞回来了（这正是这次改动的意义）", okCompact.messages.some((m) => m.content === longHistory[0]!.content));
+check("比「只有尾部」更长（说明确实额外保留了用户消息）", okCompact.messages.length > 9, `实际 ${okCompact.messages.length}`);
 check("最末条消息未被改动", okCompact.messages[okCompact.messages.length - 1]!.content === longHistory[19]!.content);
 check("fallback=false", okCompact.fallback === false);
 
@@ -181,11 +188,15 @@ check("图片被水化成 image_url", JSON.stringify(wire[0]!.content).includes(
 
 // ── 5. token 估算 ──────────────────────────────────────────
 console.log("\n=== 5. token 估算 / 缓存度量 ===");
+// input / cacheRead / cacheWrite 三个桶**互不相交**（计费 prompt = 三者之和）：
+// 800 未命中 + 3200 命中 = 命中率 0.8；再带一个写入桶，分母必须跟着涨。
 const metrics = cacheMetrics({ inputTokens: 800, outputTokens: 120, cacheReadTokens: 3_200, cacheWriteTokens: 0 });
-console.log(`  estimateTextTokens("hello world")=${estimateTextTokens("hello world")}，中文 8 字=${estimateTextTokens("你好世界你好世界")}，命中率=${metrics.cacheHitRate}`);
+const withWrite = cacheMetrics({ inputTokens: 800, outputTokens: 120, cacheReadTokens: 3_200, cacheWriteTokens: 1_000 });
+console.log(`  estimateTextTokens("hello world")=${estimateTextTokens("hello world")}，中文 8 字=${estimateTextTokens("你好世界你好世界")}，命中率=${metrics.cacheHitRate}，带写入桶=${withWrite.cacheHitRate}`);
 check("英文按 ceil(len/4)", estimateTextTokens("hello world") === 3);
 check("中文按 ceil(len/2)", estimateTextTokens("你好世界你好世界") === 4);
-check("缓存命中率可度量", Math.abs(metrics.cacheHitRate - 0.8) < 1e-9);
+check("缓存命中率 = cacheRead / (input + cacheRead + cacheWrite)",
+  Math.abs(metrics.cacheHitRate - 0.8) < 1e-9 && Math.abs(withWrite.cacheHitRate - 3_200 / 5_000) < 1e-9);
 
 console.log(`\n=== 结果：${passed} 通过 / ${failed} 失败 ===`);
 if (failed > 0) process.exitCode = 1;

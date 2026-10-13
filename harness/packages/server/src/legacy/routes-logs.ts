@@ -35,6 +35,7 @@ const TYPE_MAP: Record<string, string> = {
   policy: "agent_log",
   redacted: "agent_log",
   task_injection: "agent_log",
+  mode_injection: "agent_log",
   tool_approval: "ask_user",
 };
 
@@ -56,6 +57,7 @@ function mapData(type: string, d: Record<string, unknown>): Record<string, unkno
       return { result: (ok ? "" : "✗ ") + body.slice(0, 500) };
     }
     case "turn_end": return { status: d.reason ?? d.status ?? "done", duration_ms: d.durationMs ?? 0 };
+    case "mode_injection": return { text: `本轮模式：${String(d.mode ?? "")}（指令以独立消息发出）` };
     case "error": return { message: d.message ?? d.content ?? "未知错误" };
     default: return { text: typeof d === "object" ? JSON.stringify(d).slice(0, 400) : String(d) };
   }

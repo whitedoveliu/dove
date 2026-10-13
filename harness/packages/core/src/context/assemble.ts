@@ -64,19 +64,23 @@ export interface CacheMetrics {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  /** 命中率 = cacheRead / (input + cacheRead) */
+  /** 命中率 = cacheRead / (input + cacheRead + cacheWrite) */
   cacheHitRate: number;
 }
 
 export function cacheMetrics(usage: Usage): CacheMetrics {
+  // 分母是 prompt 侧三个桶之和（它们互不相交，见 providers/openai-compat.ts 的映射），
+  // 也就是**计费 prompt**。⚠️ 以前写的是 input + cacheRead，而当时 input 里已经含了命中
+  // （inputTokens 直接取 prompt_tokens）——同一批 token 数两遍，命中率被系统性低估。
   const input = Math.max(0, usage.inputTokens);
   const cacheRead = Math.max(0, usage.cacheReadTokens);
-  const total = input + cacheRead;
+  const cacheWrite = Math.max(0, usage.cacheWriteTokens);
+  const total = input + cacheRead + cacheWrite;
   return {
     inputTokens: input,
     outputTokens: Math.max(0, usage.outputTokens),
     cacheReadTokens: cacheRead,
-    cacheWriteTokens: Math.max(0, usage.cacheWriteTokens),
+    cacheWriteTokens: cacheWrite,
     cacheHitRate: total > 0 ? cacheRead / total : 0,
   };
 }

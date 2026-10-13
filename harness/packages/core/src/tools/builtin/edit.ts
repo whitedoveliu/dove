@@ -4,7 +4,25 @@
  */
 import * as fsp from "node:fs/promises";
 import { defineTool, S } from "../types.ts";
-import { guarded, resolveInsideWorkspace, relPath, str, optBool, readTextFile } from "./util.ts";
+import { guarded, resolvePath, resolveInsideWorkspace, relPath, str, optBool, readTextFile } from "./util.ts";
+import { recordFileMutation } from "../turn-diff.ts";
+import type { ToolAccesses } from "../types.ts";
+
+/**
+ * 「同意并记住」的参数模式：照抄 file_path 逐字。不绝对化 —— approvalRule 拿不到 workdir，
+ * 用 process.cwd() 会把别的项目的相对路径也解析到同一处（悄悄扩大授权，比不精确危险得多）。
+ */
+function ruleArg(args: Record<string, unknown>): string | undefined {
+  const p = args.file_path;
+  return typeof p === "string" && p.trim() ? p.trim() : undefined;
+}
+
+/** 并发调度声明：改**一个文件**（非递归）；越界由 execute 里的护栏拦，这里不抛 */
+export function editAccesses(args: Record<string, unknown>, workdir: string): ToolAccesses {
+  const p = args.file_path;
+  if (typeof p !== "string" || !p.trim()) return { kind: "all" };
+  return { kind: "paths", paths: [{ path: resolvePath(p, workdir), operation: "write" }] };
+}
 
 export const EditTool = defineTool({
   name: "Edit",
@@ -20,6 +38,8 @@ export const EditTool = defineTool({
   outputTier: "exact",
   approval: "heuristic",
   concurrencySafe: false,
+  accesses: editAccesses,
+  approvalRule: ruleArg,
   execute: (input, ctx) => guarded(async () => {
     // ⚠️ 必须用带护栏的版本 —— 否则能改工作区外的文件且不审批（见 util 的说明）
     const abs = resolveInsideWorkspace(str(input, "file_path"), ctx.workdir);
@@ -42,6 +62,9 @@ export const EditTool = defineTool({
     await fsp.writeFile(abs, next, "utf8");
 
     const rel = relPath(abs, ctx.workdir);
+    // 净 diff：before 就是刚才读进来做替换的那份 text，after 是落盘内容 —— 一次额外 IO 都没有。
+    // 写成功了才记账；记账失败不能连累这次编辑（吞掉）
+    try { recordFileMutation(ctx.threadId, { path: rel, before: text, after: next }); } catch { /* 忽略 */ }
     ctx.emit("tool:file-edited", { toolCallId: ctx.toolCallId, path: rel, replacements: count });
     return { file_path: rel, replacements: count, bytes: Buffer.byteLength(next, "utf8") };
   }),

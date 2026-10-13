@@ -24,7 +24,6 @@ import { applyThreadPolicy, renderPolicyNotice } from "../src/agent/tool-policy.
 import { TaskRegistry } from "../src/agents/task-registry.ts";
 import { Db } from "../src/session/db.ts";
 import { RedactStream } from "../src/security/redact-stream.ts";
-import { redact as activityRedact } from "../src/activity/redact.ts";
 
 const fakeTool = (over: Partial<Tool>): Tool => ({
   name: "Read", description: "读文件",
@@ -321,15 +320,6 @@ test("脱敏：卡号走 Luhn 校验（假卡号不误伤）", () => {
   const s2 = new RedactStream();
   const fake = s2.push("编号 1234 5678 9012 3456") + s2.flush();
   assert.ok(fake.includes("1234"), "Luhn 不过的数字不该被误伤");
-});
-
-test("脱敏：活动层的旧入口仍然可用（转发没断）", () => {
-  // 注意：同一段文本可能同时命中多条规则（"token sk-…" 会先被 BEARER_TOKEN 吃掉），
-  // 所以这里断言「密钥确实没了」，不断言具体是哪个 kind。
-  const out = activityRedact("token sk-abcdefghijklmnopqrstuvwxyz123456");
-  assert.ok(!out.text.includes("sk-abcdefgh"), "密钥必须被脱掉");
-  assert.match(out.text, /\[REDACTED:/);
-  assert.ok(Object.keys(out.hits).length >= 1, "至少命中一条规则");
 });
 
 // ── 只读权威（T8.2） ──────────────────────────────────

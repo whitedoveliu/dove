@@ -9,11 +9,27 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
 import { json, readBody, projectIdToPort, portToProject, findProjectByKey, type LegacyProject } from "./server.ts";
-import { toLegacy, sessionIdEvent, MODIFYING_TOOLS, type LegacyEvent } from "./sse-compat.ts";
+import { toLegacy, sessionIdEvent, MODIFYING_TOOLS, type LegacyEvent, type LegacyCtx } from "./sse-compat.ts";
 import { listPendingAsks, answerWithText } from "../../../core/src/tools/builtin/ask-user.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runWithGoalContinuation } from "../goal-runner.ts";
+import { isTurnMode, type TurnMode } from "../../../core/src/agent/mode-injection.ts";
+import { newestAssistantMessageId, saveTurnFiles } from "./turn-files-store.ts";
+
+/**
+ * body.mode 校验（面板「+」菜单的 Swarm / 计划 / 目标开关走这里）。
+ *
+ * 纪律：**没传 = 今天的行为，一点不变**；传了就必须是三个值之一，别的值一律 400 ——
+ * 静默忽略会让面板以为开关生效了，用户看到的是「按了没反应」。
+ * 空值（undefined / null / ""）等同于没传：前端「没选模式」序列化成 null / 空串是常态，
+ * 因为一个空 select 把整条对话打回 400 才是真的事故。
+ */
+function parseMode(raw: unknown): { ok: true; mode: TurnMode | undefined } | { ok: false } {
+  if (raw === undefined || raw === null || raw === "") return { ok: true, mode: undefined };
+  const v = String(raw);
+  return isTurnMode(v) ? { ok: true, mode: v } : { ok: false };
+}
 
 /** 项目里有没有可跑的构建脚本（没有就别假装构建失败） */
 function hasBuildScript(dir: string): boolean {
@@ -71,6 +87,8 @@ export async function handleChatRoutes(
     const b = await readBody(req);
     const projectId = String(b.project_id ?? "");
     const message = String(b.message ?? "");
+    const m = parseMode(b.mode);
+    if (!m.ok) { json(res, 400, { error: "mode 必须是 plan / goal / swarm" }); return true; }
     const port = projectIdToPort(svc, projectId);
     const proj = port !== null ? portToProject(svc, port) : null;
 
@@ -99,13 +117,25 @@ export async function handleChatRoutes(
     let built = false;
     // ⚠️ 这个 ctx 必须**跨事件复用**（不能每次新建）—— 它带着工具调用的
     //    批次状态，每事件新建会让批处理失效，聊天区又变成一屏工具行。
-    const legacyCtx = { hasBuilt: false, toolBurst: false };
+    //    toolCalls 也是为了跨事件：审批事件不带工具名/入参，而「同意并记住」
+    //    要展示**这次调用会落成什么形状的规则**，只能靠 tool_start 时先记下来。
+    const legacyCtx: LegacyCtx = { hasBuilt: false, toolBurst: false, tools: svc.tools, toolCalls: new Map() };
     const sink = (e: { type: string; [k: string]: unknown }): void => {
       if (e.type === "tool_start" && MODIFYING_TOOLS.has(String(e.tool ?? ""))) modified = true;
       if (e.type === "tool:build" && e.ok === true) built = true;
       legacyCtx.hasBuilt = built;
       for (const le of toLegacy(e as never, legacyCtx)) {
         if (le.type === "build_error") built = false;
+        // turn_diff 内核只发这一次、且**不落库** —— 顺手按 assistant 消息 id 存一份，
+        // 刷新后由 /api/history 回填（见 turn-files-store.ts 顶部：为什么键是消息 id）。
+        if (le.type === "turn_diff") {
+          const messageId = newestAssistantMessageId(svc, thread.id);
+          if (messageId) {
+            saveTurnFiles(svc, thread.id, messageId, {
+              files: le.files, truncated: le.truncated === true, diff: le.diff ?? "",
+            });
+          }
+        }
         writeSse(res, le);
       }
     };
@@ -116,6 +146,7 @@ export async function handleChatRoutes(
       await runWithGoalContinuation(svc.runtime, {
         threadId: thread.id, userText: message, projectId: proj.id,
         model: b.model ? String(b.model) : undefined,
+        mode: m.mode,
         signal: ctrl.signal, sink,
       });
 
@@ -189,13 +220,20 @@ export async function handleChatRoutes(
     return true;
   }
 
-  // ── POST /api/user-input（回答 ask_user）─────────────
+  // ── POST /api/user-input（回答 ask_user / 工具审批）───
   // 老契约请求体是 {session_id, answer} —— session_id 就是第一条 session_id 事件给的线程 id
   if (path === "/api/user-input" && req.method === "POST") {
     const b = await readBody(req);
     const sessionId = String(b.session_id ?? "");
     const answer = String(b.answer ?? "");
     if (!sessionId) { json(res, 404, { success: false, message: "缺少 session_id" }); return true; }
+    /**
+     * 「同意并记住」——只有**审批**这一支有意义（见下面 ①；把这次调用落成一条
+     * 会话规则，形状来自工具自报的 approvalRule，见 core 的 tools/rule-pattern.ts）。
+     * ask_user 的回答是给模型的**文本**，没有「记住」这回事 —— 下面 ②③ 两条
+     * 非审批分支一律不看它：带着它回答提问不该有任何副作用。
+     */
+    const remember = b.remember === true;
 
     // AnswerResolver 按线程路由；新内核的 AskUserQuestion 按 toolCallId 索引，
     // 这里取该线程当前在等的那一个问题来配平。
@@ -207,7 +245,7 @@ export async function handleChatRoutes(
         // 只有一个待审批时直接用；多个就按提交顺序取第一个
         const target = approvals[0]!;
         const yes = /^(允许|同意|allow|yes|ok|y)$/i.test(answer.trim());
-        ok = svc.pending.resolveApproval(target.toolCallId, yes, yes ? undefined : answer);
+        ok = svc.pending.resolveApproval(target.toolCallId, yes, yes ? undefined : answer, remember);
       }
     } catch { ok = false; }
     // ② 不是审批 → AskUserQuestion：按线程找到那个正在等回答的提问，投进去

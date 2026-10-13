@@ -41,6 +41,13 @@ export interface ApprovalResponse {
   decision?: "allow" | "deny";
   /** reason=timeout 时：实际等了多久（毫秒）。写给用户看的错误文案要用它 */
   timeoutMs?: number;
+  /**
+   * 「同意并**记住**」：只对 approved 有意义。
+   * 设为 true 时，会话级规则表里会记下这次调用的 `Tool.approvalRule(args)`，
+   * 之后同形状的调用直接放行（见 tools/rule-pattern.ts）。
+   * ⚠️ 默认 absent = **不记** —— 不问自记等于偷偷扩大授权。
+   */
+  remember?: boolean;
 }
 
 export interface ToolServices {
@@ -49,8 +56,11 @@ export interface ToolServices {
   /** 启动子代理（M6）；background=true 时立即返回 taskId */
   spawnSubagent?: (opts: { prompt: string; label?: string; background?: boolean })
     => Promise<{ status: "running" | "done"; taskId?: string; output?: string }>;
-  /** 查后台任务状态（TaskOutput 用） */
-  getTask?: (taskId: string) => { taskId: string; label: string; status: string; result?: string } | undefined;
+  /**
+   * 查后台任务状态（TaskOutput 用）。
+   * usage 是追加字段：provider 没报时为 undefined（**不是 0** —— 0 会被读成「没花 token」）。
+   */
+  getTask?: (taskId: string) => { taskId: string; label: string; status: string; result?: string; usage?: { inputTokens: number; outputTokens: number } } | undefined;
   /**
    * 列出某线程派出去的后台任务（RuntimeStatus 用）。
    * 心跳自检要回答「有没有没跑完的任务」—— 没有它就只能靠猜。
@@ -60,12 +70,6 @@ export interface ToolServices {
   dispatchToProject?: (projectId: string, instruction: string) => Promise<{ output: string; endReason: string }>;
   /** 项目操作 */
   project?: ProjectOps;
-  /**
-   * 检索**屏幕内容**（截图 OCR 的历史）。
-   * 和 recall 是两条不同的记忆通道：recall 查的是沉淀下来的长期记忆，
-   * searchScreen 查的是「我当时在屏幕上看到过什么」。
-   */
-  searchScreen?: (query: string, limit?: number) => ScreenHit[];
   /**
    * 搜索 API 的 key（目前是 Tavily）。
    *
@@ -184,6 +188,8 @@ export interface TaskSummary {
   prompt: string;
   createdAt: number;
   finishedAt?: number;
+  /** token 用量；provider 没报时 undefined（**不是 0**）——展示成「未上报」，不许写 0 */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 /** 子代理 / 后台任务的一条摘要（ListAgents 的输出行） */
@@ -206,7 +212,9 @@ export interface AgentSendResult {
   ok: boolean;
   /**
    * injected = 子代理还在跑，消息会在它的下一步被读进去（真注入）；
-   * resumed  = 它已经结束了，带着它之前的最终答复**新起一个**子代理继续做。
+   * resumed  = 它已经结束了，**重挂同一个子代理、接在同一段历史上**继续做。
+   *            （只有作用域缓存被淘汰 / 跨进程 / 只剩库里留档时才退回
+   *              「新起一个 + 旧结论当种子」，那时 note 会明说。）
    */
   mode?: "injected" | "resumed";
   error?: string;
@@ -270,19 +278,6 @@ export interface ContextStats {
   note?: string;
 }
 
-/** 屏幕检索的一条命中（结构来自 memory/screen-index.ts，这里只声明形状避免跨层 import） */
-export interface ScreenHit {
-  frameId: string;
-  snapshotId: string;
-  text: string;
-  matched: string[];
-  score: number;
-  at: number;
-  appName?: string | null;
-  windowTitle?: string | null;
-  filePath?: string | null;
-}
-
 export interface ProjectOps {
   build(): Promise<{ ok: boolean; output: string; durationMs: number }>;
   preview(): Promise<{ url: string; port: number }>;
@@ -295,6 +290,32 @@ export interface ToolResult {
   /** 给模型看的输出（已经过预算裁剪由 budget.ts 处理） */
   [key: string]: unknown;
 }
+
+/**
+ * 工具对文件系统的访问声明 —— 并发调度的**唯一**依据。
+ *
+ * 为什么需要它：原先只有一个 concurrencySafe 布尔，两个方向都错：
+ * 两次互不相干的 Bash 被强行串行（慢），而标了 safe 的读与同批次的写其实会重叠（危险）。
+ * 声明成「碰哪些路径 + 读还是写」之后，冲突就是可计算的：
+ *   任一侧 kind === "all"，或至少一侧写且路径重叠（含 recursive 覆盖子路径）→ 冲突。
+ * 没有声明 accesses 的工具一律按 "all" 处理（保守串行）。
+ */
+export interface ToolAccesses {
+  kind: "all" | "paths";
+  paths?: { path: string; operation: "read" | "search" | "write" | "readwrite"; recursive?: boolean }[];
+}
+
+/**
+ * 工具暴露档位（两轴模型）。
+ * 「模型看得见」与「能执行」是两件事：能力裁剪时改的是**执行**，不一定要动**可见性** ——
+ * 后者一改，工具表顺序/内容变化 → provider 前缀缓存整段作废。
+ *   direct              可见 + 可执行（缺省）
+ *   direct_model_only   可见但不可执行（本轮被裁掉，保留 schema 以维持缓存）
+ *   deferred            初始不可见，可由 ToolSearch 加载
+ *   deferred_model_only 加载后仍不可执行
+ *   hidden              完全不上 wire
+ */
+export type ToolExposure = "direct" | "direct_model_only" | "deferred" | "deferred_model_only" | "hidden";
 
 export interface Tool {
   name: string;
@@ -313,7 +334,23 @@ export interface Tool {
   parameters: Record<string, unknown>;
   outputTier: OutputTier;
   approval: ApprovalMode;
+  /**
+   * 只读 / 可并行的**保守**声明。
+   * ⚠️ 新代码不要再拿它当调度依据 —— 声明 `accesses` 才会被真正用上；
+   *    没声明 accesses 的工具（含 MCP / 用户自定义）一律串行。
+   * 保留该字段是为了兼容未迁移的工具与既有测试。
+   */
   concurrencySafe: boolean;
+  /** 声明这次调用碰哪些路径（并发调度依据）。缺省 = 独占，与所有工具冲突 */
+  accesses?: (args: Record<string, unknown>, workdir: string) => ToolAccesses;
+  /**
+   * 审批规则的**参数模式**（会话级「同意并记住」用）。
+   * 返回 undefined = 该工具不支持按参数记忆，只能整工具记（MCP / 用户工具就是这种）。
+   * 例：Bash 返回 `rm *`，Write 返回 `/abs/path`。
+   */
+  approvalRule?: (args: Record<string, unknown>) => string | undefined;
+  /** 暴露档位（两轴模型）。缺省 "direct" */
+  exposure?: ToolExposure;
   /** 超时覆盖（毫秒） */
   timeoutMs?: number;
   execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;

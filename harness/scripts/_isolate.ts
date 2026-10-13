@@ -21,7 +21,6 @@ if (!process.env.DOVE_DB) {
   process.env.DOVE_CONFIG = process.env.DOVE_CONFIG ?? join(root, "cfg");
   process.env.DOVE_WORKSPACE = process.env.DOVE_WORKSPACE ?? join(root, "ws");
   // 别让冒烟脚本起一堆后台服务互相打架
-  process.env.DOVE_ACTIVITY = process.env.DOVE_ACTIVITY ?? "off";
   process.env.DOVE_LEGACY = process.env.DOVE_LEGACY ?? "off";
   if (process.env.DOVE_ISOLATE_QUIET !== "1") {
     console.log(`[isolate] 用临时库 ${process.env.DOVE_DB}（想用别的请显式设 DOVE_DB）`);
@@ -31,3 +30,7 @@ if (!process.env.DOVE_DB) {
 }
 
 export const ISOLATED = !process.env.DOVE_FORCE_PROD;
+
+// 预览代理默认拒绝回环目标（防 SSRF）；冒烟里要拿本机起的 upstream 当靶子（smoke-preview 的
+// 「外站代理的沙箱」一节），所以这里放开。只影响冒烟进程 —— 正式内核不 import 这个文件。
+process.env.DOVE_PREVIEW_PROXY_ALLOW_PRIVATE = process.env.DOVE_PREVIEW_PROXY_ALLOW_PRIVATE ?? "1";

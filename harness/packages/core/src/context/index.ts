@@ -10,3 +10,4 @@ export * from "./tokens.ts";
 export * from "./convert.ts";
 export * from "./compact.ts";
 export * from "./compact-prompt.ts";
+export * from "./instructions.ts";   // 项目指令（AGENTS.md）：发现规则在那边，接线在 agent/assemble-adapter.ts

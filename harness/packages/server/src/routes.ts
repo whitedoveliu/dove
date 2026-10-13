@@ -14,7 +14,34 @@ import { handlePreviewRoutes } from "./routes-preview.ts";
 import { handleThreadRoutes } from "./routes-threads.ts";
 import { handleToolRoutes } from "./routes-tools.ts";
 import { readRuntimeLog, listRuntimeFiles } from "../../core/src/session/runtime-log.ts";
-import { requestScreenPermission, resetAskedMarker } from "../../core/src/activity/permission.ts";
+import { requestToken, tokenMatches } from "./local-token.ts";
+import { panelOrigin } from "./panel-origin.ts";
+
+/**
+ * Host 必须是 loopback 字面量 —— 防 DNS rebinding。
+ *
+ * 为什么需要：rebinding 时页面以为自己**同源**（地址栏是 http://evil.example，
+ * DNS 把 evil.example 解析到 127.0.0.1），于是浏览器认为
+ * `GET http://evil.example:8790/api/local-token` 是**同源读取**、不做 CORS 检查，
+ * 令牌就被页面拿走了 —— 只看 Origin 的判据（panel-origin.ts）拦不住这一步。
+ * 浏览器永远会把「它访问的主机名」填进 Host，所以 Host 是这里唯一可信的判据。
+ *
+ * 缺 Host 时放行：HTTP/1.0 与进程内测试客户端可能不带该头，而带不出 Host 的
+ * 浏览器页面对应不了「一个恶意网页」这个威胁（它一定会带）。
+ */
+export function hostIsLoopback(host: string | undefined): boolean {
+  if (!host) return true;
+  const bare = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "127.0.0.1" || bare === "localhost" || bare === "::1";
+}
+
+/** 这些路径不走 API 令牌闸门（各有各的理由，见下面的闸门注释） */
+function tokenExempt(path: string): boolean {
+  return path === "/api/local-token"        // 面板自举入口，必须能取到令牌
+    || path.startsWith("/api/tools/")       // PTC 自带 session+token 闸门（另一把锁，见 routes-tools.ts）
+    || path.startsWith("/api/preview/");    // 浏览器内嵌资源（img/iframe 发不了自定义头）
+}
+
 
 function json(res: ServerResponse, code: number, data: unknown): void {
   const body = JSON.stringify(data);
@@ -47,6 +74,11 @@ export interface RouteDeps {
   /** 产品界面：control-panel 的构建产物 */
   controlPanelDir: string;
   running: Map<string, AbortController>;
+  /**
+   * 本机令牌（见 local-token.ts）—— 面板从 /api/local-token 取它，再去过 8008 的闸门。
+   * 可缺省：进程内起测试服务的脚本不经过这条路；缺省时空串会让面板明确报「没有令牌」，不会静默。
+   */
+  token?: string;
 }
 
 export async function handle(req: IncomingMessage, res: ServerResponse, deps: RouteDeps): Promise<boolean> {
@@ -62,6 +94,12 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
     return serveStatic(path, res, deps.controlPanelDir);
   }
 
+  // ── Host 反 rebinding（所有 /api/* 都要过）────────────
+  if (!hostIsLoopback(req.headers.host)) {
+    json(res, 403, { error: "Host 不是本机地址，已拒绝（防 DNS rebinding）" });
+    return true;
+  }
+
   // ── 健康检查 ─────────────────────────────────────
   if (path === "/api/health") {
     json(res, 200, {
@@ -69,6 +107,35 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
       threads: svc.store.listThreads().length, tools: svc.tools.size,
       memory: !!svc.memory, projects: svc.projects.list().length,
     });
+    return true;
+  }
+
+  // ── 本地令牌（面板取用 8008 的唯一入口）──────────────
+  // 面板由内核自己托管（同源）→ 这条**不带任何 CORS 头**它也读得到；
+  // 跨源页面（含 DNS rebinding 的 https://evil.example）响应里一个 CORS 头都没有 → 读不到。
+  // 谁算「自己人」（同源 + 开发端口白名单）与为什么不再对任意 loopback 端口放开：panel-origin.ts。
+  if (path === "/api/local-token" && req.method === "GET") {
+    const origin = panelOrigin(req);
+    const head: Record<string, string> = {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      Vary: "Origin",
+    };
+    if (origin) head["Access-Control-Allow-Origin"] = origin;
+    res.writeHead(200, head);
+    res.end(JSON.stringify({ token: deps.token ?? "" }));
+    return true;
+  }
+
+  // ── API 令牌闸门（与 8008 同一把锁）──────────────────
+  // 为什么 8790 也要上锁：令牌的威胁模型（见 local-token.ts）是「用户开着的任意网页」。
+  // 8008 早就上了锁，但 8790 的 /api/chat、/api/steer、/api/approve 一直裸着 ——
+  // 跨源页面确实**读不到** /api/local-token 的响应（那条不带 CORS 头），
+  // 但它根本不需要读：一个 text/plain 的 POST 不触发预检，浏览器照样发出去，
+  // 于是任意网页都能开回合、批准工具调用、改模型设置 —— 和当初 8008 的病是同一个。
+  // deps.token 为空 = 进程内起的测试服务（smoke 脚本就是这么用的），按既有约定跳过闸门。
+  if (deps.token && !tokenExempt(path) && !tokenMatches(deps.token, requestToken(req, url))) {
+    json(res, 401, { error: "缺少或错误的本地令牌（X-Dove-Token / ?token=）：见 <DOVE_CONFIG>/api-token" });
     return true;
   }
 
@@ -129,7 +196,7 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
   // ── 审批 / 回答 ───────────────────────────────────
   if (path === "/api/approve" && req.method === "POST") {
     const b = await readBody(req);
-    const ok = svc.pending.resolveApproval(String(b.toolCallId ?? ""), !!b.approved, b.reason ? String(b.reason) : undefined);
+    const ok = svc.pending.resolveApproval(String(b.toolCallId ?? ""), !!b.approved, b.reason ? String(b.reason) : undefined, b.remember === true);
     json(res, 200, { ok });
     return true;
   }
@@ -218,26 +285,13 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
     return true;
   }
 
-  // ── M6 / M7 服务路由（情绪 / 疲劳 / 定时 / 心跳 / 感知）—— 拆到 routes-services.ts
+  // ── M6 服务路由（情绪 / 疲劳 / 定时 / 心跳）—— 拆到 routes-services.ts
   if (await handleServiceRoutes(path, url, req, res, svc, json, () => readBody(req))) return true;
 
   // ── 工具控制面（PTC）：RunScript 脚本里的 doveTool / listTools 打这里 —— 拆到 routes-tools.ts
   if (await handleToolRoutes(path, url, req, res, svc, json, () => readBody(req))) return true;
 
   // ── 日志与配置 ─────────────────────────────────────
-  // 重新申请屏幕录制权限（默认只在首次启动问一次，这个接口给「我想开了」用）
-  if (path === "/api/activity/request-screen-permission" && req.method === "POST") {
-    resetAskedMarker(svc.cfg.configDir);
-    const r = await requestScreenPermission();
-    json(res, 200, {
-      success: true, ...r,
-      note: r.granted
-        ? "已获得权限（可能需重启 Dove 才生效）"
-        : "已弹出系统申请。点「打开系统设置」→ 勾上 Dove → 重启 Dove。",
-    });
-    return true;
-  }
-
   // 运行时日志（console 输出）—— 和 /api/logs 的「结构化事件」是两回事
   if (path === "/api/logs/runtime" && req.method === "GET") {
     const after = Number(url.searchParams.get("after") ?? 0);

@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { flagBool, flagNum, flagStr, freeText, type Args } from "./args.ts";
-import { api, configDir, probeHealth, resolveTarget, type Target } from "./client.ts";
+import { api, ApiError, configDir, probeHealth, resolveTarget, type Target } from "./client.ts";
 import { bold, dim, EXIT, green, humanMs, note, out, red, shortTime, yellow } from "./out.ts";
 import { resolveThread, NoThreadError } from "./threads.ts";
 
@@ -164,6 +164,36 @@ export async function cmdStop(t: Target, a: Args): Promise<number> {
   // 没有在跑的回合**不是失败**：stop 幂等，脚本里连着调两次不该报错
   out(r.stopped ? `已停止 ${id}` : dim(`${id} 当前没有在跑的回合`));
   return EXIT.ok;
+}
+
+export async function cmdUndo(t: Target, a: Args): Promise<number> {
+  const asked = flagStr(a, "turns") ?? freeText(a);
+  const turns = Number.isFinite(Number(asked)) && Number(asked) > 0 ? Math.floor(Number(asked)) : 1;
+  let id: string;
+  try {
+    id = (await resolveThread(t, a, undefined, { allowCreate: false })).id;
+  } catch (e) {
+    if (e instanceof NoThreadError) { note(red("✗ ") + e.message); return EXIT.fail; }
+    throw e;
+  }
+  try {
+    const r = await api<{ undone?: number; available?: number; reason?: string }>(
+      t, `/api/threads/${encodeURIComponent(id)}/undo`, { body: { turns }, timeoutMs: 15_000 },
+    );
+    if (flagBool(a, "json")) { out(JSON.stringify({ threadId: id, turns, ...r })); return r.undone ? EXIT.ok : EXIT.fail; }
+    out(`已撤销 ${r.undone} 轮（${id}）。磁盘上的历史一个字都没删 —— 只是标记为已撤销，日志里追加了一条 context.undo。`);
+    return EXIT.ok;
+  } catch (e) {
+    // 撤销不了是**预期结果**，不是「内核出错」：内核用 409 + reason 说清了差多少。
+    // 不在这里接住的话，用户看到的是通用的「内核返回 409：{...}"——信息在，但像是故障。
+    if (e instanceof ApiError && e.status === 409) {
+      const reason = (e.body as { reason?: string } | null)?.reason ?? "没有可撤销的轮次";
+      if (flagBool(a, "json")) { out(JSON.stringify({ threadId: id, turns, undone: 0, reason })); return EXIT.fail; }
+      note(red("✗ ") + reason);
+      return EXIT.fail;
+    }
+    throw e;
+  }
 }
 
 export async function cmdSteer(t: Target, a: Args): Promise<number> {

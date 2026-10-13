@@ -41,28 +41,14 @@ export const RecallTool = defineTool({
       createdAt: m.createdAt,
     }));
 
-    // 第二条通道：屏幕记忆（截图 OCR 的历史）
-    const screenHits = (ctx.services?.searchScreen?.(query, Math.min(limit, 5)) ?? []).map((h) => ({
-      seenAt: new Date(h.at).toISOString(),
-      app: h.appName ?? null,
-      window: h.windowTitle ?? null,
-      matched: h.matched,
-      excerpt: (h.text ?? "").replace(/\s+/g, " ").slice(0, 400),
-      score: Number(h.score.toFixed(3)),
-    }));
-
     ctx.emit("tool:memory-recalled", {
-      toolCallId: ctx.toolCallId, query, found: list.length, screenFound: screenHits.length,
+      toolCallId: ctx.toolCallId, query, found: list.length,
     });
     return {
       query,
       found: list.length,
       memories: list,
-      screenFound: screenHits.length,
-      screenMemories: screenHits,
-      note:
-        "longTerm 是沉淀下来的长期记忆，screen 是「你在屏幕上看到过的内容」（截图 OCR）。" +
-        "两者都只是**命中若干条**，不是全部 —— 不要据此断言「没有相关记忆」。",
+      note: "返回的只是**命中若干条**，不是全部 —— 不要据此断言「没有相关记忆」。",
     };
   }),
 });

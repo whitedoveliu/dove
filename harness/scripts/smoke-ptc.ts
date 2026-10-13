@@ -31,7 +31,6 @@ import { finish } from "./_lifecycle.ts";
 const PORT = 8841;
 process.env.DOVE_PORT = String(PORT);
 process.env.DOVE_APPROVE = "ask";       // 审批必须真走一遍（别被外部环境的 auto 短路掉）
-process.env.DOVE_ACTIVITY = "off";
 process.env.DOVE_LEGACY = "off";
 
 let failures = 0;

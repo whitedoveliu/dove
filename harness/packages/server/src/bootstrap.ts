@@ -8,6 +8,10 @@ import { homedir } from "node:os";
 import { Db } from "../../core/src/session/db.ts";
 import { Store } from "../../core/src/session/store.ts";
 import { EventLog } from "../../core/src/session/event-log.ts";
+import { openJournal } from "../../core/src/session/journal.ts";
+import { createHookRegistry } from "../../core/src/loop/hooks.ts";
+import { registerSecretPathGuard } from "../../core/src/agent/hook-presets.ts";
+import { planAging } from "../../core/src/tools/result-aging.ts";
 import { PendingRegistry } from "../../core/src/agent/pending.ts";
 import { SteeringQueue } from "../../core/src/loop/steering.ts";
 import { AgentRuntime } from "../../core/src/agent/runtime.ts";
@@ -16,7 +20,6 @@ import { makeAssembler, fallbackAssemble, makeCompactor } from "../../core/src/a
 import { resolveEmbedder } from "./embedder.ts";
 import { installRuntimeLog } from "../../core/src/session/runtime-log.ts";
 import type { Config, Services } from "./bootstrap-types.ts";
-import { getProvider } from "../../core/src/providers/index.ts";
 import { makeClassifier } from "./classifier.ts";
 import { GoalStore } from "../../core/src/agents/goal-store.ts";
 import { makeExitPlanMode } from "./plan-mode-wiring.ts";
@@ -28,17 +31,15 @@ import { MemoryService } from "../../core/src/memory/index.ts";
 import { TaskRegistry } from "../../core/src/agents/task-registry.ts";
 import { EmotionService, FatigueService } from "../../core/src/emotion/index.ts";
 import { CronScheduler, Heartbeat, makeCronOps } from "../../core/src/scheduler/index.ts";
-import { ActivityRecorder } from "../../core/src/activity/index.ts";
-import { ocrEveryFromEnv } from "../../core/src/activity/ocr.ts";
 import { makeTailState } from "./tail-state.ts";
-import { attachInputMonitor, detachInputMonitor } from "../../core/src/activity/focus.ts";
 import { providerLlm } from "../../core/src/memory/index.ts";
 import { MEMORY_SLEEP_DEFAULTS } from "../../core/src/constants.ts";
 import { initMcp, type McpWiring } from "./mcp-wiring.ts";
 import type { McpPort } from "./mcp-wiring.ts";
 import { publishDiscovery } from "./discovery.ts";
+import { LiveModelProvider, ModelSettingsStore } from "./model-settings.ts";
 
-export type { Config, Services, EmotionPort, FatiguePort, CronPort, HeartbeatPort, ActivityPort } from "./bootstrap-types.ts";
+export type { Config, Services, EmotionPort, FatiguePort, CronPort, HeartbeatPort } from "./bootstrap-types.ts";
 function findEnvFile(start: string): string | null {
   let dir = start;
   for (let i = 0; i < 6; i++) {
@@ -98,10 +99,39 @@ export async function bootstrap(cfg: Config): Promise<Services> {
   // 才会同时进环形缓冲和磁盘。装晚了会漏掉启动阶段最关键的几条。
   installRuntimeLog(cfg.configDir);
 
+  // 模型设置（面板设置对话框的落点）：env > 存盘 > 默认 —— env 给过的字段是**托管层**，
+  // 运行期以 env 为准，且永不落盘（见 model-settings.ts 的 #write）。
+  // ⚠️ 必须在**建 provider 之前**读 —— provider 吃的就是它。cfg 只是「报告面」
+  //    （/api/health · /api/config · discovery 读的是 cfg），这里把它同步成**生效值**，
+  //    面板一改设置就跟着变，不用等重启。
+  const modelSettings = new ModelSettingsStore({
+    configDir: cfg.configDir,
+    fallback: { baseUrl: cfg.providerBaseUrl, model: cfg.model, apiKey: cfg.apiKey },
+  });
+  const syncCfgFromSettings = (): void => {
+    cfg.providerBaseUrl = modelSettings.baseUrl;
+    cfg.model = modelSettings.model;
+    cfg.apiKey = modelSettings.apiKey;
+  };
+  modelSettings.onChange(syncCfgFromSettings);
+  syncCfgFromSettings();
+  if (modelSettings.filePath && existsSync(modelSettings.filePath)) {
+    console.log(`[dove] 模型设置: ${modelSettings.filePath}（文件里存的是面板改过的值；env 给过的字段以 env 为准）`);
+  }
+
   if (!cfg.apiKey) console.warn("[bootstrap] 未找到 API key，模型调用会失败");
 
   const db = new Db(cfg.dbFile);
-  const store = new Store(db);
+  /**
+   * 依赖注入而不是让 session 层 import 上层：
+   * - `planAging` 住在 tools 层（上层），session 直接 import 会被 lint-layering 拦（连动态 import 都查）；
+   * - 日志实例由 configDir + threadId 现开，所以传工厂而不是实例。
+   * 缺任何一个都只是功能降级（不做老化 / 不写线程日志），不会让服务起不来。
+   */
+  const store = new Store(db, {
+    planAging,
+    journalFor: (threadId) => openJournal(cfg.configDir, threadId),
+  });
   const logsDir = join(cfg.configDir, "logs");
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
   const eventLog = new EventLog({ dir: logsDir });
@@ -109,7 +139,7 @@ export async function bootstrap(cfg: Config): Promise<Services> {
   const steering = new SteeringQueue();
   const preview = new PreviewManager(3000);
   const projects = new ProjectManager({ store, workspaceRoot: cfg.workspaceRoot, templateDir: cfg.templateDir, preview });
-  const provider = getProvider({ baseUrl: cfg.providerBaseUrl, apiKey: cfg.apiKey });
+  const provider = new LiveModelProvider(modelSettings);
 
   // 工具
   const tools = new Map<string, Tool>();
@@ -141,10 +171,6 @@ export async function bootstrap(cfg: Config): Promise<Services> {
   //    实测为此查了三轮 —— 表现只是模型抱怨「Bing 把 VST 认成卓佳」。
   //    打出来之后，一眼就能看出 key 有没有到位。
   console.log(`[dove] 搜索后端: ${cfg.tavilyApiKey ? "tavily（已配 key）" : "抓取 Bing/DDG/百度（未配 TAVILY_API_KEY，质量较差）"}`);
-  // 屏幕语义通道只在真向量上开：hash 降级是字面匹配，0.40 那个阈值是按 BGE 标定的尺度
-  const screenEmbedder = embedder.note ? undefined : embedder.provider;
-  // 关掉是**有意为之**（不是故障），但要留一条说明：否则用户只会看到「屏幕记忆搜不到语义相似的内容」
-  if (!screenEmbedder) console.warn(`[dove] 屏幕向量腿已禁用（向量后端降级为 ${embedder.note}），只用词法腿`);
 
   let memory: MemoryService | null = null;
   try {
@@ -171,7 +197,13 @@ export async function bootstrap(cfg: Config): Promise<Services> {
   }
 
   const memoryPort: MemoryPort | undefined = memory ? {
-    retrieveForContext: (q, pid) => memory!.retrieveForContext(q, { scope: pid ? undefined : undefined }),
+    // ⚠️ 原写法是 `{ scope: pid ? undefined : undefined }` —— 两个分支恒等，
+    //    于是**永远**把 scope 覆盖成 undefined：pid 被彻底忽略，
+    //    而且连服务自己的 `#scopeList()`（项目作用域时是 [scope, "global"]）也被这个 undefined 覆盖掉
+    //    （retrieveForContext 里是 `{ scope: ..., ...opts }`，opts 在后）。
+    //    现在：有 pid 就收窄到「该项目 + global」；没有就交给服务默认范围，不要传 scope。
+    retrieveForContext: (q, pid) =>
+      pid ? memory!.retrieveForContext(q, { scope: [pid, "global"] }) : memory!.retrieveForContext(q),
     remember: (c, k, s) => memory!.remember(c, k as never, s),
     captureDaily: (c) => memory!.captureDaily(c),
     captureDiary: (x) => memory!.captureDiary(x),
@@ -186,8 +218,6 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       configDir: cfg.configDir,
       emotion: (threadId) => emotions.renderBlock(threadId),
       fatigue: () => fatigue.renderBlock(),
-      activity: () => activity,
-      screenEmbedder: () => screenEmbedder,
     }),
   });
 
@@ -199,7 +229,12 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     }
   };
 
-  const compact = makeCompactor({ provider, model: cfg.toolModel });
+  // 压缩：把「恢复指针」也接上 —— 没有它，模型被摘要之后就不知道细节还在磁盘上
+  const compact = makeCompactor({
+    provider, model: cfg.toolModel,
+    journalFor: (threadId) => openJournal(cfg.configDir, threadId),
+    spillDir: join(cfg.workspaceRoot, ".spill"),
+  });
 
   // 审批策略在装配层解决：不改 PendingRegistry 的语义，只决定"要不要真的问人"
   if (cfg.approvalPolicy === "auto") {
@@ -228,19 +263,35 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     return m.parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text).join("").trim();
   };
 
+  /**
+   * 循环 hook 注册表：**一处构造、跨轮存活**（每轮新建等于白注册）。
+   *
+   * 这是「让新特性注册、而不是改循环」的挂载点：任何监听者可以 veto / allow / pass /
+   * waitUntil（延后到同步监听者跑完 —— 审批弹窗正是靠这个才不阻塞别的注册者），
+   * 事件见 loop/hooks.ts 的 HookEvent。
+   *
+   * ⚠️ 目前**一个内置监听者都没有**，这是刻意的：现成的横切逻辑（工具去重、断路器、
+   *    压缩、提醒注入）都已经在各自的正确位置实现了，硬塞进 hook 只是换个地方重复一遍。
+   *    这个字段的价值在于「下一条横切需求不用再改 loop/turn.ts」。
+   */
+  const hooks = createHookRegistry();
+  // 注册**真的在干活**的那条：秘密路径的全域兜底（覆盖 MCP / 用户工具 / 将来忘了接护栏的新工具）。
+  // 这里必须显式调用 —— 注册表不会自己长出监听者，「建好没接」是本仓库栽过多次的坑。
+  registerSecretPathGuard(hooks);
+
   const runtime = new AgentRuntime({
     provider, store, eventLog, pending, steering, tools, assemble, tasks,
+    hooks,
     memory: memoryPort,
     compact,
+    // 每线程的可重放日志（恢复指针的第二份来源）。runtime 里与 eventLog **双写**，
+    // 缺这一处只是没有线程日志（恢复指针退化），不会让对话失败 —— 见 agent/run-log.ts。
+    journalFor: (threadId) => openJournal(cfg.configDir, threadId),
     projectOps: (id) => projects.ops(id),
     // MCP 资源能力（ListMcpResources / ReadMcpResource）。
     // ⚠️ 这个值要穿过四处：bootstrap（这里）→ AgentServices 声明 → wire.ts 的转发 → ToolServices.mcp。
     //    漏了 wire.ts 那一处 = 工具永远返回「MCP 未接入」，而且不报错。
     mcp: mcpWiring?.resources,
-    // 屏幕记忆：Recall 的「我屏幕上看到过什么」那条通道。
-    // ⚠️ activity 是在这个 runtime **之后**才创建的（它自己要用 runtime 派活），
-    //    所以这里必须惰性取值 —— 直接写 activity?.xxx 会命中 TDZ。
-    activity: { searchScreen: (q, o) => activity?.store.searchScreen(q, o) ?? [] },
     // 搜索 API 的 key（Tavily）。没配就退回抓搜索引擎 HTML —— 见 webSearchKey 的注释。
     webSearchKey: cfg.tavilyApiKey,
     // 审批分类器（auto 模式用）。⚠️ 这个值以前**根本没提供** —— 只在类型里声明过，
@@ -294,62 +345,18 @@ export async function bootstrap(cfg: Config): Promise<Services> {
     deliver: (text: string) => emit({ type: "heartbeat_report", text }),
   });
 
-  // ── M7：感知层（活动记录器）
-  // 没有屏幕录制权限时**不启动触发器**，但 analyze / report 仍然可用。
-  let activity: ActivityRecorder | null = null;
-  if (process.env.DOVE_ACTIVITY !== "off") {
-    try {
-      activity = new ActivityRecorder({
-        db, configDir: cfg.configDir,
-        // OCR 很贵，默认每 3 帧一次。DOVE_OCR_EVERY=1 可以每帧都 OCR
-        // （调参/联调时用；生产别设 1，CPU 吃不消）
-        // 脏值（NaN / 0 / 负数 / 文字）在 ocrEveryFromEnv 里就告警丢弃了：NaN 会让 OCR 永久静默
-        ...ocrEveryFromEnv(process.env.DOVE_OCR_EVERY),
-        llm: providerLlm(provider, cfg.toolModel),
-        logger: (level, msg, data) => {
-          if (level === "error" || level === "warn") console.log("[activity]", level, msg, data ?? "");
-        },
-        remember: memory ? (content: string, kind?: string) => memory!.remember(content, kind as never) : undefined,
-      });
-      const init = await activity.init();
-      if (init.screenPermission) {
-        activity.start();
-        console.log("[dove] 屏幕感知已启动（有屏幕录制权限）");
-      } else {
-        console.warn("[dove] 屏幕感知未启动：" + (init.note ?? "没有屏幕录制权限"));
-      }
-      // T7.4 输入监听：给它 app 名/窗口标题，快照才有上下文。
-      // 键盘事件需要「辅助功能」权限；没权限时仍能收 app 切换事件，所以这里不阻塞。
-      try {
-        const input = await attachInputMonitor(activity, {
-          logger: (lv: string, m: string, d?: unknown) => { if (lv !== "info") console.log("[input]", lv, m, d ?? ""); },
-        });
-        // note 自己就是一句完整的话（"仅 app 切换事件：没有辅助功能权限…"），不要再套一层"已启动"，
-        // 否则会打成「已启动（已启动（…））」。
-        console.log("[dove] 输入监听：" + (input.ok ? (input.note ? input.note : "已启动") : "未启动 —— " + (input.error ?? "")));
-      } catch (e) {
-        console.warn("[dove] 输入监听启动失败（不影响感知）：", e instanceof Error ? e.message : e);
-      }
-      emit({ type: "activity_ready", screenPermission: init.screenPermission, note: init.note });
-    } catch (e) {
-      console.error("[bootstrap] 活动记录器初始化失败（降级为不感知）：", e instanceof Error ? e.message : e);
-      activity = null;
-    }
-  }
-
   // 对外发现信息（~/.dove/port + api-spec.md）：内核是常驻服务，CLI / 外部 agent
   // 得先知道去哪儿说话。只写这两个文件，绝不碰用户数据；写失败也不影响内核干活。
   publishDiscovery(cfg, tools.size);
 
   return {
     cfg, db, store, eventLog, pending, steering, runtime, tools, projects, preview, memory, tasks,
+    modelSettings,
     mcp: mcpWiring?.port,
     onEvent: (l: BusListener) => { busListeners.push(l); },
     shutdown: () => {
       // 顺序很重要：先停生产者，再关存储
       try { mcpWiring?.manager.close(); } catch { /* ignore */ }
-      try { detachInputMonitor(); } catch { /* ignore */ }
-      try { activity?.stop(); } catch { /* ignore */ }
       try { cron.stop(); } catch { /* ignore */ }
       try { heartbeat.stop(); } catch { /* ignore */ }
       try { memory?.stopScheduler(); } catch { /* ignore */ }
@@ -383,16 +390,5 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       start: () => heartbeat.start(), stop: () => heartbeat.stop(),
       tick: () => heartbeat.tick(),
     },
-    activity: activity ? {
-      init: async () => ({ ok: true, screenPermission: activity!.screenPermission }),
-      start: () => activity!.start(),
-      stop: () => activity!.stop(),
-      captureNow: (reason?: string) => activity!.captureNow(reason),
-      analyzePending: (limit?: number) => activity!.analyzePending(limit),
-      listSnapshots: (date?: string, limit?: number) => activity!.listSnapshots(date, limit) as never,
-      dailyReport: (date: string) => activity!.dailyReport(date),
-      weeklyReport: () => activity!.weeklyReport(),
-      stats: () => activity!.stats() as never,
-    } : undefined,
   };
 }

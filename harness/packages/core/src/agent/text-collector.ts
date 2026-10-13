@@ -14,12 +14,30 @@
  *      3. 完成守卫看到"模型说过话"就开了续跑，而用户那边一个字都没收到。
  */
 import type { Part } from "../session/types.ts";
-import type { EventLog } from "../session/event-log.ts";
 import { RedactStream } from "../security/redact-stream.ts";
+
+/**
+ * 落日志要的**最小接口**：只要 `append(type, data?, ctx?)` 形状对得上就行。
+ *
+ * 为什么不写死 `EventLog`：助手正文必须同时进**两份**日志 —— 按天的全局日志（面板契约）
+ * 与每线程的 journal（压缩后的恢复指针指的就是后者）。runtime 现在传进来的是双写门面
+ * `agent/run-log.ts` 的 RunLog（见那边的注释），它没有 EventLog 的 file/seq 等成员，
+ * 按类收窄就传不进来（要么改门面加空壳成员，要么在调用点包一层 —— 两种都是把
+ * 「日志长什么样」这件事硬塞进一个只负责收集文本的文件里）。
+ *
+ * 顺带的好处：测试里塞一个数组收集器就够了，不必起真文件。
+ */
+export interface LogSink {
+  append(type: string, data?: Record<string, unknown>, ctx?: { run?: string; turn?: number; step?: number }): unknown;
+}
+
+/** 落日志的增量上限（字符）—— 防日志爆炸，不是内容截断 */
+const LOG_DELTA_CHARS = 400;
 
 export interface TextCollectorOptions {
   parts: Part[];
-  eventLog: EventLog;
+  /** 日志出口：EventLog 或双写门面 RunLog 都行（只要 append 形状对得上，见 LogSink） */
+  eventLog: LogSink;
   sink: (e: { type: string; [k: string]: unknown }) => void;
   runId: string;
   /** 当前 step 号（惰性取：日志按步归档） */
@@ -28,7 +46,7 @@ export interface TextCollectorOptions {
 
 export class TextCollector {
   #parts: Part[];
-  #eventLog: EventLog;
+  #eventLog: LogSink;
   #sink: TextCollectorOptions["sink"];
   #runId: string;
   #step: () => number;
@@ -59,12 +77,20 @@ export class TextCollector {
     return this.#text;
   }
 
-  /** 模型的一段输出（逐 token 推流） */
+  /**
+   * 模型的一段输出（逐 token 推流）。
+   *
+   * ⚠️ 落日志的 `delta` **故意**截到 LOG_DELTA_CHARS：一段回复可以很长，日志是为了
+   *    「事后看得出模型在这一步说过什么」，不是为了回读原文。
+   *    于是**线程日志（journal）里的 assistant 正文是增量片段、还可能被截断** ——
+   *    别把它当全文用：**完整正文在 messages.parts 的 text part 里**
+   *    （wire 重建、压缩、界面全都只吃 parts，日志这一份不参与任何还原）。
+   */
   push(delta: string): void {
     const safe = this.#redactor.push(delta);
     if (safe.length === 0) return;
     this.#ensureText().text += safe;
-    this.#eventLog.append("assistant_text", { delta: safe.slice(0, 400) }, { run: this.#runId, step: this.#step() });
+    this.#eventLog.append("assistant_text", { delta: safe.slice(0, LOG_DELTA_CHARS) }, { run: this.#runId, step: this.#step() });
     this.#sink({ type: "text", content: safe });
   }
 
@@ -78,13 +104,22 @@ export class TextCollector {
     this.#sink({ type: "reasoning", content: delta });
   }
 
-  /** 放掉脱敏器扣住的尾巴。每个 step 结束都要调（见文件头），整轮结束再调一次兜底 */
+  /**
+   * 放掉脱敏器扣住的尾巴，**并封口**：下一个 step 的文本新开一个 part。
+   * 一步一条 text part 是重建按步还原的前提（见 wire-history.ts 的「切步规则」）——
+   * 不封口的话，两个 step 的文本会并进同一条 part，「中间夹着纯文本步」的回合就还原不出来。
+   * 每个 step 结束都要调（见文件头），整轮结束再调一次兜底（幂等）。
+   *
+   * 这里那条日志同样按 LOG_DELTA_CHARS 截断（见 push 的注释：日志是片段，全文在 parts）。
+   */
   flush(): void {
     const tail = this.#redactor.flush();
-    if (tail.length === 0) return;
-    this.#ensureText().text += tail;
-    this.#eventLog.append("assistant_text", { delta: tail.slice(0, 400) }, { run: this.#runId, step: this.#step() });
-    this.#sink({ type: "text", content: tail });
+    if (tail.length > 0) {
+      this.#ensureText().text += tail;
+      this.#eventLog.append("assistant_text", { delta: tail.slice(0, LOG_DELTA_CHARS) }, { run: this.#runId, step: this.#step() });
+      this.#sink({ type: "text", content: tail });
+    }
+    this.#text = null;
   }
 
   /**
