@@ -1,8 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Dove 默认能力",
+  "description": "Dove 默认能力。remote.urls = 内核托管的控制面板（面板是内核 HTTP 服务的页面 http://127.0.0.1:8790，对 Tauri 属**远程源**；不写这一条时所有 Tauri 命令都会被 ACL 拒掉 —— 「选择项目…」的原生选择框就是这么坏掉的）。内核换端口（DOVE_PORT）时这里要一起改，否则会退到内核的 osascript 兜底（能用，但不是窗口模态）。",
   "windows": ["main"],
-  "permissions": [
-    "dialog:default","core:default"]
+  "remote": {
+    "urls": ["http://127.0.0.1:8790/*", "http://localhost:8790/*"]
+  },
+  "permissions": ["dialog:default", "core:default"]
 }

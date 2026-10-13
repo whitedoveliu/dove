@@ -15,6 +15,7 @@ import type { Services } from "../bootstrap.ts";
 
 import { json, readBody, toLegacyProject, projectIdToPort, portToProject } from "./server.ts";
 import { localTime, partsToEvents, didModify } from "./routes-project-parts.ts";
+import { pickFolder } from "./folder-picker.ts";
 import { loadTurnFiles, clearTurnFilesForThread, appendTurnFiles } from "./turn-files-store.ts";
 
 
@@ -361,8 +362,10 @@ export async function handleProjectRoutes(
   }
 
   // ── POST /api/dialog/choose-folder ─────────────────
+  // 真弹系统对话框（不是桩）：实现与理由见 folder-picker.ts（Tauri 原生对话框被 ACL 拒时的兜底 +
+  // 浏览器形态唯一的选择器）。返回形状 {success, path?|cancelled?, message?} 是面板在读的契约。
   if (path === "/api/dialog/choose-folder" && req.method === "POST") {
-    json(res, 200, { success: false, cancelled: true, message: "当前运行形态没有原生文件夹选择器，请手动填写路径" });
+    json(res, 200, await pickFolder());
     return true;
   }
 

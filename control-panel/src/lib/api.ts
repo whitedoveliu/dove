@@ -646,21 +646,45 @@ export async function createTask(input: {
   return response.json();
 }
 
-/** 唤起系统原生的「选择文件夹」对话框 */
+/**
+ * 唤起系统原生的「选择文件夹」对话框。
+ *
+ * 三层，顺序有理由：
+ *   ① 桌面壳的 Tauri 原生对话框（**窗口模态**，体验最好）。用 `core.invoke` 而不是插件全局：
+ *      `withGlobalTauri` 一定注入 core，插件的 `__TAURI__.dialog` 反而不保证有。
+ *      面板是内核托管的**远程源**，这条命令能不能过取决于 `capabilities/default.json` 的
+ *      `remote.urls`（不声明时 ACL 会拒绝一切 Tauri 命令）；被拒就往下走 —— 绝不静默。
+ *   ② 内核的 `/api/dialog/choose-folder`：由内核进程弹系统的 choose folder
+ *      （浏览器形态唯一可行的一条；桌面壳里 ① 被拒时也走它）。
+ *   ③ 都没有就返回**可读的失败原因**，由调用方显示（以前这里静默返回，用户看到的是「点了没反应」）。
+ */
 export async function chooseFolder(): Promise<{ success: boolean; path?: string; cancelled?: boolean; message?: string }> {
-  // 桌面端优先用 Tauri 的原生对话框（弹在应用窗口上、无需额外权限）
-  const tauri = (window as unknown as { __TAURI__?: { dialog?: { open?: (o: unknown) => Promise<string | string[] | null> } } }).__TAURI__;
-  if (tauri?.dialog?.open) {
+  const tauri = (window as unknown as {
+    __TAURI__?: {
+      core?: { invoke?: (cmd: string, args?: unknown) => Promise<unknown> };
+      dialog?: { open?: (o: unknown) => Promise<string | string[] | null> };
+    };
+  }).__TAURI__;
+  const options = { directory: true, multiple: false, title: "选择项目文件夹" };
+  const first = (v: unknown): string | null | undefined =>
+    Array.isArray(v) ? (typeof v[0] === "string" ? v[0] : undefined) : (typeof v === "string" ? v : v === null ? null : undefined);
+
+  if (tauri?.core?.invoke || tauri?.dialog?.open) {
     try {
-      const picked = await tauri.dialog.open({ directory: true, multiple: false, title: "选择项目文件夹" });
-      if (!picked || Array.isArray(picked)) return { success: false, cancelled: true };
-      return { success: true, path: picked };
+      const picked = tauri.core?.invoke
+        ? await tauri.core.invoke("plugin:dialog|open", { options })
+        : await tauri.dialog!.open!(options);
+      const path = first(picked);
+      if (typeof path === "string" && path) return { success: true, path };
+      // null / undefined 都可能表示「用户取消」，但空数组不是 —— 空数组按失败处理，别把取消当成静默成功
+      if (path === null) return { success: false, cancelled: true, message: "已取消选择" };
     } catch {
-      /* 落到后端兜底 */
+      /* 没被授权 / 插件不可用 → 退到内核那条，不吞掉（下面的兜底会给出可读结果） */
     }
   }
+
   const response = await apiFetch(`${getApiBaseUrl()}/api/dialog/choose-folder`, { method: "POST" });
-  return response.json().catch(() => ({ success: false, message: "打开选择框失败" }));
+  return response.json().catch(() => ({ success: false, message: `打开选择框失败：后端返回了读不懂的结果（HTTP ${response.status}）` }));
 }
 
 /**
