@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Loader2, StopCircle, Settings2, Check, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye, ClipboardList, XCircle, Target } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Send, Loader2, StopCircle, DollarSign, Paperclip, X, FileIcon, Plus, Play, Download, VolumeX, Pause, Square, RotateCcw, AlertTriangle, Search, PanelRightOpen, PanelRight, FolderOpen, ChevronDown, HardDrive, ArrowUp, Shield, ShieldOff, Eye, ClipboardList, XCircle, Target, Scan, Network } from "lucide-react";
 import { Hint } from "@/components/ui/tooltip";
 import { IconButton } from "@/components/ui/icon-button";
 import { loadSavedStyle } from "./AIStyleSelector";
@@ -9,7 +9,16 @@ import MessageList from "./MessageList";
 import { SubagentBar, reduceSubagents, type SubagentInfo } from "./subagent-bar";
 import { SubagentView } from "./subagent-view";
 import { ComposerBox, PermissionSelect } from "./composer-box";
+import type { ComposerHandle } from "./composer-input";
+import { DropFilesOverlay } from "./drop-overlay";
+import { useSelectionQuoteMenu } from "./selection-quote-menu";
+import { ComposerPlusMenu, type PlusMenuItem } from "./composer-plus-menu";
+import { ComposerStatusLine, type ComposerStatusData } from "./composer-status-line";
+import { ModelChip } from "./model-chip";
+import { ModelSettingsButton, ModelSettingsDialog } from "./model-settings-dialog";
+import { ModeChips, type ModeChipSpec } from "./mode-chip";
 import { SteerQueueBar } from "./steer-queue-bar";
+import { usageEntries } from "@/lib/models";
 import { enqueueMessage, queueForProject, rekeyQueuedProject, removeQueuedMessage, takeQueueHead, type QueuedMessage } from "@/lib/steer-queue";
 import { GoalBar } from "./goal-bar";
 import { usePermissionMode, usePlanMode, readDraftPlanMode, writeDraftPlanMode } from "@/lib/permission";
@@ -19,7 +28,10 @@ import { useToast, type ToastOptions } from "@/components/ui/toast";
 import type { SlashCommand } from "@/components/slash-menu";
 import { isExitPlanModeTool } from "@/lib/plan-mode";
 import { extractPresentedFiles, isPresentTool, type PresentedFile } from "@/lib/presented-files";
-import { Message, sendChatMessage, submitUserInput, stopGeneration, steerMessage, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, listSubagents, type Project, type Goal, type GoalAction, type GoalPostBody } from "@/lib/api";
+import { findMessageElement } from "@/lib/message-anchor";
+import { createPortal } from "react-dom";
+import { PromptRail, type PromptRailItem } from "@/components/prompt-rail";
+import { Message, sendChatMessage, captureScreen, submitUserInput, stopGeneration, steerMessage, getHistory, HistoryRecord, submitBrowserResult, switchVersion, switchToLatest, setPreviewVersion, uploadFile, UploadedFile, TodoItem, checkProjectExists, createProject, importProject, resetProject, listSubagents, getModelSettings, saveModelSettings, formatBytes, type Project, type Goal, type GoalAction, type GoalPostBody, type CaptureScreenResult } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -32,11 +44,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import UserInputDialog from "./UserInputDialog";
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -44,8 +51,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
 import type { ConsoleLog, NetworkRequest } from "@/hooks/useDevToolsBridge";
 import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 import PromptReplacementDialog, { getEnabledReplacements, PromptReplacement } from "./PromptReplacementDialog";
@@ -53,12 +58,6 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { mergeLogContent, sanitizeLogContent } from "@/lib/logs";
 
 const SETTINGS_KEY = "chat_settings";
-
-// 模型选项
-const MODEL_OPTIONS = [
-  { value: "deepseek-flash", label: "DeepSeek V4.1 Flash" },
-  { value: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
-];
 
 // 设置类型
 /**
@@ -70,23 +69,25 @@ const MODEL_OPTIONS = [
 const NEW_TASK_PLACEHOLDER = "交给我一件事：查资料、写代码、做分析、跑命令都行…";
 const COMPOSER_PLACEHOLDER = "说点什么，或让我做点什么…";
 
+/**
+ * 面板侧的设置（`chat_settings`）—— 模型选择 + 建议自动发送。
+ *
+ * ⚠️ 模型**同时**存在两处，各有各的职责，别再往这里塞新的东西：
+ *   · 内核（`<DOVE_CONFIG>/model.json`，见 lib/api.ts 的模型设置那一段）= 权威存储，
+ *     决定内核默认用什么模型；
+ *   · 这里 = 这台浏览器最后一次选的是哪个，负责「每一轮发出去的那个 model 字段」
+ *     （行为和以前逐字节一致：`POST /api/chat` 的 body.model）。
+ * 选一次两边一起写（见 applyModel），所以它们不会长期不一致。
+ */
 interface ChatSettings {
   model: string;
-  enableThinking: boolean;
-  continuousChat: boolean;  // 连续对话模式
-  enableMemory: boolean;    // 记忆模式
-  suggestionAutoSend: boolean;  // 建议点击后自动发送
-  enableRecommendFiles: boolean;  // 推荐文件开关（仅普通模式生效）
+  suggestionAutoSend: boolean;  // 建议点击后自动发送（它一直没有 UI，沿用默认 true）
 }
 
 // 默认设置
 const DEFAULT_SETTINGS: ChatSettings = {
   model: "deepseek-flash",
-  enableThinking: true,   // 默认开启
-  continuousChat: true,   // 默认开启
-  enableMemory: true,     // 默认开启
   suggestionAutoSend: true,  // 默认自动发送
-  enableRecommendFiles: true,  // 默认开启
 };
 
 // 转换 usage 格式（兼容新旧格式）
@@ -153,6 +154,34 @@ function loadSettings(): ChatSettings {
   return DEFAULT_SETTINGS;
 }
 
+/**
+ * 这台浏览器**选过**模型吗？
+ *
+ * 用来决定启动时的对齐方向：选过 → 面板的值推到内核（用户上一版的意图不能被悄悄改掉）；
+ * 没选过（第一次打开 / 新机器）→ 内核的值拉到面板（内核才是权威存储）。
+ */
+function hasSavedModelChoice(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const saved = localStorage.getItem(SETTINGS_KEY);
+    if (!saved) return false;
+    const v = (JSON.parse(saved) as { model?: unknown }).model;
+    return typeof v === "string" && v.trim().length > 0;
+  } catch { return false; }
+}
+
+/**
+ * 宿主注入的消息 —— 内核在 Swarm 轮会**多存一条**：role 是 user、正文用
+ * <system-reminder>…</system-reminder> 包起来、origin 标成 injection。
+ * 它不是用户说的话，回放时必须整条跳过（否则会顶着用户气泡出现在记录里）。
+ * 两个判据都认：正文带包裹，或记录 / payload 上带 origin。实时流不带它，只有这条路要看。
+ */
+function isInjectedHistoryRecord(record: HistoryRecord): boolean {
+  if (record.user.startsWith("<system-reminder>")) return true;
+  const raw = record as HistoryRecord & { origin?: string; payload?: { origin?: string } };
+  return raw.origin === "injection" || raw.payload?.origin === "injection";
+}
+
 // 将后端历史记录转换为前端 Message 格式
 function convertHistoryToMessages(history: HistoryRecord[]): Message[] {
   const messages: Message[] = [];
@@ -161,6 +190,9 @@ function convertHistoryToMessages(history: HistoryRecord[]): Message[] {
   let versionCounter = 0;
   
   for (const record of history) {
+    // 注入消息整条丢弃：用户气泡和 AI 气泡都不出现
+    if (isInjectedHistoryRecord(record)) continue;
+
     // 用户消息
     messages.push({
       id: record.id + "_user",
@@ -247,6 +279,18 @@ function convertHistoryToMessages(history: HistoryRecord[]): Message[] {
       commit_hash: record.commit_hash,
       // 是否被恢复操作跳过
       skipped_by_restore: record.skipped_by_restore,
+      // 这一轮改了哪些文件（**持久化回填**：兼容层把 turn_diff 按消息 id 落盘了，
+      // 刷新 / 重开都还在）。每轮文件卡片优先读它，没有才退回实时的 turn_diff。
+      ...(record.turn_files && record.turn_files.length > 0
+        ? {
+            turn_files: record.turn_files,
+            turn_diff: {
+              files: record.turn_files,
+              truncated: record.turn_files_truncated === true,
+              diff: record.turn_diff ?? "",
+            },
+          }
+        : {}),
     };
     
     messages.push(aiMessage);
@@ -295,16 +339,20 @@ interface ChatPanelProps {
   onProjectCreated?: () => void;  // 新建项目后的回调（用于刷新目录树）
   asideCollapsed?: boolean;        // 预览区是否已收起
   onToggleAside?: () => void;      // 收起/展开预览区
-  onQuickCreateTask?: (text: string) => void;  // 空状态里直接开新任务
+  /** 空状态里直接开新任务。返回 false = 任务没建起来，这句话**还在调用方手里**（要放回输入框） */
+  onQuickCreateTask?: (text: string) => Promise<boolean>;
   projects?: Project[];                        // 起始页的项目选择器用
   draftProject?: string | null;                // 起始页预选的项目
   onDraftProjectChange?: (project: string | null) => void;
   onChooseFolder?: () => void;                 // 唤起系统选择框并接入项目
-  pendingMessage?: string | null;  // 建好任务后要自动发出的第一条消息
+  /** 建好任务后要自动发出的第一条消息（**带它属于哪个任务**，见 App.handleQuickCreateTask） */
+  pendingMessage?: { projectId: string; text: string } | null;
   onPendingMessageConsumed?: () => void;
+  /** 用户离开时被 App 收回来的那条消息（放回输入框 + 提示；token 变化 = 一次新的还原） */
+  restoreDraft?: { text: string; token: number } | null;
 }
 
-export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onOpenFile, onPresentedFiles, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
+export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVersionChange, latestVersion, projectId, onProjectSelect, onRefreshPreview, onLoadingChange, onStartDevServer, externalBuildError, onClearBuildError, externalRuntimeError, onClearRuntimeError, onSwitchingVersionChange, onPreviewReady, onBuildStart, enableHotReload, onFileModifying, onOpenFile, onPresentedFiles, onProjectCreated, onQuickCreateTask, pendingMessage, onPendingMessageConsumed, restoreDraft, asideCollapsed, onToggleAside, projects = [], draftProject, onDraftProjectChange, onChooseFolder }: ChatPanelProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   // 子代理状态（顶部状态栏）。内核的 subagent_text 不带 label，
   // 流式文本按「最近一个 running 的」归并 —— 见 reduceSubagents。
@@ -322,6 +370,21 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
    * 用户批准后**内核自己**把这一位关掉 —— 所以除 change 外还要 refresh。
    */
   const [planMode, changePlanMode, refreshPlanMode] = usePlanMode(projectId);
+  /**
+   * Swarm 模式 —— **面板侧的旗标**：内核只在发消息时收 `mode:"swarm"`（没有查询接口），
+   * 所以状态放在这里。和计划模式一样"黏"：不主动关就一直开着，发下一轮也不重置。
+   * 关着的时候请求体里没有这个字段（和以前逐字节一致，见 ChatRequest.mode）。
+   */
+  // Swarm 是**每轮**的请求状态（发送时作为 mode 字段带上）。
+  // ⚠️ 但它必须**按线程**：切到别的任务要复位，否则下一个任务会莫名变成 swarm 回合、白烧 token。
+  const [swarmOn, setSwarmOn] = useState(false);
+  useEffect(() => {
+    setSwarmOn(false);
+    // 状态行也**按线程**：换任务就整个清掉 —— 上个任务的步数 / token / tok/s
+    // 标在新任务上是假的（和 Swarm 旗标同一个道理）
+    setStatusLine(null);
+    turnRef.current = null;
+  }, [projectId]);
   /**
    * 长期目标 —— **线程级**（每线程至多一个）。目标 active 时内核会在每轮结束后
    * 自动再开一轮，所以面板只给两个入口：输入框上方的状态条、输入框里的 /goal 命令。
@@ -398,7 +461,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const [folderMode, setFolderMode] = useState(false);
   const [folderPath, setFolderPath] = useState("");
 
-  const submitStartDraft = () => {
+  const submitStartDraft = async () => {
     const text = startDraft.trim();
     if (!text) return;
 
@@ -427,7 +490,19 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     }
 
     setStartDraft("");
-    onQuickCreateTask?.(text);
+    // 建任务 + 记下「这条消息要发到哪个任务」由 App 负责；返回 false 就是**没建起来**。
+    // 失败时这句话必须回来：原来这里不管返回值，创建一失败，草稿已经清了、
+    // 消息又发不出去 —— 用户看到的就是「我发的话变成了任务名，然后什么都没发生」。
+    const accepted = await onQuickCreateTask?.(text);
+    if (accepted !== true) {
+      setStartDraft((prev) => (prev.trim() ? `${text}\n\n${prev}` : text));
+      toast({
+        title: "任务没建成，消息还在",
+        description: "已把刚才那段话放回输入框 —— 直接再发一次即可",
+        tone: "warning",
+      });
+      focusComposer();
+    }
   };
   
   // 包装 setIsLoading，同时通知父组件
@@ -442,14 +517,26 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const isLoading = runningProjects.has(projectId ?? "");
   const [currentRoute, setCurrentRoute] = useState("/");
   const [settings, setSettings] = useState<ChatSettings>(DEFAULT_SETTINGS);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [stats, setStats] = useState<{
-    input_tokens: number;
-    output_tokens: number;
-    cache_read_tokens: number;
-    cache_creation_tokens: number;
-    rounds: number;
-  } | null>(null);
+  /** 模型设置对话框（左下角齿轮 / 右下角 chip 都开它）的开关 */
+  const [modelDialogOpen, setModelDialogOpen] = useState(false);
+  /** 正在把选中的模型写进内核 —— chip 上转个圈，写失败也不回滚界面（见 applyModel） */
+  const [modelSaving, setModelSaving] = useState(false);
+  /**
+   * 输入框下方状态行的数据（公式都写在 composer-status-line.tsx 里，这里只管攒数）。
+   *
+   * 两个来源，缺一不可：
+   *   · 面板自己攒的：这一轮的**墙钟**和**工具调用数**（起点见 handleSend 的 turnRef）
+   *   · 内核的 stats 事件：rounds + usage（token / 缓存）
+   * null = 这个线程还没有任何可展示的数据（新线程 / 刚切过来）→ 整条不渲染。
+   */
+  const [statusLine, setStatusLine] = useState<ComposerStatusData | null>(null);
+  /**
+   * 正在跑的这一轮：起点 + 数到的工具调用 + **它属于哪个会话**。
+   *
+   * 为什么带 project：流回调是长生命周期闭包，用户在 A 跑到一半切到 B 再切回来时，
+   * 只有认准 project 才不会把 B 的计时/步数算进 A（messagesMirrorRef 同一个道理）。
+   */
+  const turnRef = useRef<{ project: string; startedAt: number; steps: number } | null>(null);
   
   // 用户输入对话框状态
   const [userInputDialog, setUserInputDialog] = useState<{
@@ -492,6 +579,10 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 输入卡片的容器 —— ComposerBox 不暴露 ref，要聚焦就从这里找它的 textarea（见 focusComposer）
+  const composerWrapRef = useRef<HTMLDivElement | null>(null);
+  /** 输入框正文的把手：插入引用 chip（「添加到评论」）—— 见 composer-input.tsx */
+  const composerRef = useRef<ComposerHandle | null>(null);
   
   // 语音朗读 Hook
   const speechSynthesis = useSpeechSynthesis();
@@ -502,6 +593,46 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+
+  // ── 最右侧 userprompt 刻度栏 ────────────────────────────────
+  // 插槽由 shell 渲染（永远在最右缘），这里用 portal 挂进去 —— 状态留在本组件，不必抬到 App。
+  const [railSlot, setRailSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => { setRailSlot(document.getElementById("prompt-rail-slot")); }, []);
+  const railItems = useMemo<PromptRailItem[]>(() => {
+    const out: PromptRailItem[] = [];
+    messages.forEach((m, i) => {
+      if (m.role !== "user") return;
+      const text = String(m.content ?? "");
+      // 注入不是「用户输入的位置」（提醒/模式注入都包在 system-reminder 里）—— 刻度只标用户真正说的话
+      if (text.trimStart().startsWith("<system-reminder>")) return;
+      const reply = messages[i + 1]?.role === "assistant" ? messages[i + 1] : undefined;
+      const files = (reply?.turn_files ?? reply?.turn_diff?.files ?? []).slice(0, 3)
+        .map((f) => ({ name: f.path.split("/").pop() ?? f.path, path: f.path }));
+      out.push({
+        messageId: m.id, text,
+        replySummary: reply ? String(reply.content ?? "").slice(0, 200) : undefined,
+        files: files.length > 0 ? files : undefined,
+      });
+    });
+    return out;
+  }, [messages]);
+  /**
+   * 刻度栏拿滚动容器的方式。
+   * **必须是稳定引用**（useCallback 空依赖）—— 以前这里传的是内联箭头，每次渲染都是
+   * 新函数，刻度栏里挂着它的 effect 就会连滚动监听和 ResizeObserver 一起重建。
+   */
+  const getMessagesScrollContainer = useCallback(() => messagesContainerRef.current, []);
+  const jumpToMessage = useCallback((id: string) => {
+    // 查找口径与刻度栏共用一份（不吃选择器转义，见 lib/message-anchor.ts）
+    const el = findMessageElement(messagesContainerRef.current, id);
+    if (!el) {
+      // 找不到**必须说出来**：切任务的瞬间容器可能还是 null，消息也可能已被回滚 ——
+      // 以前是 `el?.` 静默吞掉，用户只会以为「点了没反应」
+      toast({ title: "没找到这条消息", description: "它可能已被回滚，或还在加载中", tone: "warning", duration: 2000 });
+      return;
+    }
+    el.scrollIntoView({ block: "start", behavior: "smooth" });
+  }, [toast]);
   const currentSessionId = useRef<string | null>(null);
   const pendingNewVersionRef = useRef<number | null>(null);  // 当前会话产生的新版本号（用于 preview_ready 回调）
   const isNearBottomRef = useRef(true);
@@ -515,8 +646,32 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
       const savedSettings = loadSettings();
       setSettings(savedSettings);
       isInitializedRef.current = true;
+      void alignModelWithKernel(savedSettings.model);
     }
   }, []);
+
+  /**
+   * 启动时把「面板里的模型」和「内核里的模型」对齐 —— 方向取决于用户有没有选过：
+   *
+   *   · 这台浏览器选过 → 面板的值推给内核（上一版模型存在 localStorage 里，
+   *     升上来不能因为内核默认是 flash 就把人选过的 pro 悄悄改掉）；
+   *   · 没选过（第一次用 / 换机器）→ 内核的值拉到面板（内核是权威存储，
+   *     它可能是 env 里手写进去的模型）。
+   *
+   * 内核没起来 / 接口出错就什么都不做 —— 面板照常用 localStorage 那份，
+   * 聊天本来也发不出去，这里不该再多冒一个红条。
+   */
+  const alignModelWithKernel = async (localModel: string) => {
+    try {
+      const remote = await getModelSettings();
+      if (!remote.model || remote.model === localModel) return;
+      if (hasSavedModelChoice()) {
+        await saveModelSettings({ model: localModel });
+      } else {
+        setSettings((prev) => ({ ...prev, model: remote.model }));
+      }
+    } catch { /* 内核不可达：保持本地这份 */ }
+  };
 
   // 加载历史记录的函数（可复用）
   const loadHistory = async (port: string, switchLatest: boolean = false) => {
@@ -623,6 +778,27 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     setSettings(prev => ({ ...prev, ...newSettings }));
   };
 
+  /**
+   * 换模型（chip 和设置对话框里的模型都走这一条）。
+   *
+   * 两边一起写：localStorage（老行为，**每轮发出去的 model 字段**就是它）+
+   * 内核设置（权威存储，下次开机也用它）。内核写失败**不回滚界面** ——
+   * 用户已经选了，回滚只会让他以为自己点歪了；发出去的 model 字段本来也是面板说了算。
+   */
+  const applyModel = (id: string) => {
+    updateSettings({ model: id });
+    setModelSaving(true);
+    saveModelSettings({ model: id })
+      .catch((e: unknown) => {
+        toast({
+          title: "模型没能存进内核",
+          description: `${e instanceof Error ? e.message : String(e)}（这一轮仍按 ${id} 发）`,
+          tone: "warning",
+        });
+      })
+      .finally(() => setModelSaving(false));
+  };
+
   // 是否是初次加载（用于决定滚动方式）
   const isInitialLoadRef = useRef(true);
 
@@ -655,41 +831,214 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     }
   }, [messages]);
 
-  // 任务建好后，把它当作第一条消息自动发出
+  /**
+   * 建好任务后，把「空状态里说的那句话」当作第一条消息自动发出。
+   *
+   * 三件必须做对的事（原来一件都没做）：
+   *   ① 认项目：pendingMessage 带着 projectId，只有当前正看着那个任务时才发 ——
+   *      否则用户中途切走，这条消息会发进**别的**任务。
+   *   ② 一次性：`sentPendingRef` 记下已经接手的那一条。effect 的依赖里 projectId
+   *      一变就会再进来一次，没有这个守卫就会发两遍。
+   *   ③ 失败不吞内容：handleSend 返回 false（没发出去）时把原文放回输入框 + 提示 ——
+   *      绝不能像以前那样静默丢掉（用户的原始投诉）。
+   */
+  const sentPendingRef = useRef<{ projectId: string; text: string } | null>(null);
   useEffect(() => {
-    if (projectId && pendingMessage) {
-      onPendingMessageConsumed?.();
-      void handleSend(pendingMessage);
-    }
+    if (!projectId || !pendingMessage) return;
+    if (pendingMessage.projectId !== projectId) return;   // 还没切到位，或者用户已经走了（App 会 takeBack）
+    if (sentPendingRef.current === pendingMessage) return;
+    sentPendingRef.current = pendingMessage;
+    onPendingMessageConsumed?.();                          // 已经接手，不再重发
+    const text = pendingMessage.text;
+    void handleSend(text).then((sent) => {
+      // sent=false 只在**没发出去**时提前 resolve（成功要等整轮跑完才 resolve，这里不等它）
+      if (!sent) restoreUnsentText(text, "发送失败，已把内容放回输入框 —— 可以直接重试");
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, pendingMessage]);
 
-  // 处理文件选择
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0 || !projectId) return;
-    
+  /**
+   * App 把「用户离开时被收回来的那条消息」交还到这里（见 App.takeBackPending）：
+   * 放回当前输入框 + 提示。只认 token —— 同一个对象重渲染不该重复插入一遍。
+   */
+  const restoreTokenRef = useRef(0);
+  useEffect(() => {
+    if (!restoreDraft || restoreDraft.token === restoreTokenRef.current) return;
+    restoreTokenRef.current = restoreDraft.token;
+    restoreUnsentText(restoreDraft.text, "已放回输入框（还没有发送给任何任务）");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreDraft]);
+
+  /**
+   * 上传一组文件 —— **文件选择 / 拖进来 / 粘贴** 三个入口共用这一条路。
+   *
+   * 逐个上传、逐个报错：一个失败不影响其它（原来是一个 try 包住整个循环，
+   * 第一个失败后面的就全不传了，而且只弹一个 alert）。
+   * 返回成功传上去的个数，调用方自己决定要不要提示。
+   */
+  const uploadFilesToTask = async (files: File[], targetProject: string): Promise<number> => {
+    if (files.length === 0) return 0;
     setIsUploading(true);
+    let ok = 0;
     try {
-      for (const file of Array.from(files)) {
-        const uploaded = await uploadFile(file, projectId);
-        setAttachments(prev => [...prev, uploaded]);
+      for (const file of files) {
+        try {
+          const uploaded = await uploadFile(file, targetProject);
+          setAttachments(prev => [...prev, uploaded]);
+          ok++;
+        } catch (error) {
+          // 每个失败都点名到文件 —— 一次拖 5 个、坏了 1 个时，
+          // 用户必须知道是哪个坏了，而不是一句笼统的「上传失败」
+          toast({
+            title: "文件上传失败",
+            description: error instanceof Error ? error.message : String(error),
+            tone: "danger",
+          });
+        }
       }
-    } catch (error) {
-      console.error("文件上传失败:", error);
-      alert(error instanceof Error ? error.message : "文件上传失败");
     } finally {
       setIsUploading(false);
+    }
+    return ok;
+  };
+
+  // 处理文件选择（桌面上的「选文件」入口；可以一次选多个）
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    try {
+      if (!files || files.length === 0 || !projectId) return;
+      await uploadFilesToTask(Array.from(files), projectId);
+    } finally {
       // 清空 input，以便可以重复选择同一文件
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
   
   // 移除附件
   const removeAttachment = (id: string) => {
     setAttachments(prev => prev.filter(a => a.id !== id));
+  };
+
+  /**
+   * 拖进来的文件（全窗口蒙层 → 松手）、以及 Cmd+V 粘贴进来的文件，
+   * 都落到这里 —— 和「+」菜单选文件是同一条路。
+   * 还没有任务时不能传（没有落点），说清楚而不是静默失败。
+   */
+  const handleDroppedFiles = (files: File[]) => {
+    if (!projectId) {
+      toast({
+        title: "先建好任务",
+        description: "文件要落到任务的 uploads/ 目录里；先在输入框里说一句话建好任务，再拖进来",
+        tone: "info",
+      });
+      return;
+    }
+    void uploadFilesToTask(files, projectId).then((n) => {
+      if (n > 0) toast({ title: `已加入 ${n} 个文件`, description: "会随下一条消息进对话", tone: "success", duration: 2000 });
+    });
+  };
+
+  /**
+   * 把焦点送回输入框（「+」菜单 / 斜杠命令选完之后）。
+   *
+   * 为什么不只 focus() 一次：Radix 关浮层时 FocusScope 会用一个 setTimeout(0) 把焦点
+   * 还给触发按钮（也就是「+」），所以先让过那一拍、再兜一次底 —— 否则光标会停在按钮上。
+   *
+   * 选择器认 `[data-composer-input]`：输入框正文现在是 contenteditable
+   * （textarea 里画不出引用 chip，见 composer-input.tsx 的取舍），找不到才退回 textarea。
+   */
+  const focusComposer = () => {
+    const grab = () => composerWrapRef.current
+      ?.querySelector<HTMLElement>("[data-composer-input], textarea")?.focus();
+    grab();
+    window.setTimeout(grab, 0);
+    window.setTimeout(grab, 80);
+  };
+
+  /**
+   * 把一段「没能发出去」的文字还给用户：还原到**当前**输入框 + 一条能行动的提示。
+   *
+   * 这是「消息静默消失」这条主诉的统一兜底：任何一条没能发出去的路
+   * （建任务失败 / 发送失败 / 中途切走）都必须落到这里 —— 用户至少能看见它、能直接重试。
+   * 手快已经在输入框里打了新字的话，原话接在前面（宁可多一段，也不能少一句）。
+   */
+  const restoreUnsentText = (text: string, reason: string) => {
+    const put = (prev: string) => (prev.trim() ? `${text}\n\n${prev}` : text);
+    if (projectId) { setInput(put); focusComposer(); } else { setStartDraft(put); }
+    toast({ title: "这条消息还没有发出去", description: reason, tone: "warning" });
+  };
+
+  /**
+   * 消息里选中文字 → 右键「添加到评论」：把那一段作为**引用 chip** 插进输入框
+   * （显示成缩写，hover 出原文；发出去的是完整原文，见 composer-input.tsx）。
+   * 插到**光标处** —— 用户可能已经写了一半，再回头引用某句话。
+   */
+  const handleAddToComment = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    composerRef.current?.insertReference(t);
+    focusComposer();
+  };
+  // 右键菜单只挂在消息列表那一块（见下面的 onContextMenu），别处照旧走系统菜单
+  const { onContextMenu: onMessagesContextMenu, menuNode: quoteMenu } = useSelectionQuoteMenu(
+    projectId ? handleAddToComment : undefined,
+  );
+
+  /** 「+」菜单 / /file：和原来的回形针同一条路 —— 打开隐藏的文件选择框 */
+  const triggerFilePick = () => {
+    if (!projectId) {
+      // 起始页还没有线程，上传没有落点；说清楚，别让用户对着没反应的入口点
+      toast({ title: "先建好任务", description: "文件会随消息进对话；建好任务后再从输入框的 + 上传", tone: "info" });
+      return;
+    }
+    fileInputRef.current?.click();
+  };
+
+  /**
+   * 「+」菜单 / /capture：框选截屏 → 走**既有**的 uploadFile 通道进附件条。
+   * 「评论」就是接下来打的那句话：截屏只负责把图放进这一轮。
+   */
+  const handleCapture = async () => {
+    if (!projectId) {
+      toast({ title: "先建好任务", description: "截屏会作为附件进对话；建好任务后再从输入框的 + 截屏", tone: "info" });
+      return;
+    }
+    let shot: CaptureScreenResult;
+    try {
+      shot = await captureScreen();
+    } catch (error) {
+      toast({ title: "截屏失败", description: error instanceof Error ? error.message : String(error), tone: "danger" });
+      return;
+    }
+    if (!shot.ok) {
+      if (shot.cancelled) return;   // 用户按了 Esc：不是错误，什么都不做（不弹任何东西）
+      toast({ title: "截屏失败", description: shot.error, tone: "danger" });
+      return;
+    }
+    setIsUploading(true);
+    try {
+      // base64 → File：截屏结果顺着既有的上传通道走，先变回一个文件
+      const bin = atob(shot.data);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const uploaded = await uploadFile(new File([bytes], shot.name, { type: shot.mediaType }), projectId);
+      setAttachments(prev => [...prev, uploaded]);
+      focusComposer();   // 图已经在附件条上了，光标回输入框等着写评论
+    } catch (error) {
+      console.error("截屏上传失败:", error);
+      toast({ title: "截屏上传失败", description: error instanceof Error ? error.message : String(error), tone: "danger" });
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  /** Swarm 开关（「+」菜单和 /swarm 共用）—— 只动面板旗标，发消息时随 mode 带出去 */
+  const toggleSwarm = () => {
+    const next = !swarmOn;
+    setSwarmOn(next);
+    toast(next
+      ? { title: "已开启 Swarm 模式", description: "下一轮起用多个子代理并行处理", tone: "info" }
+      : { title: "已关闭 Swarm 模式", description: "回到单代理执行", tone: "default" });
   };
 
   // 创建或进入项目
@@ -885,13 +1234,24 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   /** 状态条上的按钮 —— 和 /goal 命令走同一条路，只是不用打字 */
   const runGoalBarAction = (action: GoalAction) => { void runGoalAction({ action }); };
 
-  const handleSend = async (messageText?: string, isNewProject: boolean = false) => {
+  /**
+   * 发送一条消息。
+   *
+   * 返回值 = 「这条消息有没有被接手」，调用方必须看：
+   *   true  交给发送流程了（发出 / 排队 / 当作提问的回答）
+   *   false 没发出去 —— **内容还在调用方手里**，要负责还给用户
+   *         （建完任务自动发第一条、以及「没建成时把原话放回输入框」都靠它）
+   *
+   * ⚠️ 成功那一支要**等整轮跑完**才 resolve（下面 await 的是整条 SSE 流），
+   *    所以调用方只该在 false 上做事，别拿它当「已送达」的即时信号。
+   */
+  const handleSend = async (messageText?: string, isNewProject: boolean = false): Promise<boolean> => {
     const textToSend = messageText || input;
     // /goal … 是**面板命令**，不发模型。刻意放在 isLoading 检查之前：一轮正在跑的时候
     // 也要能 /goal pause / complete。只拦"手动发送"这条路 —— messageText 是程序自动发的
     // （重试 / 继续 / 建完任务后的第一条），里面以 /goal 开头也只是普通正文。
-    if (messageText === undefined && (await runGoalCommand(textToSend))) return;
-    if (!textToSend.trim()) return;
+    if (messageText === undefined && (await runGoalCommand(textToSend))) return true;
+    if (!textToSend.trim()) return false;
 
     /**
      * 运行中发送 = **排队**（不再像以前那样直接丢掉）。
@@ -904,7 +1264,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
       setInput("");
       await handleAskUserSubmit(pendingQuestion.id, textToSend);
       toast({ title: "已作为回答提交", duration: 2000 });
-      return;
+      return true;
     }
 
     if (isLoading) {
@@ -912,8 +1272,11 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         setQueued((prev) => enqueueMessage(prev, projectId ?? "", textToSend));
         setInput("");
         toast({ title: "已加入队列", description: "当前回合结束后自动发送", duration: 2200 });
+        return true;
       }
-      return;
+      // 程序自动发的（重试 / 建完任务后的第一条）不排队 —— 直接说「没发出去」，
+      // 让调用方把内容还回输入框。原来这里是静默 return：那条消息就没了。
+      return false;
     }
 
     // ⚠️ 这个会话在这次 send 里是哪个 —— 流回调靠它判断「事件还该不该写进当前视图」。
@@ -922,6 +1285,24 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     // 立即设置 loading 状态，防止重复发送
     setIsLoading(true);
     setRunningProjects((prev) => new Set(prev).add(streamProject));
+    /**
+     * 状态行：新一轮从零开始数。
+     *   · turnRef 记起点（tok/s 要的墙钟时长从这儿算）和步数（每个 tool_start +1）
+     *   · statusLine 只把**步数**清零 —— rounds / usage 要等这一轮结束的 stats 事件；
+     *     清零之前先留着上一轮那几个数（"最近一轮"的口径，见 composer-status-line.tsx）
+     */
+    turnRef.current = { project: streamProject, startedAt: Date.now(), steps: 0 };
+    // 行本身先立起来（哪怕是第一轮：轮/usage 那几格写 —，步数开始跳）。
+    // 上一轮的数字留着不动 —— 状态行是"最近一轮 + 正在跑的步数"，不是"当前这一轮的残影"。
+    setStatusLine((prev) => ({
+      steps: 0,
+      rounds: prev?.rounds ?? null,
+      outputTokens: prev?.outputTokens ?? null,
+      promptTokens: prev?.promptTokens ?? null,
+      cacheReadTokens: prev?.cacheReadTokens ?? null,
+      durationMs: prev?.durationMs ?? null,
+      totalTokens: prev?.totalTokens ?? 0,
+    }));
     /**
      * 用户是不是还停在这个会话上看。
      * 切走之后旧流继续收，但**不再写视图** —— 服务端照跑、历史照存，只是不往别的会话里灌。
@@ -998,15 +1379,27 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     let finalMessage = textToSend;
     const currentAttachments = [...attachments];
     
+    /**
+     * 附件的「可读路径」必须真的写进消息里 —— 否则模型只能知道文件名，找不到文件。
+     *
+     * 内核把上传的文件原样落在 `<项目>/uploads/`（legacy/routes-project.ts 的
+     * POST /api/upload-file），模型的 Read 既认绝对路径、也认工作目录（= 项目根）
+     * 的相对路径 —— 这里给**绝对路径**，不指望它去猜 cwd。
+     * （原来写的是「你可以使用 save_uploaded_file 工具」—— 内核里没有这个工具，
+     *   等于让模型自己满世界找；「+」菜单的文案现在与这条对齐。）
+     */
     if (currentAttachments.length > 0) {
-      const attachmentInfo = currentAttachments.map(a => 
-        `- 文件: ${a.name} (${a.type}, file_id: ${a.id})`
+      const projectRoot = projects.find((p) => p.port === projectId)?.path;
+      const attachmentInfo = currentAttachments.map(a =>
+        `- ${a.name}（${a.type || "未知类型"}，${formatBytes(a.size)}）：${projectRoot ? `${projectRoot}/uploads/${a.name}` : `uploads/${a.name}`}`
       ).join("\n");
-      finalMessage = `${textToSend}\n\n[用户上传了以下文件，你可以使用 save_uploaded_file 工具将文件保存到项目中]\n${attachmentInfo}`;
+      finalMessage = `${textToSend}\n\n[用户上传了以下文件，已放在项目目录下，可直接用 Read 读取]\n${attachmentInfo}`;
       // 清空附件列表
       setAttachments([]);
     }
-    
+
+    // 这一次请求有没有失败（失败 = 内容归调用方处置，见函数头的返回值说明）
+    let failed = false;
     try {
       // 获取启用的提示词替换规则
       const enabledReplacements = getEnabledReplacements();
@@ -1016,21 +1409,27 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           message: finalMessage,
           route: currentRoute,
           if_history: !isNewProject,
-          if_thinking: settings.enableThinking,
+          // ── 原来这里是设置浮层里的四个开关，浮层现在只剩模型选择 ──
+          // 值**按「开关开着」的默认值冻结**（不是随手删掉）：内核收到的东西
+          // 必须和以前"用户没动过设置"时一致 —— 删 UI 不能顺手变成改行为。
+          // （localStorage 里存的老 chat_settings 还留着这些键，但不再被读。）
+          if_thinking: true,          // 原 settings.enableThinking（默认开）
           if_new_project: isNewProject,
           model: settings.model,
-          continuous_chat: settings.continuousChat,
-          if_memory: settings.enableMemory,
+          continuous_chat: true,      // 原 settings.continuousChat（默认开）
+          if_memory: true,            // 原 settings.enableMemory（默认开）
           project_id: projectId || undefined,
           prompt_replacements: enabledReplacements.length > 0 ? enabledReplacements : undefined,
           if_hot_reload: enableHotReload,
-          if_recommend_files: settings.enableRecommendFiles,
+          if_recommend_files: true,   // 原 settings.enableRecommendFiles（默认开）
           attachments: currentAttachments.length > 0 ? currentAttachments.map(a => ({
             file_id: a.id,
             filename: a.name,
             mime_type: a.type,
             size: a.size,
           })) : undefined,
+          // 关着的时候是 undefined —— JSON.stringify 会整个丢掉，请求体和以前一致
+          mode: swarmOn ? "swarm" : undefined,
           ai_style_x: aiStyle.x,
           ai_style_y: aiStyle.y,
         },
@@ -1050,6 +1449,10 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           } 
           // 处理 ask_user 事件 - 放到消息流中
           else if (event.type === "ask_user") {
+            // 审批类（approval）带上「同意并记住」的形状（remember_rule，如 Bash(rm -rf /tmp/x)）；
+            // 普通提问没有这两个字段，AskUserInline 就不会画「记住」选项
+            const approval = event.approval === true;
+            const rememberRule = typeof event.remember_rule === "string" ? event.remember_rule : undefined;
             applyMessages((prev) =>
               prev.map((msg) =>
                 msg.id === aiMessageId
@@ -1060,6 +1463,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
               questionType: event.question_type || "single",
               suggestions: event.suggestions,
                         answered: false,
+                        approval,
+                        remember_rule: rememberRule,
                       },
                       events: [
                         ...(msg.events || []),
@@ -1067,7 +1472,9 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                           type: "ask_user" as const, 
                           question: event.question,
                           questionType: event.question_type || "single",
-                          suggestions: event.suggestions 
+                          suggestions: event.suggestions,
+                          approval,
+                          remember_rule: rememberRule,
                         }
                       ]
                     }
@@ -1219,6 +1626,24 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             if (fileModifyTools.includes(event.tool || "")) {
               onFileModifying?.(true);
             }
+
+            // 状态行的「步」= 一个 tool_start 记一步（这是面板能实时看见的最小单位；
+            // 内核 stats 里那个 rounds 要等这一轮跑完才有）。切走再切回来时行可能是空的，
+            // 顺手把它立起来 —— 回合还在跑的时候状态行不该整条消失。
+            const turn = turnRef.current;
+            if (turn && turn.project === streamProject) {
+              turn.steps += 1;
+              const steps = turn.steps;
+              setStatusLine((prev) => ({
+                steps,
+                rounds: prev?.rounds ?? null,
+                outputTokens: prev?.outputTokens ?? null,
+                promptTokens: prev?.promptTokens ?? null,
+                cacheReadTokens: prev?.cacheReadTokens ?? null,
+                durationMs: prev?.durationMs ?? null,
+                totalTokens: prev?.totalTokens ?? 0,
+              }));
+            }
             
             applyMessages((prev) =>
               prev.map((msg) =>
@@ -1367,19 +1792,36 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             const sonnet = usage?.sonnet;
             const opus = usage?.opus;
             
-            // 合并 token 用于 stats 显示
-            const totalInputTokens = (sonnet?.input_tokens || 0) + (opus?.input_tokens || 0);
-            const totalOutputTokens = (sonnet?.output_tokens || 0) + (opus?.output_tokens || 0);
-            const totalCacheReadTokens = (sonnet?.cache_read_tokens || 0) + (opus?.cache_read_tokens || 0);
-            const totalCacheCreationTokens = (sonnet?.cache_creation_tokens || 0) + (opus?.cache_creation_tokens || 0);
-            
-            setStats({
-              input_tokens: totalInputTokens,
-              output_tokens: totalOutputTokens,
-              cache_read_tokens: totalCacheReadTokens,
-              cache_creation_tokens: totalCacheCreationTokens,
-              rounds: event.rounds || 0,
-            });
+            /**
+             * 状态行落定 —— 这一轮的 rounds / token 到了。
+             *
+             * token 走 lib/models 的 usageEntries 归一化：**新的 stats 载荷是
+             * `usage.breakdown[]`（且没有 sonnet/opus）**，以前这里只加 sonnet+opus
+             * 两个桶，结果是全 0。归一化之后两代形状都能算。
+             */
+            const entries = usageEntries(usage);
+            const turn = turnRef.current;
+            const startedAt = turn && turn.project === streamProject ? turn.startedAt : null;
+            if (entries.length > 0) {
+              const sum = (pick: (e: (typeof entries)[number]) => number) =>
+                entries.reduce((acc, e) => acc + pick(e), 0);
+              // 提示侧 = input + cache_read + cache_creation（缓存命中率与 C% 的分母，见状态行注释）
+              const promptTokens = sum((e) => e.input_tokens + e.cache_read_tokens + e.cache_creation_tokens);
+              const outputTokens = sum((e) => e.output_tokens);
+              setStatusLine((prev) => ({
+                steps: turn?.steps ?? prev?.steps ?? 0,
+                rounds: event.rounds ?? 0,
+                outputTokens,
+                promptTokens,
+                cacheReadTokens: sum((e) => e.cache_read_tokens),
+                durationMs: startedAt != null ? Date.now() - startedAt : null,
+                // 跨轮累计：提示侧 + 输出侧（口径见 composer-status-line.tsx）
+                totalTokens: (prev?.totalTokens ?? 0) + promptTokens + outputTokens,
+              }));
+            } else if (event.rounds != null) {
+              // 只有 rounds、没有 usage：至少把轮数落上，别让整行空着
+              setStatusLine((prev) => (prev ? { ...prev, rounds: event.rounds ?? 0 } : prev));
+            }
             
             // 注意：不再在 stats 时触发 onBuildStart，改为在 build_start 事件时触发
             // 这样 loading 时间更短，用户体验更好
@@ -1561,6 +2003,23 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                   : msg
               )
             );
+          } else if (event.type === "turn_diff") {
+            // 这一轮改了什么（内核在回合末发一次）。空 diff（一轮只读）内核不发、
+            // 兼容层也不会映射出门 —— 这里再挡一道：没有文件条目就什么都不落，
+            // 免得消息里挂一个空块。
+            //
+            // 同时落两份：`turn_diff`（给已有的 TurnDiffCard，含 diff 正文）与
+            // `turn_files`（给每轮文件卡片；刷新后由 /api/history 回填同一份数据）。
+            const files = event.files ?? [];
+            if (files.length === 0) return;
+            const turnDiff = { files, truncated: event.truncated === true, diff: event.diff ?? "" };
+            applyMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === aiMessageId
+                  ? { ...msg, turn_diff: turnDiff, turn_files: files }
+                  : msg
+              )
+            );
           } else if (event.type === "subagent") {
             // 子代理/后台任务的状态与流式内容 → 顶部状态栏
             setSubagents((prev) => reduceSubagents(prev, event as never));
@@ -1596,6 +2055,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             : msg
         )
       );
+      // 没发出去 → 告诉调用方（内容归它处置：放回输入框），别让它以为已经发出了
+      failed = true;
     } finally {
       // 回合结束 → 服务端历史已经是权威（这一轮已写进去），镜像退休。
       // 放在清 running 之前，保证切回来时走 loadHistory 拿到完整结果。
@@ -1610,7 +2071,13 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         return next;
       });
       setIsLoading(false);
+      // 状态行的计时器退休（numbers 已经在 stats 里落定；这里是兜底 —— 中断/报错
+      // 的那一轮没有 stats，停掉计时即可，上一轮的数字留着别动）
+      if (turnRef.current?.project === streamProject) {
+        turnRef.current = null;
+      }
     }
+    return !failed;
   };
 
   // 拉历史子代理（A3）—— 否则刷新之后顶栏空着，之前跑过的就点不进去了。
@@ -1630,6 +2097,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           parentId: s.parentId || undefined,      // A5 树的父子关系
           status: s.status === "error" ? "error" : "done",
           steps: [], stepCount: 0,
+          // token 用量（路由从任务表带出来的那份）：null = 没记录 / 没上报
+          usage: s.usage ?? undefined,
         })));
       })
       .catch(() => { /* 拉不到就算了，不影响实时通道 */ });
@@ -1651,7 +2120,13 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     }
   };
 
-  const handleAskUserSubmit = async (messageId: string, answer: string | string[]) => {
+  /**
+   * 回答提问 / 确认审批。
+   *
+   * remember 只有**审批**这条路会带（「同意并记住这个形状」，见 MessageList 的
+   * AskUserInline）：内核据此把这次调用的形状落成会话规则。回答普通提问时不传。
+   */
+  const handleAskUserSubmit = async (messageId: string, answer: string | string[], remember?: boolean) => {
     // 标记该消息的 askUser 已回复，并保存用户的回复
     setMessages((prev) =>
       prev.map((msg) =>
@@ -1665,8 +2140,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
     const answerToSubmit = Array.isArray(answer) ? JSON.stringify(answer) : answer;
     if (currentSessionId.current) {
       try {
-        await submitUserInput(currentSessionId.current, answerToSubmit);
-        console.log("用户输入已提交:", answerToSubmit);
+        await submitUserInput(currentSessionId.current, answerToSubmit, remember);
+        console.log("用户输入已提交:", answerToSubmit, remember ? "（并记住）" : "");
       } catch (error) {
         console.error("提交用户输入失败:", error);
       }
@@ -1980,7 +2455,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   // 判断是否需要居中内容（有消息但无版本，内容不要撑太开）
   const shouldCenterContent = latestVersion === 0 && messages.length > 0;
 
-  // ── 斜杠命令：/plan 开关 + /goal ────────────────────────
+  // ── 斜杠命令：/plan 开关 + /goal + 「+」菜单那三条 ──────
   // 斜杠菜单只认「第一行、以 / 开头、还没打空格」的查询词（见 slash-menu.tsx 的 slashQuery），
   // 所以带参数的写法**匹配不到**：
   //   · /plan  → **一条命令做开关**：不在计划模式时叫「计划模式」，在的时候叫「退出计划模式」
@@ -2021,6 +2496,11 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           insert: "/goal ",
           keywords: ["goal", "mubiao", "目标"],
         },
+    // 下面三条和「+」菜单是同一批能力 —— 斜杠是**全集**，从哪儿都得能唤醒。
+    // 都没有 insert（选中即清空输入框），动作由 handleSlashCommand 按 name 分派。
+    { name: "file", title: "上传文件", description: "任意格式，落到任务的 uploads/，模型可直接读", hint: "Enter 执行", keywords: ["file", "upload", "wenjian", "上传", "附件"] },
+    { name: "capture", title: "框选截屏", description: "框选屏幕，截图作为附件进这一轮", hint: "Enter 执行", keywords: ["capture", "screen", "截图", "jietu", "screenshot"] },
+    { name: "swarm", title: "Swarm 模式", description: "用多个子代理并行处理", hint: "Enter 执行", keywords: ["swarm", "parallel", "并行", "bingxing"] },
   ], [planMode, goal]);
 
   // ── 新会话页的斜杠命令 ──────────────────────────────────
@@ -2040,10 +2520,18 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
       ? { name: "plan", title: "取消计划模式（新任务）", description: "新任务将直接动手，不再先出计划", hint: "Enter 执行", keywords: ["plan", "jihua"] }
       : { name: "plan", title: "计划模式（新任务）", description: "新任务先调研、出计划、等你批准再动手", hint: "Enter 执行", keywords: ["plan", "jihua"] },
     { name: "goal", title: "设定长期目标", description: "跨多轮自动推进；建好任务后自动生效", hint: "继续输入", insert: "/goal ", keywords: ["goal", "mubiao", "目标"] },
+    // 和项目页同名的三条（斜杠是全集）；这里还没有线程，文件 / 截屏点了会先提示"先建好任务"
+    { name: "file", title: "上传文件", description: "任意格式，落到任务的 uploads/，模型可直接读", hint: "Enter 执行", keywords: ["file", "upload", "wenjian", "上传", "附件"] },
+    { name: "capture", title: "框选截屏", description: "框选屏幕，截图作为附件进这一轮", hint: "Enter 执行", keywords: ["capture", "screen", "截图", "jietu", "screenshot"] },
+    { name: "swarm", title: "Swarm 模式", description: "用多个子代理并行处理", hint: "Enter 执行", keywords: ["swarm", "parallel", "并行", "bingxing"] },
   ], [draftPlan]);
 
   const handleStartSlashCommand = (cmd: SlashCommand) => {
     if (cmd.name === "plan") { toggleDraftPlan(); return; }
+    // 这三条和「+」菜单共用同一批 handler；Swarm / 计划一样是粘在本地的（建好任务后接着生效）
+    if (cmd.name === "file") { triggerFilePick(); return; }
+    if (cmd.name === "capture") { void handleCapture(); return; }
+    if (cmd.name === "swarm") { toggleSwarm(); return; }
     // /goal 只把输入框置成 "/goal "（命令的 insert），接着写目标描述即可：
     // 落地分两步 —— submitStartDraft 存草稿，App.handleCreateProject 建任务时写进内核。
   };
@@ -2070,10 +2558,93 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
       }
       return;
     }
+    // 「+」菜单那三条 —— 斜杠是全集，走的是同一批 handler
+    if (cmd.name === "file") { triggerFilePick(); return; }
+    if (cmd.name === "capture") { void handleCapture(); return; }
+    if (cmd.name === "swarm") { toggleSwarm(); return; }
   };
 
   /** 左下角 chip 的「点击退出」和斜杠命令走同一条路 */
   const exitPlanMode = () => applyPlanMode(false);
+
+  // ── 「+」菜单的条目 ─────────────────────────────────────
+  // 两个页面同一批、同一顺序（/ 是全集，+ 是精选）。勾不勾**一律从真实状态派生**：
+  // 计划看 planMode / draftPlan，目标看有没有目标，Swarm 看本地旗标 —— 不另开一份
+  // 本地变量，否则会出现"模型已经退出计划模式、勾还亮着"那样的假象。
+  // 数组每轮重建即可：条目就这几条、没有重计算，写成 useMemo 反而容易吃到旧闭包。
+  const plusItems: PlusMenuItem[] = [
+    { key: "file", label: "文件", hint: "任意格式（≤20MB），落到任务的 uploads/，模型可直接读", icon: <Paperclip className="size-4" />, onSelect: triggerFilePick },
+    { key: "capture", label: "截屏", hint: "框选屏幕并评论", icon: <Scan className="size-4" />, onSelect: () => void handleCapture() },
+    {
+      key: "goal", label: "目标", hint: "设定目标并持续推进", icon: <Target className="size-4" />,
+      on: !!goal,
+      // 不在这里造目标：把输入框置成 /goal，交给既有的命令流程（和 /goal 菜单项同一条路）
+      onSelect: () => { setInput("/goal "); focusComposer(); },
+    },
+    { key: "plan", label: "计划", hint: "先计划再动手", icon: <ClipboardList className="size-4" />, on: planMode, onSelect: () => applyPlanMode(!planMode) },
+    { key: "swarm", label: "Swarm", hint: "用多个子代理并行处理", icon: <Network className="size-4" />, on: swarmOn, onSelect: toggleSwarm },
+  ];
+
+  /** 起始页的同名菜单：还没有线程，目标 / 计划落在草稿上（建好任务后由 App 落地） */
+  const startPlusItems: PlusMenuItem[] = [
+    { key: "file", label: "文件", hint: "任意格式（≤20MB），落到任务的 uploads/，模型可直接读", icon: <Paperclip className="size-4" />, onSelect: triggerFilePick },
+    { key: "capture", label: "截屏", hint: "框选屏幕并评论", icon: <Scan className="size-4" />, onSelect: () => void handleCapture() },
+    {
+      key: "goal", label: "目标", hint: "设定目标并持续推进", icon: <Target className="size-4" />,
+      on: !!draftGoal,
+      onSelect: () => { setStartDraft("/goal "); focusComposer(); },
+    },
+    { key: "plan", label: "计划", hint: "先计划再动手", icon: <ClipboardList className="size-4" />, on: draftPlan, onSelect: toggleDraftPlan },
+    { key: "swarm", label: "Swarm", hint: "用多个子代理并行处理", icon: <Network className="size-4" />, on: swarmOn, onSelect: toggleSwarm },
+  ];
+
+  // ── 左下角的模式药丸 ───────────────────────────────────
+  // 已经装备上的模式摊成药丸（见 mode-chip.tsx），点了就关。
+  // **和「+」菜单写的是同一份状态**：Swarm 就是上面那个 swarmOn / toggleSwarm，
+  // 不另开一份本地变量（两份状态的下场就是药丸和菜单对不上）。
+  // 计划模式**不在这里**：它有自己的 chip（在内核那条 permission 轴上，走 leftActions），
+  // 再画一个就是第二颗了。以后要加模式：往这张表里追一条即可。
+  const modeChips: ModeChipSpec[] = swarmOn
+    ? [{
+        key: "swarm",
+        label: "Swarm",
+        title: "Swarm 模式（点击取消）",
+        icon: <Network className="size-3" />,
+        onClear: toggleSwarm,
+      }]
+    : [];
+
+  /**
+   * 模型设置对话框 —— **一个状态、两份实例**（起始页 / 项目页各在自己的返回树里渲染一份）。
+   * 两个 composer 都可以有，但同一时刻只会挂一个（两棵返回树是互斥的），
+   * 所以这里只是一段可复用的 JSX，不需要为它开 portal。
+   */
+  const modelSettingsDialog = (
+    <ModelSettingsDialog
+      open={modelDialogOpen}
+      onOpenChange={setModelDialogOpen}
+      model={settings.model}
+      onModelChange={applyModel}
+    />
+  );
+
+  /**
+   * 全窗口拖拽蒙层 —— 和上面那个对话框一样，**一份 JSX、两棵返回树各渲染一次**
+   * （起始页 / 项目页互斥，同一时刻只会挂一个）。
+   * 蒙层文案要说清「传到哪个项目」：拖进来的人最怕的就是不知道文件去哪了。
+   */
+  const dropOverlay = (
+    <DropFilesOverlay
+      targetLabel={
+        projectId
+          ? (projects.find((p) => p.port === projectId)?.display_name
+            || projects.find((p) => p.port === projectId)?.name_text
+            || `任务 ${projectId}`)
+          : null
+      }
+      onFiles={handleDroppedFiles}
+    />
+  );
 
   // 没选任务时的起始页：居中一个输入框，直接说话就开工（对齐 codex / DSH）
   if (!projectId) {
@@ -2094,12 +2665,13 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
 
         {/* 输入区：贴底（留出和侧栏一致的下边距） */}
         <div className="px-6 pb-6">
-          <div className="mx-auto w-full max-w-[640px]">
-            {/* ⚠️ 这张卡片**不能加 overflow-hidden**：斜杠菜单浮在输入框上方，
-                一旦被裁就只剩半行（实测踩过）。圆角靠子元素自身不需要裁剪。 */}
-            <div className="flex flex-col rounded-2xl border border-border-default bg-surface-raised shadow-sm transition-[border-color,box-shadow] duration-fast focus-within:border-accent-ring focus-within:shadow-focus">
-              {/* 左上角：项目 / 文件夹选择 */}
-              <div className="flex items-center gap-1.5 px-2.5 pt-2">
+          {/* 宽度：860 = mnemo 起始页那张卡片的宽度（原来 640 太瘦，长句一眼就折行） */}
+          <div ref={composerWrapRef} className="mx-auto w-full max-w-[860px]">
+            {/* 卡片外观由 ComposerBox 统一提供（和项目页同一份实现，不再手搓第二张卡片）；
+                左上角的项目 / 文件夹选择器改走 topLeft 插槽。 */}
+            <ComposerBox
+              autoFocus
+              topLeft={
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <button
@@ -2138,23 +2710,29 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-              </div>
-
-              
-
-              <ComposerBox
-                autoFocus
+              }
                 value={startDraft}
                 onChange={setStartDraft}
                 onSubmit={submitStartDraft}
+                onPasteFiles={handleDroppedFiles}
                 sendDisabled={!startDraft.trim()}
                 sendTitle="创建任务并开始"
                 placeholder={NEW_TASK_PLACEHOLDER}
                 hint="Enter 开始 · Shift+Enter 换行"
                 commands={startCommands}
                 onSlashCommand={handleStartSlashCommand}
+                // 已装备的模式（和「+」菜单写的是同一份状态，见 modeChips）
+                chips={<ModeChips chips={modeChips} />}
+                // 右下角：模型 chip（挨着发送按钮）。起始页也要有 —— 模型不是「项目设置」，
+                // 是这一轮发给内核的字段之一。
+                rightActions={<ModelChip value={settings.model} onChange={applyModel} saving={modelSaving} />}
                 leftActions={
                   <>
+                    {/* 「+」菜单在最前（文件 / 截屏 / 目标 / 计划 / Swarm）—— 和项目页同一份组件、同一批条目 */}
+                    <ComposerPlusMenu items={startPlusItems} />
+                    {/* 模型设置（API Key / Base URL / 模型）。**全局的一份**，和项目无关，
+                        所以起始页也留入口 —— 第一次用的人通常先在这里说话。 */}
+                    <ModelSettingsButton onOpen={() => setModelDialogOpen(true)} />
                     {/* 新会话页还没有项目，所以这里配的是**新项目的默认权限**，
                         存 localStorage，建项目时写进线程 metadata。 */}
                     <PermissionSelect
@@ -2194,13 +2772,16 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                     )}
                   </>
                 }
-                className="rounded-none border-0 bg-transparent shadow-none focus-within:border-transparent focus-within:shadow-none"
               />
-            </div>
 
 
           </div>
         </div>
+
+        {/* 模型设置对话框（起始页这份实例；项目页另有一份，同一个状态） */}
+        {modelSettingsDialog}
+        {/* 拖进来就上传的蒙层（起始页没有任务可落，蒙层会把话说清） */}
+        {dropOverlay}
       </div>
     );
   }
@@ -2269,6 +2850,7 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         ref={messagesContainerRef}
         className={`overflow-y-auto transition-all duration-300 ease-out ${isCompactMode ? 'flex-[0] opacity-0' : 'flex-1 opacity-100'}`}
         onScroll={handleScroll}
+        onContextMenu={onMessagesContextMenu}
       >
         {!isCompactMode && (
           <div className={`transition-all duration-300 ${shouldCenterContent ? 'max-w-2xl mx-auto' : ''}`}>
@@ -2295,6 +2877,9 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           </div>
         )}
       </div>
+
+      {/* 选中文字 → 右键「添加到评论」的菜单（只在上面这块消息区里出现） */}
+      {quoteMenu}
 
       {/* Build 错误提示（合并内部错误和外部错误） */}
       {(buildError || externalBuildError) && (
@@ -2421,8 +3006,8 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           </div>
         )}
         
-        <div className={`relative ${isCompactMode ? 'flex flex-1 flex-col' : ''}`}>
-          {/* 隐藏的文件输入（附件按钮在 ComposerBox 的 leftActions 插槽里） */}
+        <div ref={composerWrapRef} className={`relative ${isCompactMode ? 'flex flex-1 flex-col' : ''}`}>
+          {/* 隐藏的文件输入（入口在 ComposerBox 的「+」菜单里，见 leftActions 插槽） */}
           <input
             ref={fileInputRef}
             type="file"
@@ -2443,12 +3028,16 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           />
 
           {/* 输入卡片 —— 和起始页**同一个 ComposerBox**（结构 / 发送按钮 / 斜杠菜单只有一份）。
-              项目页多出来的东西（附件 / 权限 / 计划模式 / 设置 / 朗读）全走 leftActions 插槽，
-              长期目标状态条走 topLeft 插槽 —— 没有目标时 GoalBar 自己返回 null，不占位置。 */}
+              项目页多出来的东西（「+」菜单 / 权限 / 计划模式 / 设置 / 朗读）全走 leftActions 插槽，
+              长期目标状态条走 topLeft 插槽 —— 没有目标时 GoalBar 自己返回 null，不占位置。
+              模型 chip 走 rightActions（右下角，发送按钮左边）—— 起始页也一样。 */}
           <ComposerBox
+            ref={composerRef}
+            autoFocus
             value={input}
             onChange={setInput}
             onSubmit={() => handleSend()}
+            onPasteFiles={handleDroppedFiles}
             placeholder={COMPOSER_PLACEHOLDER}
             hint="Enter 发送 · Shift+Enter 换行"
             sending={isLoading}
@@ -2456,10 +3045,19 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             commands={slashCommands}
             onSlashCommand={handleSlashCommand}
             topLeft={goal ? <GoalBar goal={goal} pending={goalPending} onAction={runGoalBarAction} /> : undefined}
-            className="mx-auto w-full max-w-[880px] rounded-xl"
+            className="mx-auto w-full max-w-[1000px]"
+            // 已装备的模式（和「+」菜单写的是同一份状态，见 modeChips）
+            chips={<ModeChips chips={modeChips} />}
+            // 右下角：模型 chip（挨着发送按钮）
+            rightActions={<ModelChip value={settings.model} onChange={applyModel} saving={modelSaving} />}
             textareaClassName={isCompactMode ? 'min-h-0 flex-1' : undefined}
             leftActions={
               <>
+                {/* 「+」菜单在最前（文件 / 截屏 / 目标 / 计划 / Swarm）—— 和起始页同一份组件、同一批条目。
+                    原来那个回形针按钮收进菜单的「文件」里：附件只剩这一个入口。上传中禁用，避免重复传。 */}
+                <ComposerPlusMenu items={plusItems} disabled={isUploading} />
+                {/* 模型设置（API Key / Base URL / 模型）—— 齿轮紧挨着「+」，和起始页同一份组件 */}
+                <ModelSettingsButton onOpen={() => setModelDialogOpen(true)} />
                 {/* 计划模式 chip：只在开启时出现；点一下 = POST planMode:false */}
                 {planMode && (
                   <button
@@ -2478,22 +3076,6 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
                 )}
 
 
-            {/* 附件上传按钮 */}
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isUploading || !projectId}
-              className="flex items-center justify-center w-7 h-7 text-muted-foreground hover:text-foreground hover:bg-muted rounded-full transition-colors disabled:opacity-50"
-              title="上传附件 (最大 20MB)"
-            >
-              {isUploading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Paperclip className="w-3.5 h-3.5" />
-              )}
-            </button>
-            
-            
             {/* 权限模式 —— 和新会话页**同一个组件** */}
             <PermissionSelect
               surface="session"
@@ -2502,164 +3084,12 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
               disabled={!projectId}
             />
 
-            {/* 设置按钮 */}
-            <Popover open={settingsOpen} onOpenChange={setSettingsOpen}>
-              <PopoverTrigger asChild>
-                <button
-                  type="button"
-                  aria-label="设置"
-                  title="设置"
-                  className="flex size-7 items-center justify-center rounded-full text-text-tertiary transition-colors duration-fast hover:bg-surface-hover hover:text-text-primary"
-                >
-                  <Settings2 className="size-3.5" />
-                </button>
-              </PopoverTrigger>
-            <PopoverContent className="w-64 p-3" align="start" side="top">
-              <div className="space-y-4">
-                {/* 模型选择 */}
-                <div className="space-y-2">
-                  <Label className="text-xs font-medium text-muted-foreground">Model</Label>
-                  <div className="space-y-1">
-                    {MODEL_OPTIONS.map((option) => (
-                      <button
-                        key={option.value}
-                        type="button"
-                        onClick={() => updateSettings({ model: option.value })}
-                        className={`w-full flex items-center justify-between px-3 py-2 text-sm rounded-md transition-colors ${
-                          settings.model === option.value
-                            ? "bg-primary/10 text-primary"
-                            : "hover:bg-muted"
-                        }`}
-                      >
-                        <span>{option.label}</span>
-                        {settings.model === option.value && (
-                          <Check className="w-4 h-4" />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Think 开关 */}
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="thinking-switch" className="text-xs font-medium text-muted-foreground">
-                    Enable Thinking
-                  </Label>
-                  <Switch
-                    id="thinking-switch"
-                    checked={settings.enableThinking}
-                    onCheckedChange={(checked) => updateSettings({ enableThinking: checked })}
-                  />
-                </div>
-
-                {/* 连续对话模式开关 */}
-                <div className="flex items-center justify-between">
-                  <div>
-                    <Label htmlFor="continuous-chat-switch" className="text-xs font-medium text-muted-foreground">
-                      Continuous Chat
-                    </Label>
-                    <p className="text-[10px] text-muted-foreground/60 mt-0.5">使用完整对话历史</p>
-                  </div>
-                  <Switch
-                    id="continuous-chat-switch"
-                    checked={settings.continuousChat}
-                    onCheckedChange={(checked) => updateSettings({ continuousChat: checked })}
-                  />
-                </div>
-
-                {/* 记忆模式开关 */}
-                <div className="flex items-center justify-between">
-                  <div>
-                    <Label htmlFor="memory-switch" className="text-xs font-medium text-muted-foreground">
-                      Memory
-                    </Label>
-                    <p className="text-[10px] text-muted-foreground/60 mt-0.5">携带长期记忆</p>
-                  </div>
-                  <Switch
-                    id="memory-switch"
-                    checked={settings.enableMemory}
-                    onCheckedChange={(checked) => updateSettings({ enableMemory: checked })}
-                  />
-                </div>
-
-                {/* 推荐文件开关 - 只在非 Full Chat 模式下显示 */}
-                {!settings.continuousChat && (
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <Label htmlFor="recommend-files-switch" className="text-xs font-medium text-muted-foreground">
-                        Recommend Files
-                      </Label>
-                      <p className="text-[10px] text-muted-foreground/60 mt-0.5">AI 推荐相关文件</p>
-                    </div>
-                    <Switch
-                      id="recommend-files-switch"
-                      checked={settings.enableRecommendFiles}
-                      onCheckedChange={(checked) => updateSettings({ enableRecommendFiles: checked })}
-                    />
-                  </div>
-                )}
-
-                {/* 分割线 */}
-                <div className="border-t border-border my-2" />
-
-                {/* 语音朗读开关 */}
-                <div className="flex items-center justify-between">
-                  <div>
-                    <Label htmlFor="speech-switch" className="text-xs font-medium text-muted-foreground">
-                      Voice Reading
-                    </Label>
-                    <p className="text-[10px] text-muted-foreground/60 mt-0.5">流式语音朗读</p>
-                  </div>
-                  <Switch
-                    id="speech-switch"
-                    checked={speechSynthesis.isEnabled}
-                    onCheckedChange={(checked) => speechSynthesis.setEnabled(checked)}
-                  />
-                </div>
-
-                {/* 语音设置（仅在启用时显示） */}
-                {speechSynthesis.isEnabled && (
-                  <>
-                    {/* 音量调节 */}
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-xs font-medium text-muted-foreground">
-                          音量: {Math.round(speechSynthesis.settings.volume * 100)}%
-                        </Label>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="1"
-                        step="0.1"
-                        value={speechSynthesis.settings.volume}
-                        onChange={(e) => speechSynthesis.updateSettings({ volume: parseFloat(e.target.value) })}
-                        className="w-full h-1.5 bg-muted rounded-lg appearance-none cursor-pointer accent-primary"
-                      />
-                    </div>
-
-                    {/* 语音选择 */}
-                    {speechSynthesis.voices.length > 0 && (
-                      <div className="space-y-1.5">
-                        <Label className="text-xs font-medium text-muted-foreground">语音</Label>
-                        <select
-                          value={speechSynthesis.currentVoice?.voice_id || ''}
-                          onChange={(e) => speechSynthesis.setVoice(e.target.value)}
-                          className="w-full px-2 py-1.5 text-xs bg-muted rounded-md border-0 focus:ring-1 focus:ring-primary"
-                        >
-                          {speechSynthesis.voices.map((voice) => (
-                            <option key={voice.voice_id} value={voice.voice_id}>
-                              {voice.name}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            </PopoverContent>
-            </Popover>
+            {/* 原来这里挂着一个「设置」浮层（里面只剩一张模型表）。现在：
+                · 模型 → 右下角的 chip（见 model-chip.tsx）
+                · 齿轮 → 上面那排 leftActions 里的「模型设置」对话框入口（API Key / Base URL / 模型）
+                浮层里那四个开关（Think / Continuous Chat / Memory / Recommend Files）和朗读
+                更早以前就撤了，值冻结在发消息的地方（见 handleSend）；朗读的 hook 和
+                朗读中的暂停/停止按钮留着，之前已经开着的人不受影响，只是不再有入口去改。 */}
             
             {/* 语音控制按钮（朗读时显示） */}
             {speechSynthesis.isEnabled && speechSynthesis.isSpeaking && (
@@ -2689,9 +3119,24 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
               </>
             }
           />
+
+          {/* 状态行 —— 卡片**下面**那一行小字（轮/步/tok/s · 累计/缓存 · 上下文）。
+              数据自己攒（见 statusLine / turnRef）：没数据时整条不渲染，跑着的时候步数是活的。
+              宽度和卡片对齐（同一档 max-w），左右各缩进 8px 让数字别贴死卡片边。
+              紧凑模式（那块 9/4 的小窗）里不显示：那里寸土寸金。 */}
+          {!isCompactMode && (
+            <ComposerStatusLine
+              data={statusLine}
+              model={settings.model}
+              className="mx-auto mt-1.5 w-full max-w-[1000px] px-2"
+            />
+          )}
         </div>
         </div>{/* shouldCenterContent 内部容器闭合 */}
       </div>
+
+      {/* 模型设置对话框（项目页这份实例；起始页另有一份，同一个状态） */}
+      {modelSettingsDialog}
 
       {/* 用户输入对话框 */}
       <UserInputDialog
@@ -2790,6 +3235,14 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 拖进来就上传的蒙层（文案里写着会传到哪个任务） */}
+      {railSlot && railItems.length >= 2 && createPortal(
+        <PromptRail items={railItems} onJump={jumpToMessage} getScrollContainer={getMessagesScrollContainer} />,
+        railSlot,
+      )}
+
+      {dropOverlay}
       </div>{/* 紧凑模式内部容器闭合 */}
     </div>
   );

@@ -1,12 +1,12 @@
 import * as React from "react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowUp, Loader2, Square, Shield, ShieldOff, Eye, ChevronDown, Check } from "lucide-react";
 import { SlashMenu, filterSlashCommands, slashQuery, type SlashCommand } from "@/components/slash-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { PERM_COPY, usePermissionPresets, presetOf, type PermissionMode, type PermissionPreset } from "@/lib/permission";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
+import { ComposerInput, type ComposerHandle } from "@/components/composer-input";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,10 +16,16 @@ import { cn } from "@/lib/utils";
  * 很快就漂移了（发送按钮长得不一样、提示文案一个在占位符里一个在外面）。
  * 现在两处都用这个组件，差异只通过 props 表达。
  *
+ * 正文是 `ComposerInput`（contenteditable）而不是 `<textarea>` —— 原因写在
+ * composer-input.tsx 顶部：要在文字中间画「引用 chip」，textarea 里放不下任何元素。
+ * 这里只留卡片的几何、斜杠菜单和插槽；输入、换行、粘贴、长高都在那边。
+ *
  * 插槽：
  *   topLeft      左上角（新会话页放「选择项目」）
  *   leftActions  左下角按钮组（附件 / 权限 / 设置）
+ *   chips        左下角状态药丸（已装备的模式，如 Swarm；见 mode-chip.tsx）
  *   hint         左下角提示文字
+ *   rightActions 右下角（发送按钮**左边**那块，模型 chip 就在这儿；见 model-chip.tsx）
  */
 export interface ComposerBoxProps {
   value: string;
@@ -33,6 +39,10 @@ export interface ComposerBoxProps {
   topLeft?: React.ReactNode;
   /** 左下角按钮组 */
   leftActions?: React.ReactNode;
+  /** 左下角状态药丸 —— 排在 leftActions **之后**（按钮组保持原位，药丸跟在末尾，像 mnemo 的 progress-chip） */
+  chips?: React.ReactNode;
+  /** 右下角，发送按钮**左边**（模型 chip）。两个输入框都挂它 */
+  rightActions?: React.ReactNode;
   autoFocus?: boolean;
   disabled?: boolean;
   /** 发送中（按钮变成「停止」） */
@@ -40,6 +50,7 @@ export interface ComposerBoxProps {
   onStop?: () => void;
   /** 外层宽度类（新会话页窄、项目页宽） */
   className?: string;
+  /** 正文输入区（contenteditable）的额外类 —— 紧凑模式用它把正文撑开 */
   textareaClassName?: string;
   /** 允许输入但禁止发送（比如没选项目） */
   sendDisabled?: boolean;
@@ -48,30 +59,25 @@ export interface ComposerBoxProps {
   commands?: SlashCommand[];
   /** 选中某条斜杠命令（输入框内容已按 command.insert 替换过） */
   onSlashCommand?: (cmd: SlashCommand) => void;
+  /** 剪贴板里贴进来的文件（Cmd+V 一张截图）—— 接到上传通道 */
+  onPasteFiles?: (files: File[]) => void;
+  /** 给外面用的把手：插入引用 chip（「添加到评论」）、聚焦（React 19 的 ref 就是个普通 prop） */
+  ref?: React.Ref<ComposerHandle>;
 }
 
 export function ComposerBox({
   value, onChange, onSubmit,
   placeholder = "交给我一件事：查资料、写代码、做分析、跑命令都行…",
   hint = "Enter 发送 · Shift+Enter 换行",
-  topLeft, leftActions,
+  topLeft, leftActions, chips, rightActions,
   autoFocus, disabled, sending, onStop,
   className, textareaClassName, sendDisabled, sendTitle = "发送",
-  commands, onSlashCommand,
+  commands, onSlashCommand, onPasteFiles, ref,
 }: ComposerBoxProps) {
   const canSend = !sendDisabled && !disabled && value.trim().length > 0;
 
-  // ── 输入框高度：默认**一行**，内容换行时往上长（对齐 DSH / codex）──────
-  // textarea 自己不会长高，只会内部滚动；这里每轮先把 height 归零再按
-  // scrollHeight 设回去（归零是为了让删字时也能缩回来），到 MAX 就交给内部滚动。
-  const taRef = useRef<HTMLTextAreaElement | null>(null);
-  useLayoutEffect(() => {
-    const el = taRef.current;
-    if (!el) return;
-    const MAX = 220;                  // 和 className 里的 max-h-[220px] 对齐
-    el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, MAX) + "px";
-  }, [value]);
+  // ── 输入框高度由 ComposerInput 自己管（它拥有那个 DOM 节点）──
+  // （原来是 textarea + 这里的 useLayoutEffect 手动量 scrollHeight，见 composer-input.tsx）
 
   // ── 斜杠命令 ────────────────────────────────────────────
   // 只在「第一行、/ 开头、还没打空格」时进入命令模式（见 slashQuery）。
@@ -90,7 +96,10 @@ export function ComposerBox({
     onSlashCommand?.(cmd);
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    // 输入法拼字中：Enter 是确认候选词，不能当成"发送"或"选中菜单项"
+    // （ComposerInput 已经先挡了一道，这里再挡一道，防止别处直接调这个 handler）
+    if (e.nativeEvent.isComposing) return;
     if (menuOpen) {
       if (e.key === "ArrowDown") { e.preventDefault(); setActiveIndex((i) => (i + 1) % matches.length); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setActiveIndex((i) => (i - 1 + matches.length) % matches.length); return; }
@@ -124,39 +133,46 @@ export function ComposerBox({
       )}
     <div
       className={cn(
-        "flex flex-col overflow-hidden rounded-2xl border border-border-default bg-surface-raised shadow-xs",
+        // 输入卡片几何照 mnemo 的 composer-card：22px 圆角 + 看得见的描边 + 15/16/12 内边距
+        "flex flex-col overflow-hidden rounded-[22px] border border-border-strong bg-surface-raised px-4 pt-3.5 pb-3 shadow-xs",
         "transition-[border-color,box-shadow] duration-fast ease-standard",
-        "focus-within:border-accent-ring focus-within:shadow-focus",
+        // 聚焦时**只给描边染一点主题色，不加光圈**（mnemo 就是 `color-mix(accent 45%, line-strong)`）：
+        // 之前那圈 4px 的 --shadow-focus 太抢眼，用户明确要求去掉。
+        "focus-within:border-[rgb(var(--accent-ring)/0.45)]",
         className,
       )}
     >
-      {topLeft && <div className="flex items-center gap-1.5 px-2.5 pt-2">{topLeft}</div>}
+      {topLeft && <div className="flex items-center gap-1.5 pb-2.5">{topLeft}</div>}
 
-      <Textarea
-        ref={taRef}
-        rows={1}
+      <ComposerInput
+        ref={ref}
         autoFocus={autoFocus}
         value={value}
         disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={onChange}
         onKeyDown={handleKeyDown}
+        onPasteFiles={onPasteFiles}
         placeholder={placeholder}
         className={cn(
-          // rows=1 → 空的时候就是一行（py-2 + 一行文字 ≈ 36px）；
-          // 超过 max-h 之后不再长高，改为内部滚动（见上面的 useLayoutEffect）
-          "min-h-9 max-h-[220px] resize-none rounded-none border-0 bg-transparent text-sm shadow-none",
-          "focus-visible:border-transparent focus-visible:ring-0",
+          // 内边距/高度上限归卡片和组件自己；这里只留插槽调用方能改的部分
+          "resize-none rounded-none border-0 bg-transparent shadow-none",
           textareaClassName,
         )}
       />
 
-      <div className="flex items-center justify-between gap-2 px-2 pb-2">
+      <div className="mt-2 flex items-center justify-between gap-2.5">
         <div className="flex min-w-0 items-center gap-1">
           {leftActions}
+          {chips}
           <span className="truncate pl-1 text-2xs text-text-tertiary">{hint}</span>
         </div>
 
-        <SendButton sending={sending} onSend={onSubmit} onStop={onStop} disabled={!canSend} title={sendTitle} />
+        {/* 右下角：模型 chip 紧挨在发送按钮左边（贴右边沿，和发送按钮同一档高度）。
+            左边那组是 min-w-0 + 提示文字 truncate，所以窗口窄时先挤提示，chip 不会被压没。 */}
+        <div className="flex shrink-0 items-center gap-2">
+          {rightActions}
+          <SendButton sending={sending} onSend={onSubmit} onStop={onStop} disabled={!canSend} title={sendTitle} />
+        </div>
       </div>
     </div>
     </div>
@@ -184,7 +200,7 @@ export function SendButton({
         type="button"
         onClick={onStop}
         title="停止"
-        className="flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-danger text-white shadow-sm transition-colors hover:bg-danger-hover"
+        className="flex size-[38px] shrink-0 items-center justify-center rounded-full border-0 bg-danger text-white shadow-sm transition-colors hover:bg-danger-hover"
       >
         <Square className="size-3.5" fill="currentColor" />
       </button>
@@ -196,7 +212,7 @@ export function SendButton({
         type="button"
         disabled
         title="生成中"
-        className="flex size-9 shrink-0 items-center justify-center rounded-full border-0 bg-[rgb(var(--nb-200))] text-white shadow-sm dark:bg-[rgb(var(--nb-750))]"
+        className="flex size-[38px] shrink-0 items-center justify-center rounded-full border-0 bg-[rgb(var(--nb-200))] text-white shadow-sm dark:bg-[rgb(var(--nb-750))]"
       >
         <Loader2 className="size-4 animate-spin" />
       </button>
@@ -209,7 +225,7 @@ export function SendButton({
       disabled={disabled}
       title={title ?? "发送 (Enter)"}
       className={cn(
-        "flex size-9 shrink-0 items-center justify-center rounded-full border-0 shadow-sm transition-colors",
+        "flex size-[38px] shrink-0 items-center justify-center rounded-full border-0 shadow-sm transition-colors",
         "bg-[rgb(var(--accent))] text-white hover:bg-[rgb(var(--accent-hover))]",
         "disabled:bg-[rgb(var(--nb-200))] disabled:text-white dark:disabled:bg-[rgb(var(--nb-750))]",
       )}
@@ -261,7 +277,7 @@ export function PermissionSelect({
             disabled={disabled}
             title={copy.title}
             className={cn(
-              "flex h-7 items-center gap-1 rounded-full px-2 text-2xs transition-colors disabled:opacity-40",
+              "flex h-7 items-center gap-1 rounded-full border border-border-default bg-surface-inset px-2.5 text-2xs transition-colors disabled:opacity-40",
               // 颜色只用中性色（不要黄色）：危险档靠图标（ShieldOff）区分，不靠颜色喊
               dangerous
                 ? "text-text-secondary hover:bg-surface-hover hover:text-text-primary"

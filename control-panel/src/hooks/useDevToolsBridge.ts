@@ -105,6 +105,16 @@ export function useDevToolsBridge(
   // 监听来自 iframe 的消息
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
+      /**
+       * 只认**这个 iframe 自己**发的消息。
+       *
+       * 不校验来源时，页面上任何脚本（模型产出的代码是不可信输入）都能伪造
+       * `DEVTOOLS_RESPONSE` / `DEVTOOLS_RUNTIME_ERROR` / `IFRAME_USER_ACTIVITY`：
+       * 前者能把面板里挂起的请求用假结果**提前 resolve**，后两者能让「运行时报错」
+       * 面板显示不存在的东西。判据用 contentWindow 的身份（跨源成立），
+       * 不用 event.origin —— 预览的源可能是 8008 / 开发服务器 / 面板同源代理。
+       */
+      if (event.source !== iframeRef.current?.contentWindow) return;
       const { type, requestId, result, error } = event.data || {};
       
       if (type === 'DEVTOOLS_READY') {
@@ -137,7 +147,7 @@ export function useDevToolsBridge(
     
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [onRuntimeError, onUserActivity]);
+  }, [iframeRef, onRuntimeError, onUserActivity]);
   
   // 获取 console 日志
   const getConsoleLogs = useCallback(async (): Promise<ConsoleLog[]> => {

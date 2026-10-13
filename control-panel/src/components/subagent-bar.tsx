@@ -33,6 +33,14 @@ export interface SubagentInfo {
   steps: SubagentStep[];
   /** 内核报的步数 */
   stepCount: number;
+  /**
+   * token 用量（入 / 出）。两个来源、**同一个数**：
+   *   · 实时：内核在 subagent_done / task_done 事件里发的那份（run 的结果）；
+   *   · 刷新后：8008 的子代理列表从任务表带出来的那份（见 legacy/routes-subagents.ts）。
+   * undefined / null = 没记录或 provider 没报 → 显示「未上报」，
+   * **绝不显示 0**（0 会被读成「没花 token」，见 agents/task-registry.ts:finish）。
+   */
+  usage?: { inputTokens?: number; outputTokens?: number } | null;
 }
 
 const MAX_STEPS = 200;
@@ -41,7 +49,8 @@ const MAX_TEXT = 1200;
 export function reduceSubagents(
   prev: SubagentInfo[],
   e: { action?: string; label?: string; taskId?: string; subagentId?: string; content?: string;
-       tool?: string; info?: string; steps?: number; endReason?: string; background?: boolean },
+       tool?: string; info?: string; steps?: number; endReason?: string; background?: boolean;
+       usage?: { inputTokens?: number; outputTokens?: number } | null },
 ): SubagentInfo[] {
   const action = String(e.action ?? "");
   const label = String(e.label ?? "");
@@ -99,16 +108,19 @@ export function reduceSubagents(
 
   if (action === "done") {
     const status = e.endReason === "error" ? "error" as const : "done" as const;
+    // usage 只在这次事件里带 —— done 之后不会再有更新，所以拿不到就保持原值
+    const usage = e.usage ?? undefined;
     let i = prev.findIndex((s) => s.key === key);
     if (i < 0) i = prev.findIndex((s) => s.label === label && s.status === "running");
     if (i < 0) {
       return [...prev, {
         key, id: sid || key, label: label || "子任务", background: e.background === true,
         status, steps: [], stepCount: Number(e.steps ?? 0),
+        usage,
       }];
     }
     const next = prev.slice();
-    next[i] = { ...next[i]!, status, stepCount: Number(e.steps ?? 0) };
+    next[i] = { ...next[i]!, status, stepCount: Number(e.steps ?? 0), usage: usage ?? next[i]!.usage ?? undefined };
     return next;
   }
 
@@ -143,6 +155,22 @@ export function buildTree(agents: SubagentInfo[]): SubagentInfo[] {
     .map((a, i) => ({ a: { ...a, depth: calc(a, new Set()) }, i }))
     .sort((x, y) => (x.a.depth! - y.a.depth!) || (x.i - y.i))
     .map((x) => x.a);
+}
+
+/** 紧凑 token 数：1234 → 1.2k。**没有 0 的用法** —— 没上报就是不显示 */
+function fmtTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return (k >= 100 ? Math.round(k) : Math.round(k * 10) / 10) + "k";
+}
+
+/**
+ * 用量文案。**未上报 ≠ 0**：没有数就写「未上报」，写 0 会被读成「没花 token」
+ * （内核存的也是 NULL 而不是 0，两边口径一致，见 agents/task-registry.ts:finish）。
+ */
+function usageLine(u: SubagentInfo["usage"]): string {
+  if (!u) return "用量未上报";
+  return "用量 " + fmtTokens(u.inputTokens ?? 0) + " 入 / " + fmtTokens(u.outputTokens ?? 0) + " 出";
 }
 
 function StepLine({ step }: { step: SubagentStep }) {
@@ -252,6 +280,12 @@ export function SubagentBar({
               >
                 <Bot className="w-3 h-3" />
                 <span className="max-w-[10rem] truncate">{a.label}</span>
+                {/* 已经拿到用量的（后台任务收尾后）在胶囊上直接给个总数，不用点开 */}
+                {a.usage && (
+                  <span className="text-2xs opacity-70" title={usageLine(a.usage)}>
+                    {fmtTokens((a.usage.inputTokens ?? 0) + (a.usage.outputTokens ?? 0))} tok
+                  </span>
+                )}
                 {a.status === "running" && <span className="text-2xs opacity-70">…</span>}
                 {a.status === "done" && <Check className="w-2.5 h-2.5 text-success" />}
                 {a.status === "error" && <X className="w-2.5 h-2.5 text-danger" />}
@@ -283,6 +317,13 @@ export function SubagentBar({
               <span>{a.background ? "后台" : "前台"}</span>
               <span>·</span>
               <span>{a.status === "running" ? "进行中" : a.status === "done" ? "完成（" + a.stepCount + " 步）" : "失败"}</span>
+              {/* 用量：结束后才有数。还没结束时不写「未上报」—— 那不是"没报"，是"还没到" */}
+              {a.status !== "running" && (
+                <>
+                  <span>·</span>
+                  <span>{usageLine(a.usage)}</span>
+                </>
+              )}
               {onOpen && (
                 <button
                   type="button"

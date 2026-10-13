@@ -153,14 +153,22 @@ function ToolRow({ item, expanded, onToggle }: { item: ToolItem; expanded: boole
         type="button"
         onClick={onToggle}
         aria-expanded={expanded}
-        className="group/row flex w-full items-center gap-2 rounded-md px-2 py-1 text-left font-mono transition-colors hover:bg-surface-hover"
+        // 折叠态**永远一行**：`min-w-0` 让它能在窄容器里真正收缩，
+        // 内容不折行（下面的 info 走 truncate；有换行的文本由 shorten 折叠成空格）
+        className="group/row flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1 text-left font-mono transition-colors hover:bg-surface-hover"
       >
         {failed
           ? <X className="w-3 h-3 shrink-0 text-danger" />
           : <Check className="w-3 h-3 shrink-0 text-muted-foreground/40" />}
         <Icon className="w-3 h-3 shrink-0 text-muted-foreground/70" />
         <span className="shrink-0 font-medium text-muted-foreground">{verb}</span>
-        {item.info && <span className="truncate text-muted-foreground/60">{shorten(item.info)}</span>}
+        {item.info && (
+          // 显示的是 shorten 后的一行摘要，完整原文放 title —— 折行换取的几行宽度
+          // 换不回可读性，用户要的是「一眼扫过去这段在干嘛」，细节点开行看
+          <span title={item.info} className="min-w-0 truncate text-muted-foreground/60">
+            {shorten(item.info)}
+          </span>
+        )}
         <ChevronRight
           className={cn(
             "ml-auto w-3 h-3 shrink-0 text-muted-foreground/40 opacity-0 transition-transform group-hover/row:opacity-100",
@@ -219,7 +227,7 @@ function PhaseBody({
   const Icon = PHASE_ICON[phase.phase];
   const label = PHASE_LABEL[phase.phase];
   return (
-    <div className="ml-1 flex flex-col border-l border-border/40 pl-2">
+    <div className="ml-1 flex min-w-0 flex-col border-l border-border/40 pl-2">
       {showHeader && (
         <div className="flex items-center gap-1.5 px-2 py-0.5 text-2xs text-muted-foreground/50">
           <Icon className="w-2.5 h-2.5" />
@@ -287,9 +295,9 @@ export function ToolActivityTrack({ items, running, persistKey }: {
   const hidden = phases.length - shown.length;
 
   return (
-    <div className="my-1.5 flex flex-col gap-1">
-      <div className="flex items-center gap-2">
-        <div className="flex items-center">
+    <div className="my-1.5 flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="flex shrink-0 items-center">
           {hidden > 0 && (
             <span
               title={phases.slice(0, hidden).map((p) => PHASE_LABEL[p.phase].verb).join("、")}
@@ -325,7 +333,7 @@ export function ToolActivityTrack({ items, running, persistKey }: {
           })}
         </div>
 
-        <span className={cn("text-xs text-muted-foreground/70", running && "animate-pulse")}>
+        <span className={cn("min-w-0 truncate text-xs text-muted-foreground/70", running && "animate-pulse")}>
           {running ? runningLabel(items) : summarizeRun(items)}
         </span>
 
@@ -334,7 +342,7 @@ export function ToolActivityTrack({ items, running, persistKey }: {
             type="button"
             onClick={() => { setOpenPhase(openPhase === -1 ? null : -1); setOpenRows(new Set()); }}
             title="展开全部阶段"
-            className="text-2xs text-muted-foreground/50 hover:text-muted-foreground"
+            className="shrink-0 text-2xs text-muted-foreground/50 hover:text-muted-foreground"
           >
             {openPhase === -1 ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
           </button>

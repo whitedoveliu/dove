@@ -29,10 +29,14 @@ import {
   chooseFolder,
   checkHealth,
   getProjectInfo,
+  ensureLocalToken,
+  getLocalTokenState,
+  retryLocalToken,
+  type LocalTokenState,
   type Project,
 } from "@/lib/api";
 import { normalizeProjectPath, type PresentedFile } from "@/lib/presented-files";
-import { isHtmlPath } from "@/lib/preview-url";
+import { isHtmlPath, projectFileUrl } from "@/lib/preview-url";
 
 // 获取 API 主机地址（支持局域网访问）
 const getApiHost = () => typeof window !== "undefined" ? window.location.hostname : "localhost";
@@ -75,7 +79,19 @@ function ControlPanel() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [asideCollapsed, setAsideCollapsed] = useState(false);
   const [health, setHealth] = useState<"unknown" | "online" | "offline">("unknown");
+  /**
+   * 本地令牌状态。取不到令牌时 8008 的每条请求都会 401 —— `apiFetch` 带不上 X-Dove-Token 头，
+   * `<img>/<video>/pdf` 的资源 URL 也拼不出 `?token=`。面板照常渲染，但必须在界面上说清楚
+   * （见下面的提示条），不能让它变成「按了没反应」。
+   * 不受影响的只有面板同源那条项目预览路由（/api/preview/project/…，它在令牌闸门外，见预览路由的文件头）。
+   */
+  const [tokenState, setTokenState] = useState<LocalTokenState>("pending");
   const [activeFile, setActiveFile] = useState<{ port: string; path: string } | null>(null);
+  /**
+   * 「在右侧文件模块打开」的目标。带 token 是因为**同一个文件点两次也要能切回前台**
+   * （只比 path 的话第二次点击不会触发任何变化）。
+   */
+  const [previewFileTarget, setPreviewFileTarget] = useState<{ path: string; token: number } | null>(null);
   /** 要在右侧「浏览器」标签打开的网页（agent 产出的 .html / 用户点交付物卡片） */
   const [previewOpenTarget, setPreviewOpenTarget] = useState<{ path: string; token: number; force: boolean } | null>(null);
   /** 「预览就绪」自增计数：右侧收到后切回浏览器标签 */
@@ -115,7 +131,11 @@ function ControlPanel() {
    */
   const handleOpenProjectFile = useCallback(async (path: string) => {
     const port = projectId;
-    if (!port) return;
+    if (!port) {
+      // 零反馈的 return 就是「点了没反应」——说清楚要做什么
+      toast({ title: "先选一个任务", description: "文件要在具体任务里打开：在左侧选一个，或新建一个任务", tone: "info" });
+      return;
+    }
     setAsideCollapsed(false);   // 预览区收起了就先展开，否则点了什么都看不到
     let target = normalizeProjectPath(path);
     if (target.startsWith("/")) {
@@ -127,10 +147,24 @@ function ControlPanel() {
         /* 拿不到项目根：按原样试，让 FilePeek 报错 */
       }
     }
-    // 网页交付物直接渲染，不当文本读
-    if (isHtmlPath(target)) { openWebPage(target, true); return; }
-    setActiveFile({ port, path: target });
-  }, [projectId, openWebPage]);
+    // 用户点一个文件 → 一律走右侧「文件」模块（用户明确要求：默认点击就在那儿以 tab 打开）。
+    // 以前网页交付物直接顶开浏览器标签、纯文本走 FilePeek —— 现在都收敛到文件模块，
+    // 那里按类型渲染（html 用 iframe sandbox、代码高亮、图片…），且多个文件能并排成 tab。
+    setPreviewFileTarget({ path: target, token: Date.now() });
+  }, [projectId, toast]);
+
+  /**
+   * 文件模块把 `previewFileTarget` 消费掉了 → 清空。
+   *
+   * 不清的后果：这个状态是「一次性的打开请求」，而 PreviewFilesPane 会随预览面板
+   * 折叠/展开**卸载重挂**（AppShell 收起 aside 时不渲染 aside），挂载时那条 effect
+   * 照样跑一次 —— 于是「任务 A 点过文件 → 收起预览 → 切到 B → 展开预览」会在 B 下
+   * 开出一个 A 的文件 tab 并报「文件不存在」。
+   * 带 token 比较：清之前确认它就是被消费的那一条，别把期间新点的请求一起抹掉。
+   */
+  const handlePreviewFileConsumed = useCallback((token: number) => {
+    setPreviewFileTarget((current) => (current && current.token === token ? null : current));
+  }, []);
 
   // 处理运行时错误的回调
   const handleRuntimeError = useCallback((error: { message: string; source?: string; lineno?: number; stack?: string }) => {
@@ -141,10 +175,17 @@ function ControlPanel() {
     setRuntimeError(errorMessage);
   }, []);
 
+  /**
+   * 静态预览地址（没有实时开发服务器时用它）—— 项目根目录的 index.html，
+   * 走**面板同源**的 `/api/preview/project/{port}/`。
+   *
+   * 为什么不是 8008 的 `/preview/{port}/?token=`：静态页里的 `./style.css`、`assets/x.js`
+   * 是相对 URL，**不会继承查询串** —— 顶层那份文档带着令牌也挡不住子资源 401（整页无样式）。
+   * 版本号仍留在查询串里：换版本时 URL 必须变（不然 iframe 不会重载），服务端不读它
+   * （版本切换由 setPreviewVersion + 重新构建负责，见 PreviewPanel 的 handleVersionSelect）。
+   */
   const buildStaticPreviewUrl = useCallback((port: string, version?: number | null, bustCache = false) => {
-    const baseUrl = version && version > 0
-      ? `http://${getApiHost()}:8008/preview/${port}/?version=${version}`
-      : `http://${getApiHost()}:8008/preview/${port}/`;
+    const baseUrl = projectFileUrl(port, "") + (version && version > 0 ? `?version=${version}` : "");
     return bustCache ? `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}_t=${Date.now()}` : baseUrl;
   }, []);
 
@@ -155,6 +196,9 @@ function ControlPanel() {
   // 判断当前是否使用服务器预览（热更新 URL）
   const isUsingDevServer = useCallback(() => {
     if (!projectId || !previewUrl || !enableHotReload) return false;
+    // 「是不是开发服务器」不能靠端口判：静态预览现在与面板同源（/api/preview/project/…），
+    // 端口是 8790 而不是 8008。按路由形状判：面板的预览路由与老 8008 预览都算**静态**。
+    if (previewUrl.includes("/api/preview/")) return false;
     try {
       const url = new URL(previewUrl);
       return url.port !== "8008";
@@ -363,6 +407,14 @@ function ControlPanel() {
 
   // 选择项目
   const handleProjectSelect = async (port: string) => {
+    /**
+     * 切任务时，把「还没发出去的待发消息」还给用户。
+     *
+     * 那条消息属于**上一个任务**（见 handleQuickCreateTask），跟着切过去就会被
+     * 发到别的任务里。也不能像以前那样 setPendingMessage(null) 一删了之 ——
+     * 那就是「我打的字凭空消失」。交给 ChatPanel 放回输入框 + 提示。
+     */
+    if (pendingMessageRef.current && pendingMessageRef.current.projectId !== port) takeBackPending();
     // 切换项目前，先关闭当前项目的服务器（仅热更新模式）
     if (projectId && projectId !== port && isDevServerReady && enableHotReload) {
       try {
@@ -542,6 +594,11 @@ function ControlPanel() {
     return () => window.clearInterval(timer);
   }, [loadProjects]);
 
+  // 启动时取一次本地令牌（并发请求共用同一个，失败由提示条兜住，不自动重试）
+  useEffect(() => {
+    void ensureLocalToken().then(() => setTokenState(getLocalTokenState()));
+  }, []);
+
   // Cmd/Ctrl + B 折叠目录面板
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -612,20 +669,28 @@ function ControlPanel() {
 
   /**
    * 建项目。可选 `permission`：建好后**在选中它之前**把权限落库。
+   * 可选 `kickoff`：这次建项目是「空状态里直接说的话」触发的，成功提示要说清
+   *   「消息正在发出去」—— 否则用户只看到任务被建出来，会以为消息被吞了。
    *
    * ⚠️ 顺序很关键：ChatPanel 的 usePermissionMode 在 projectId 变化时会**立刻读一次**。
    *    如果先 handleProjectSelect 再写权限，那次读到的还是旧值（workspace），
    *    而写完又不会再读 —— 表现出来就是「新会话选了完全访问，进去还是工作区」。
    *    实测踩过。
+   *
+   * 返回**端口**（成功）或 undefined（失败）。调用方**必须看返回值** ——
+   * 新会话页那句话的发送就挂在它上面（见 handleQuickCreateTask）。
    */
-  const handleCreateProject = async (input: { name: string; project?: string; permission?: PermissionMode }) => {
+  const handleCreateProject = async (input: { name: string; project?: string; permission?: PermissionMode; kickoff?: boolean }) => {
     try {
       const result = await createTask(input);
       if (!result.success) throw new Error(result.message);
       const port = result.project?.port;
       toast({
         title: `已创建任务「${result.project?.name ?? input.name}」`,
-        description: result.project?.path,
+        // kickoff：那句话会在新任务里自动发出（见 ChatPanel 的 pendingMessage effect）
+        description: input.kickoff
+          ? [result.project?.path, "正在把你刚才那条消息发出去…"].filter(Boolean).join("\n")
+          : result.project?.path,
         tone: "success",
       });
       // 先落权限，再选中 —— 见上面注释
@@ -666,26 +731,63 @@ function ControlPanel() {
     }
   };
 
-  // 空状态里直接说话即可开工：用首行截断当任务名，建好后自动把原话发出去
-  const handleQuickCreateTask = async (text: string) => {
+  /**
+   * 空状态里直接说话即可开工：用首行截断当任务名，建好后自动把原话发出去。
+   *
+   * 返回值 = 「这句话有没有被接手」，调用方（ChatPanel.submitStartDraft）**必须看**：
+   *   true  任务建好了，原话已记进 pendingMessage，由 ChatPanel 在切进去之后发出
+   *   false 没建起来 —— 内容还在调用方手里，它会放回输入框（用户能直接重试）
+   *
+   * 原来这里没有返回值、也没人看返回值：createTask 一失败就 return undefined，
+   * 而草稿已经在 submitStartDraft 里清空了 —— 用户看到的就是
+   * 「我发的那句话变成了任务名，然后什么都没发生」（消息被静默吃掉）。
+   */
+  const handleQuickCreateTask = async (text: string): Promise<boolean> => {
     const firstLine = text.trim().split("\n")[0].trim();
+    // 任务名继续从消息头派生（任务列表里可读）。**只用来取名** ——
+    // 发出去的那条消息用的是 `text` 原文，一个字符都不改。
     const name = firstLine.slice(0, 24) || "新任务";
     // 新会话页选的权限，连同建项目一起交下去 —— 由 handleCreateProject
     // 保证「先落权限、再选中项目」的顺序（见那边的注释）。
-    await handleCreateProject({
+    const port = await handleCreateProject({
       name,
       project: draftProject ?? undefined,
       permission: readDraftPermission(),
+      kickoff: true,
     });
-    setPendingMessage(text);
+    if (!port) return false;
+    // 带上 projectId：这样即使中途切了任务，这条消息也不会"追着"发到别的任务里
+    setPendingMessage({ projectId: port, text });
+    return true;
   };
 
-  const [pendingMessage, setPendingMessage] = useState<string | null>(null);
+  /**
+   * 待发消息。**带 projectId**，不只是个字符串 ——
+   * 只存文本的话，「A 建好 → 用户切到 B」会让这条消息发进 B（实测会）。
+   */
+  const [pendingMessage, setPendingMessage] = useState<{ projectId: string; text: string } | null>(null);
+  /** pendingMessage 的镜像：handleProjectSelect / takeBackPending 要在事件里同步读它 */
+  const pendingMessageRef = useRef<{ projectId: string; text: string } | null>(null);
+  useEffect(() => { pendingMessageRef.current = pendingMessage; }, [pendingMessage]);
+  /**
+   * 用户自己离开（点「新会话」/切任务）时被收回来的那条消息 ——
+   * 交给 ChatPanel 放回输入框 + 提示。token 变化代表一次新的还原。
+   */
+  const [restoreDraft, setRestoreDraft] = useState<{ text: string; token: number } | null>(null);
+
+  const takeBackPending = () => {
+    const p = pendingMessageRef.current;
+    if (!p) return;
+    pendingMessageRef.current = null;
+    setPendingMessage(null);
+    setRestoreDraft({ text: p.text, token: Date.now() });
+  };
   // 起始页上预选的项目（不弹窗也能把新会话挂到某个项目下）
   const [draftProject, setDraftProject] = useState<string | null>(null);
 
   // 点「新会话」：不弹窗，直接回到聊天主界面
   const handleStartNewSession = () => {
+    takeBackPending();   // 还没发出去的消息不能跟着会话一起消失（见上）
     setProjectId(null);
     localStorage.removeItem("dove_port");
     setPreviewUrl("");
@@ -694,7 +796,6 @@ function ControlPanel() {
     setActiveFile(null);
     setAsideCollapsed(true);
     setDraftProject(null);
-    setPendingMessage(null);
   };
 
   // 在某个项目下新建会话：进主界面 + 预选该项目
@@ -781,6 +882,22 @@ function ControlPanel() {
       }
       main={
         <div className="pane flex-1">
+          {tokenState === "missing" && (
+            <div className="flex items-center gap-2 border-b border-warning/30 bg-warning-subtle px-4 py-2 text-xs text-warning-fg">
+              <span className="font-medium">缺少本地令牌</span>
+              <span className="flex-1">
+                内核的 /api/local-token 没取到，8008 后端的请求会全部被拒（改模型设置、发消息都会失败）。
+                请确认内核在运行；重启过内核的话点右边重试一次。
+              </span>
+              <button
+                type="button"
+                className="rounded border border-warning/40 px-2 py-0.5 font-medium hover:bg-warning/10"
+                onClick={() => { void retryLocalToken().then(() => setTokenState(getLocalTokenState())); }}
+              >
+                重试
+              </button>
+            </div>
+          )}
           <ChatPanel
             devToolsBridge={devToolsBridge}
             onVersionChange={handleVersionChange}
@@ -803,12 +920,13 @@ function ControlPanel() {
             onOpenFile={(path) => void handleOpenProjectFile(path)}
             onPresentedFiles={handlePresentedFiles}
             onProjectCreated={() => void loadProjects(true)}
-            onQuickCreateTask={(text) => void handleQuickCreateTask(text)}
+            onQuickCreateTask={handleQuickCreateTask}
             projects={projects}
             draftProject={draftProject}
             onDraftProjectChange={setDraftProject}
             onChooseFolder={() => void handleChooseAndAttach()}
             pendingMessage={pendingMessage}
+            restoreDraft={restoreDraft}
             asideCollapsed={asideCollapsed}
             onToggleAside={() => setAsideCollapsed((prev) => !prev)}
             onPendingMessageConsumed={() => setPendingMessage(null)}
@@ -819,6 +937,8 @@ function ControlPanel() {
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="pane flex-1">
             <PreviewPanel
+              openFilePath={previewFileTarget}
+              onFilePathConsumed={handlePreviewFileConsumed}
               url={previewUrl}
               iframeRef={iframeRef}
               historyVersion={historyVersion}

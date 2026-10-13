@@ -1,7 +1,8 @@
 /**
  * 预览地址栏的纯逻辑 —— 输入归一化 / 外站是否走代理 / 项目文件 URL 拼装。
  *
- * 不依赖 React 与 DOM（只吃一个 ctx），方便直接用 node 喂字符串验证。
+ * 不依赖 React（只吃一个 ctx），方便直接用 node 喂字符串验证；
+ * `getPanelOrigin()` 只在调用方没给 ctx.origin 时兜底（例如文件模块里没有 ctx）。
  *
  * 归一化规则表（输入 → 结果）：
  *   https://a.com/x        → 原样（http / https 才认）
@@ -15,7 +16,13 @@
  *   空                     → 报错（调用方按「清空」处理）
  *   file:///etc/passwd     → 报错：不支持的协议
  *   含空格 / 控制字符        → 报错
+ *
+ * 项目内文件有两份 URL，各管一段（为什么不能合成一份，见 projectFileUrl / projectAssetUrl）：
+ *   · project 形 `/api/preview/project/<键>/<rel>`（面板同源）→ **HTML 文档**：相对子资源要靠它；
+ *   · 8008 `/preview/<port>/<rel>?token=`（跨源）→ 图片 / 音视频 / PDF：没有相对子资源。
+ * 下载（读响应体）走第三条：同源、令牌走头的 `/api/file/download`（见 lib/file-actions.ts）。
  */
+import { getPanelOrigin } from "@/lib/api";
 export interface PreviewContext {
   /** 当前项目（面板里就是端口号字符串） */
   projectId?: string | null;
@@ -77,6 +84,8 @@ export function hostKind(hostname: string): HostKind {
 
 /** 面板同源的「项目文件」路由前缀 */
 const FILE_PREFIX = "/api/preview/file/";
+/** 面板同源的「项目作用域」路由前缀（项目键在路径里 —— HTML 预览专用） */
+const PROJECT_PREFIX = "/api/preview/project/";
 const PROXY_PREFIX = "/api/preview/proxy";
 
 function tryUrl(raw: string): URL | null {
@@ -97,13 +106,68 @@ export function filePreviewUrl(rel: string, ctx: PreviewContext): string {
   return ctx.origin + FILE_PREFIX + encodeRelPath(clean) + suffix;
 }
 
-/** 同源文件 URL → 项目内相对路径；不是就返回 null */
+/**
+ * 项目内文件的 URL —— **项目作用域写在路径里**（`/api/preview/project/<项目键>/<相对路径>`），
+ * 面板同源，且**不需要令牌**（8790 的 /api/preview/* 在闸门之外，因为浏览器标签发不了自定义头）。
+ *
+ * 谁必须用它：**HTML 文档**（右侧「浏览器」标签的项目预览、文件模块里的 html、新窗口打开的 html）。
+ * 为什么不能像图片那样走 8008 的 `/preview/{port}/…?token=`：HTML 里的 `./style.css`、
+ * `<img src="img/x.png">` 是**相对 URL**，按文档 URL 的目录解析，**不会继承查询串** ——
+ * 顶层那份文档带着令牌也没用，子资源照样 401（整页无样式、无脚本）。
+ * 走同源之后子资源自然解析回同一个项目（`…/project/3000/dir/style.css`），
+ * 由服务端按同一套边界（项目键 → resolve 判前缀 → realpath 复核 → 点段 403）自己读盘。
+ *
+ * 反过来的纪律：**没有相对子资源的东西不要走这里**（图片 / 音视频 / PDF 走 projectAssetUrl），
+ * 它们走 8008 是跨源，拿不到面板同源的任何权限（DOM / localStorage / 免令牌的 API）。
+ */
+export function projectFileUrl(port: string, rel: string, ctx?: Pick<PreviewContext, "origin">): string {
+  const origin = ctx?.origin || getPanelOrigin();
+  const clean = String(rel ?? "").replace(/\\/g, "/").replace(/^\.?\//, "");
+  return origin + PROJECT_PREFIX + encodeURIComponent(port) + "/" + encodeRelPath(clean);
+}
+
+/**
+ * 项目内文件的**资源 URL**（给 <img> / <video> / <audio> / pdf 的 <iframe> 直接加载用）：
+ * 8008 的 `/preview/{port}/{rel}?token=…`。
+ *
+ * 为什么是它而不是面板同源的 `/api/preview/project/…`：这些标签**发不了自定义头**，
+ * 8008 的闸门只认 `X-Dove-Token` 或 `?token=`；而这条路径下的东西（图片 / 音视频 / PDF）
+ * **没有相对子资源**，查询串带令牌就够 —— 于是让它们留在 8008（跨源）更安全：
+ * 拿不到面板同源的 DOM / localStorage / 免令牌 API。HTML 文档不行，见 projectFileUrl。
+ *
+ * 令牌是**同步**取来的（`getLocalTokenCached()`）：渲染里不能发请求。还没取到就拼个不带令牌的
+ * URL —— 那条请求 401，App 的提示条已经在说「没取到令牌」（不是静默失败）。
+ * 闸门口径以 `legacy/server.ts` 为准（要令牌 / 不给 CORS `*` / 点文件 403 / Host 反 rebinding），
+ * 面板这边的三种消费者分别是：① 本函数（顶层标签，查询串带令牌）；
+ * ② HTML 文档的子资源（走 projectFileUrl，不经过这里）；
+ * ③ 「下载 / 另存」的跨源 fetch（改走面板同源的 filePreviewUrl —— 没有 CORS 读不到响应体）。
+ */
+export function projectAssetUrl(port: string, rel: string, token = ""): string {
+  const host = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
+  const clean = String(rel ?? "").replace(/\\/g, "/").replace(/^\.?\//, "");
+  const suffix = token ? "?token=" + encodeURIComponent(token) : "";
+  return `http://${host}:8008/preview/${encodeURIComponent(port)}/${encodeRelPath(clean)}${suffix}`;
+}
+
+/**
+ * 同源文件 URL → 项目内相对路径；不是就返回 null。
+ * 认两种形态：`/api/preview/file/<rel>?projectId=`（query 形）与
+ * `/api/preview/project/<键>/<rel>`（项目路径形）。项目根（rel 为空）显示成 "/"。
+ */
 export function fileRelOf(target: string, ctx: PreviewContext): string | null {
   if (!target) return null;
   let u: URL;
   try { u = new URL(target, ctx.origin); } catch { return null; }
-  if (u.origin !== ctx.origin || !u.pathname.startsWith(FILE_PREFIX)) return null;
-  try { return decodeURIComponent(u.pathname.slice(FILE_PREFIX.length)); } catch { return u.pathname.slice(FILE_PREFIX.length); }
+  if (u.origin !== ctx.origin) return null;
+  const decode = (s: string): string => { try { return decodeURIComponent(s); } catch { return s; } };
+  if (u.pathname.startsWith(FILE_PREFIX)) return decode(u.pathname.slice(FILE_PREFIX.length));
+  if (u.pathname.startsWith(PROJECT_PREFIX)) {
+    const rest = decode(u.pathname.slice(PROJECT_PREFIX.length));
+    const slash = rest.indexOf("/");
+    const rel = slash === -1 ? "" : rest.slice(slash + 1);
+    return rel || "/";
+  }
+  return null;
 }
 
 /** 外站 → 同源代理 URL；本机 / 内网 / 面板同源 → 原样直连 */
@@ -183,7 +247,9 @@ function resolveRelative(raw: string, ctx: PreviewContext): PreviewInput {
   } else {
     rel = cleaned.replace(/^\/+/, "");
   }
-  return { ok: true, url: filePreviewUrl(rel, ctx), kind: "file" };
+  // 项目键写进路径（project 形）：页面里再点相对链接 / 加载相对子资源都还落在同一个项目里
+  // （query 形会把这些子请求变成「无项目的相对路径」，只能靠逐个根去猜，见 routes-preview.ts 文件头）。
+  return { ok: true, url: projectFileUrl(ctx.projectId, rel, ctx), kind: "file" };
 }
 
 export function normalizePreviewInput(input: string, ctx: PreviewContext): PreviewInput {

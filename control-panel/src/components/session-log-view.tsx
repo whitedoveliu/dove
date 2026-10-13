@@ -197,29 +197,38 @@ export function SessionLogView({ port, className }: SessionLogViewProps) {
   /* --------------------------- 实时日志（SSE） --------------------------- */
   React.useEffect(() => {
     if (!port || !session) return;
-    const source = new EventSource(sessionLogStreamUrl(port, session, 0));
+    let source: EventSource | null = null;
+    let cancelled = false;
     setConnected(false);
     setError(null);
 
-    source.addEventListener("open", () => setConnected(true));
-    source.addEventListener("record", (event) => {
-      try {
-        const record = JSON.parse((event as MessageEvent).data) as SessionLogRecord;
-        if (seenRef.current.has(record.seq)) return; // 断线重连时去重
-        seenRef.current.add(record.seq);
-        setRecords((prev) => {
-          const next = prev.length >= MAX_RECORDS ? prev.slice(prev.length - MAX_RECORDS + 1) : prev.slice();
-          next.push(record);
-          return next;
-        });
-        setConnected(true);
-      } catch {
-        /* 忽略坏行 */
-      }
+    // 令牌是异步取的（EventSource 发不了自定义头，只能挂在查询串上，见 lib/api.ts）
+    void sessionLogStreamUrl(port, session, 0).then((url) => {
+      if (cancelled) return;
+      source = new EventSource(url);
+      source.addEventListener("open", () => setConnected(true));
+      source.addEventListener("record", (event) => {
+        try {
+          const record = JSON.parse((event as MessageEvent).data) as SessionLogRecord;
+          if (seenRef.current.has(record.seq)) return; // 断线重连时去重
+          seenRef.current.add(record.seq);
+          setRecords((prev) => {
+            const next = prev.length >= MAX_RECORDS ? prev.slice(prev.length - MAX_RECORDS + 1) : prev.slice();
+            next.push(record);
+            return next;
+          });
+          setConnected(true);
+        } catch {
+          /* 忽略坏行 */
+        }
+      });
+      source.addEventListener("error", () => setConnected(false));
     });
-    source.addEventListener("error", () => setConnected(false));
 
-    return () => source.close();
+    return () => {
+      cancelled = true;
+      source?.close();
+    };
   }, [port, session]);
 
   // 会话进行中时定期刷新列表（拿到新的会话/turn 数）

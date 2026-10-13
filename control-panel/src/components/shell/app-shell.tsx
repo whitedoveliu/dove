@@ -287,6 +287,11 @@ export function AppShell({
           </aside>
         </>
       )}
+
+      {/* userprompt 刻度栏的插槽：**永远**贴在最右缘（预览区收起时也在）。
+          ChatPanel 用 portal 往这里渲染 —— 数据（messages）在它手里，
+          没必要为了一个刻度栏把状态抬到 App 来。 */}
+      <div id="prompt-rail-slot" className="flex h-full shrink-0 flex-col" />
     </div>
   );
 }
