@@ -228,12 +228,18 @@ const config: Config = {
           to: { opacity: "0" },
         },
         "pop-in": {
-          from: { opacity: "0", transform: "scale(0.96) translateY(2px)" },
-          to: { opacity: "1", transform: "scale(1) translateY(0)" },
+          // ⚠️ 动的是**独立的 `scale` 属性**，不是 `transform: scale()`。
+          // 为什么（真栽过）：动画里的 transform 在层叠里**盖掉**普通声明与内联样式里的 transform ——
+          // 入场那 120ms 里，dialog 的 `-translate-x-1/2`（居中）与 prompt-rail 气泡的
+          // `translate3d(...)`（定位）全部失效，肉眼就是「先落在别处、然后突然跳过去」
+          // （用户报的「搜索弹窗先不居中再居中」就是这个）。独立的 scale 与 transform 是两次独立变换
+          // （translate → rotate → scale → transform），动画只动自己那一份，谁都不打架。
+          from: { opacity: "0", scale: "0.96" },
+          to: { opacity: "1", scale: "1" },
         },
         "pop-out": {
-          from: { opacity: "1", transform: "scale(1)" },
-          to: { opacity: "0", transform: "scale(0.97)" },
+          from: { opacity: "1", scale: "1" },
+          to: { opacity: "0", scale: "0.97" },
         },
         "slide-up": {
           from: { opacity: "0", transform: "translateY(6px)" },

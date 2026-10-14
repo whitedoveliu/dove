@@ -20,6 +20,7 @@ import {
 } from "@/lib/file-kinds";
 import { parseDelimited } from "@/lib/parse-delimited";
 import { FileOpenMenu, useFileActionRunner } from "@/components/file-open-menu";
+import { OpenInAppButton } from "@/components/open-in-app-button";
 import { openWithSystemApp } from "@/lib/file-actions";
 import { Hint } from "@/components/ui/tooltip";
 
@@ -286,7 +287,9 @@ export function FileViewer({ port, path, onClose, className }: FileViewerProps) 
           </Hint>
         )}
 
-        <FileOpenMenu port={port} path={path} kind={effectiveKind} inPane className="size-6" />
+        {/* 右上角：「打开方式」分体按钮 —— 左半用记住的 App 打开，右半挑 App。
+            本机一个可探测的 App 都没有 / 探测失败时，它自己退回原来的 FileOpenMenu（不变砖）。 */}
+        <OpenInAppButton port={port} path={path} kind={effectiveKind} inPane />
 
         {onClose && (
           <Hint label="关闭">

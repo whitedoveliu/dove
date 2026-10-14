@@ -6,8 +6,9 @@ import { Hint } from "@/components/ui/tooltip";
 import { IconButton } from "@/components/ui/icon-button";
 import { loadSavedStyle } from "./AIStyleSelector";
 import MessageList from "./MessageList";
-import { SubagentBar, reduceSubagents, type SubagentInfo } from "./subagent-bar";
+import { SubagentBar, SubagentButtons, reduceSubagents, type SubagentInfo } from "./subagent-bar";
 import { SubagentView } from "./subagent-view";
+import { publishSubagents, requestOpenSubagentList } from "@/lib/subagent-feed";
 import { ComposerBox, PermissionSelect } from "./composer-box";
 import type { ComposerHandle } from "./composer-input";
 import { DropFilesOverlay } from "./drop-overlay";
@@ -2095,7 +2096,14 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
         setSubagents(list.map((s) => ({
           key: s.id, id: s.id, label: s.label, background: s.background,
           parentId: s.parentId || undefined,      // A5 树的父子关系
-          status: s.status === "error" ? "error" : "done",
+          /**
+           * 内核归一过的状态（见 CONTRACT.md）：running 就是**真的还在跑**（顶栏据此转圈，
+           * 卡片页签也据此分「进行中」）。error / canceled 与 stale（重启后的僵尸）
+           * 都算「没干成」——显示成失败，别让一条永远不动的记录冒充完成。
+           */
+          status: s.status === "running" ? "running"
+            : s.status === "error" || s.status === "canceled" || s.status === "stale" ? "error"
+            : "done",
           steps: [], stepCount: 0,
           // token 用量（路由从任务表带出来的那份）：null = 没记录 / 没上报
           usage: s.usage ?? undefined,
@@ -2109,6 +2117,20 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
   const pruneSubagents = () => {
     setSubagents((prev) => (prev.length === 0 ? prev : prev.filter((a) => a.status === "running")));
   };
+
+  /**
+   * 把实时的子代理状态交给右侧面板（「后台 Agent」那一页）—— 见 lib/subagent-feed.ts。
+   *
+   * 面板和这里都是 App 下的兄弟组件，而 App.tsx 不归这次改动，所以走那条模块级的线。
+   * 传的是**展示派生**（状态 + 实时时间线）：真相源仍是内核（SSE / 落盘的子线程），
+   * 面板的列表与详情都是自己再去拉那两条接口。
+   */
+  useEffect(() => {
+    publishSubagents(projectId ?? null, subagents.map((a) => ({
+      id: a.id, label: a.label, background: a.background, status: a.status,
+      steps: a.steps, stepCount: a.stepCount, usage: a.usage ?? null,
+    })));
+  }, [projectId, subagents]);
 
   const handleActionClick = (action: string) => {
     if (settings.suggestionAutoSend) {
@@ -3015,6 +3037,17 @@ export default function ChatPanel({ devToolsBridge, onVersionChange, onLatestVer
             className="hidden"
             onChange={handleFileSelect}
           />
+
+          {/* 后台 Agent 那一排按钮 —— 输入框**上方**（对齐 Kimi Code）。
+              没有子代理时组件自己返回 null，不占位置；点了在右侧面板开「后台 Agent」页。
+              紧凑模式（那块 9/4 的小窗）里不显示：那里寸土寸金（与状态行同一个判据）。 */}
+          {!isCompactMode && (
+            <SubagentButtons
+              agents={subagents}
+              onOpen={requestOpenSubagentList}
+              className="mx-auto mb-1 w-full max-w-[1000px]"
+            />
+          )}
 
           {/* 运行中的待发送队列 —— 输入框**上方**（空队列时组件自己返回 null，不占位置）。
               每行：删除 / 插话；插话只在真的有回合在跑时才可点。 */}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState, useEffect, useMemo } from "react";
-import { RefreshCw, CirclePower, Loader2, Settings2, History, Play, Plus, ChevronDown, Check, PanelRight, Globe, FolderTree, ScrollText, TriangleAlert } from "lucide-react";
+import { RefreshCw, CirclePower, Loader2, Settings2, History, Play, Plus, ChevronDown, Check, PanelRight, Globe, FolderTree, ScrollText, TriangleAlert, Bot } from "lucide-react";
 import { resetProject, createProject, checkProjectExists, getVersionList, switchVersion, setPreviewVersion, VersionInfo, restartProjectServer } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,9 +28,11 @@ import {
   type PreviewContext,
 } from "@/lib/preview-url";
 import { SessionLogView } from "@/components/session-log-view";
+import { SubagentPane } from "@/components/subagent-pane";
+import { runningCountOf, useSubagentFeed } from "@/lib/subagent-feed";
 import { cn } from "@/lib/utils";
 
-type PreviewTab = "files" | "browser" | "log";
+type PreviewTab = "files" | "browser" | "log" | "agent";
 
 /** 刷新按钮用的 _dove=<n>：只加在 iframe 的 src 上，不动真实 URL / 代理参数 */
 function withNonce(src: string, nonce: number): string {
@@ -187,6 +189,21 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
     if (!openFilePath?.path) return;
     setTab("files");
   }, [openFilePath?.token]);
+
+  /**
+   * 「后台 Agent」：聊天区输入框上方那个按钮点了之后（openToken 自增）切到这一页。
+   *
+   * 为什么走模块级的 feed（lib/subagent-feed.ts）而不是 props：本面板和 ChatPanel 是
+   * App 下的兄弟，而 App.tsx 不归这次改动 —— 见那个文件的说明。
+   */
+  const feed = useSubagentFeed();
+  const agentFeedCount = feed.projectKey === (projectId ?? null) ? feed.agents.length : 0;
+  const agentsRunning = runningCountOf(feed.projectKey === (projectId ?? null) ? feed.agents : []);
+  useEffect(() => {
+    // 只看 openPending（不是自增的 token）：重挂时不会把一条**已经消费过**的请求再演一遍。
+    // 消费在 SubagentPane 里（它切回列表并调 consumeSubagentListOpen）。
+    if (feed.openPending) setTab("agent");
+  }, [feed.openPending]);
 
   // 外站代理探针：只取状态与可读原因（不下载 body）；失败就在面板里显示原因
   useEffect(() => {
@@ -477,7 +494,7 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
 
   return (
     <div className="flex h-full flex-col overflow-hidden border-l border-border-subtle bg-surface-raised">
-      {/* 顶部标签栏：文件 / 浏览器 / 日志 */}
+      {/* 顶部标签栏：文件 / 浏览器 / 日志 / 后台 Agent */}
       <div className="pane-header justify-between gap-2">
         <Tabs value={tab} onValueChange={(value) => setTab(value as PreviewTab)}>
           <TabsList>
@@ -493,6 +510,18 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
               <ScrollText />
               日志
             </TabsTrigger>
+            {/* 后台 Agent：标只在真有子代理时出现（对齐别处「没有的东西不长控件」的做法） */}
+            {(agentFeedCount > 0 || tab === "agent") && (
+              <TabsTrigger value="agent">
+                {agentsRunning > 0
+                  ? <Loader2 className="animate-spin text-accent" />
+                  : <Bot />}
+                后台 Agent
+                {agentFeedCount > 0 && (
+                  <span className="tabular-nums text-text-tertiary">{agentFeedCount}</span>
+                )}
+              </TabsTrigger>
+            )}
           </TabsList>
         </Tabs>
 
@@ -827,6 +856,13 @@ export default function PreviewPanel({ url, iframeRef, historyVersion, latestVer
         {/* ---------------- 日志 ---------------- */}
         <div className={cn("min-h-0 flex-1", tab === "log" ? "flex" : "hidden")}>
           <SessionLogView port={projectId ?? null} className="flex-1" />
+        </div>
+
+        {/* ---------------- 后台 Agent ---------------- */}
+        {/* 用 hidden 而不是卸载：从卡片点进去的过程页面（含 markdown / 已滚到哪）
+            在切走再切回来时不该重建。与浏览器标签同一个做法。 */}
+        <div className={cn("min-h-0 flex-1", tab === "agent" ? "flex" : "hidden")}>
+          <SubagentPane port={projectId ?? null} className="flex-1" />
         </div>
       </div>
     </div>
