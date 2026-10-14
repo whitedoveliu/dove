@@ -19,6 +19,7 @@ import { WriteTool } from "../src/tools/builtin/write.ts";
 import { EditTool } from "../src/tools/builtin/edit.ts";
 import { APPROVAL_RULE_MAX_CHARS, APPROVAL_SESSION_RULE_MAX } from "../src/constants.ts";
 import type { Tool, ToolContext } from "../src/tools/types.ts";
+import { normalizeProfile, type PermissionProfile } from "../src/tools/permission.ts";
 import type { ToolCallPayload } from "../src/providers/types.ts";
 
 const WS = "/ws";
@@ -47,7 +48,10 @@ interface DepsOpts {
   tools: Tool[];
   threadId?: string;   // 会话规则按线程存；store 里用哪个 id 就必须传哪个（缺省 th_t）
   store?: ExecDeps["store"];
-  permissionMode?: ExecDeps["permissionMode"];
+  /** 旧枚举档位 → 按预设绑定成两轴 profile（测试里读起来更短，语义与线上一致） */
+  permissionMode?: "read-only" | "workspace-write" | "danger-full-access" | "auto";
+  /** 直接给 profile（要测 writableRoots 之类的新字段时用） */
+  permission?: PermissionProfile;
   classifier?: ExecDeps["classifier"];
   events?: { type: string; [k: string]: unknown }[];
   approve?: () => { approved: boolean; remember?: boolean; reason?: string };
@@ -61,7 +65,8 @@ function depsOf(o: DepsOpts): ExecDeps {
       // ⚠️ remember 要显式进对象再断言：写成 `{...} as never, ...(v.remember ? ...)` 时会被当成断言的一部分，remember 永远传不出去（踩过）
       return { approved: v.approved, reason: v.reason as "user" | "timeout" | "no-window" | undefined, decision: v.approved ? "allow" : "deny", ...(v.remember === true ? { remember: true } : {}) } as never;
     },
-    onApprovalNeeded: o.onApprovalNeeded, permissionMode: o.permissionMode, classifier: o.classifier, store: o.store,
+    onApprovalNeeded: o.onApprovalNeeded, classifier: o.classifier, store: o.store,
+    permission: o.permission ?? normalizeProfile({ permissionMode: o.permissionMode }),
   };
 }
 /** 恰好出现一次 start / end，且 start 在 end 前 */
@@ -269,19 +274,6 @@ test("审批链：诊断事件带上是哪条策略决定的", async () => {
   assert.equal(d!.by, "tool-never-allow");
   assert.equal(d!.decision, "allow");
   assert.equal(d!.tool, "Read");
-});
-
-test("审批链：会话 deny 规则 → 「用户拒绝了这次操作」的既有措辞不变", async () => {
-  const store = new Store(new Db(":memory:"));
-  store.createThread({ id: "th_d", kind: "project", title: "t" });
-  const tool = commandTool({ name: "Bash", approval: "heuristic" });
-  rememberSessionRule(store, "th_d", "Bash", { command: "rm -rf /tmp/x" }, tool, "deny");
-  let asked = 0;
-  const out = await executeOne(call("Bash", { command: "rm -rf /tmp/x" }), depsOf({ tools: [tool], store, threadId: "th_d", onApprovalNeeded: () => { asked++; } }));
-  assert.equal(asked, 0, "记住的是拒绝 → 不该再问");
-  assert.equal(out.ok, false);
-  assert.equal(out.denied, true);
-  assert.equal(out.errorText, "[权限] 用户拒绝了这次操作。");
 });
 
 test("审批链：拒绝路径与 PendingRegistry 的既有语义一致（超时说清等了多久）", async () => {

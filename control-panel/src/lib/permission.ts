@@ -10,18 +10,24 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import {
-  getPermissionMode, setPermissionMode, getPermissionPresets,
+  getPermissionMode, setPermissionMode, getPermissionPresets, getPermissionProfile, setWritableRoots,
   getPlanMode, setPlanMode,
-  type PermissionMode, type PermissionPreset,
+  type PermissionMode, type PermissionPreset, type PermissionProfile,
 } from "@/lib/api";
 
-export type { PermissionMode, PermissionPreset };
+export type { PermissionMode, PermissionPreset, PermissionProfile };
 
 /** 主机拿不到时的兜底（机值必须和主机的 PRESETS 一致） */
 const FALLBACK_PRESETS: PermissionPreset[] = [
-  { value: "read-only", label: "仅可查看", requiresConfirm: false, experimental: false, description: "只查不动：写文件、执行命令这些工具直接不给" },
-  { value: "workspace-write", label: "工作区内修改", requiresConfirm: false, experimental: false, description: "工作区内直接改；越界（装依赖、访问工作区外）才问你" },
-  { value: "danger-full-access", label: "完全权限", requiresConfirm: true, experimental: false, description: "任何操作都不再询问 —— 只在信任的任务上用" },
+  { value: "read-only", label: "仅可查看", requiresConfirm: false, experimental: false,
+    description: "只查不动：写文件、执行命令这些工具直接不给",
+    profile: { sandbox: "read-only", approval: "never", writableRoots: [] } },
+  { value: "workspace-write", label: "工作区内修改", requiresConfirm: false, experimental: false,
+    description: "工作区内直接改；越界（装依赖、访问工作区外）才问你。注意：命令仍在本机直接执行，沙箱尚未接入",
+    profile: { sandbox: "workspace-write", approval: "risky", writableRoots: [] } },
+  { value: "danger-full-access", label: "完全权限", requiresConfirm: true, experimental: false,
+    description: "任何操作都不再询问，工作区外的文件也能直接改 —— 只在信任的任务上用",
+    profile: { sandbox: "danger-full-access", approval: "never", writableRoots: [] } },
 ];
 
 export const DEFAULT_PERMISSION: PermissionMode = "workspace-write";
@@ -62,6 +68,19 @@ export function usePermissionPresets(): { presets: PermissionPreset[]; loading: 
 
 export function presetOf(presets: PermissionPreset[], mode: PermissionMode): PermissionPreset | undefined {
   return presets.find((p) => p.value === mode);
+}
+
+/**
+ * 某个档位实际生效的**沙箱轴**。
+ *
+ * 为什么不直接读 `preset.profile.sandbox`：老主机的预设没有 `profile` 字段（新前端对着旧内核跑），
+ * 那时按档位名兜底映射 —— 宁可用映射表，也不许把 undefined 当成"没限制"。
+ */
+export function sandboxOfPreset(preset: PermissionPreset | undefined, mode: PermissionMode): PermissionProfile["sandbox"] {
+  if (preset?.profile?.sandbox) return preset.profile.sandbox;
+  if (mode === "read-only") return "read-only";
+  if (mode === "workspace-write") return "workspace-write";
+  return "danger-full-access";   // danger-full-access / auto
 }
 
 const DRAFT_KEY = "dove_new_permission";
@@ -176,4 +195,50 @@ export function usePlanMode(key: string | null | undefined) {
   }, [key]);
 
   return [planMode, change, refresh] as const;
+}
+
+/**
+ * 额外可写目录（`writableRoots`）—— 沙箱轴的一部分。
+ *
+ * 语义（与内核 `tools/permission.ts` 对齐）：这些目录是**工作区之外**的白名单 ——
+ * 「工作区内修改」档下，写这些目录不再弹审批（越界 → 区内）；完全权限档下它没有意义（本来就全放行）。
+ * 读不到（还没进项目 / 内核老版本没有这个字段）时保持空数组：**空 = 工作区外每次都问**，
+ * 这是 fail-closed 的一侧，不许退回"没限制"。
+ */
+export function useWritableRoots(key: string | null | undefined) {
+  const [roots, setRoots] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!key) { setRoots([]); return; }
+    let alive = true;
+    getPermissionProfile(key)
+      .then((p) => { if (alive && p) setRoots(p.writableRoots ?? []); })
+      .catch(() => { /* 读不到就保持现值：可能是项目刚建好、内核还没落库 */ });
+    return () => { alive = false; };
+  }, [key]);
+
+  /** 加一个目录（去重）。乐观更新：先改界面，失败回滚（和权限档一致） */
+  const add = useCallback(async (dir: string) => {
+    if (!key || !dir) return;
+    const prev = roots;
+    const next = [...new Set([...roots, dir])];
+    setRoots(next);
+    try {
+      const p = await setWritableRoots(key, next);
+      if (p) setRoots(p.writableRoots ?? next);
+    } catch { setRoots(prev); }
+  }, [key, roots]);
+
+  const remove = useCallback(async (dir: string) => {
+    if (!key) return;
+    const prev = roots;
+    const next = roots.filter((r) => r !== dir);
+    setRoots(next);
+    try {
+      const p = await setWritableRoots(key, next);
+      if (p) setRoots(p.writableRoots ?? next);
+    } catch { setRoots(prev); }
+  }, [key, roots]);
+
+  return { roots, add, remove } as const;
 }

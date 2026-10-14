@@ -6,8 +6,9 @@ import { resolve, normalize, sep } from "node:path";
 import type { Tool, ToolContext, ToolAccesses, ApprovalRequest, ApprovalResponse } from "../tools/types.ts";
 import { applyBudget } from "../tools/budget.ts";
 import { repairToolCall } from "../tools/repair-call.ts";
-import { classifyLocally, buildApprovalRequest } from "../tools/approval.ts";
-import { rememberSessionRule, sessionRuleDecision, type ApprovalResponseRemembered, type RuleStorePort } from "../tools/rule-pattern.ts";
+import { DEFAULT_PROFILE, type DenialMemory, type PermissionProfile } from "../tools/permission.ts";
+import type { RuleStorePort } from "../tools/rule-pattern.ts";
+import { decideApproval } from "./approval-chain.ts";
 import type { ToolCallPayload } from "../providers/types.ts";
 import { TOOL_TIMEOUT_MS, approvalTimeoutMs, humanDuration, SCHEDULER_DEFAULT_SERIAL } from "../constants.ts";
 
@@ -36,11 +37,16 @@ export interface ExecDeps {
   classifier?: ClassifierFn;
   timeoutMs?: number;
   onApprovalNeeded?: (toolCallId: string, req: ApprovalRequest) => void;
-  /** 权限模式：full 时不审批任何操作（见 tools/approval.ts 的 PermissionMode） */
-  permissionMode?: import("../tools/approval.ts").PermissionMode;
+  /**
+   * 本轮权限（两轴：沙箱 × 审批），由 runtime 从线程 metadata 解析后注入。见 tools/permission.ts。
+   * 缺省 = workspace-write 语义 + 逐条风险审批（**fail-closed**，没接线时绝不放宽）。
+   */
+  permission?: PermissionProfile;
   /** 线程存储（可选）—— 会话级「同意并记住」的落点；没传时规则匹配/写入整体退化（不报错）。
    *  接线不用改 wire.ts：buildExecDeps 的 execOverrides 透传 ExecDeps 顶层字段。 */
   store?: RuleStorePort;
+  /** 「同一形状不再重复打扰」的会话内记忆（可选；不传 = 每次照问，见 tools/permission.ts 的 DenialMemory） */
+  denials?: DenialMemory;
   /**
    * 「看得见但不可执行」（exposure=visible 的线程裁剪）：返回给模型看的拦截理由 → 直接拦下。
    * 文案必须明说「不是工具不存在」（见 agent/tool-policy.ts 的 executionBlockedReason）——
@@ -67,137 +73,6 @@ export function prepareCall(
   return { tool, name: fixed.name, args: fixed.args ?? {}, repaired: fixed.name !== call.function.name };
 }
 
-// ── 审批策略链 ─────────────────────────────────────────
-/** 一条策略给出的结论；undefined = 交给下一条 */
-type Decision = "allow" | "deny" | "ask";
-interface Outcome {
-  decision: Decision;
-  /** ask 时用；不给则按「允许执行 <工具>？」构造 */
-  request?: ApprovalRequest;
-  /** deny 时给用户看的理由 */
-  denyReason?: string;
-  /** 命中的规则串（会话规则才有），只用于诊断 */
-  rule?: string;
-}
-interface StrategyCtx { tool: Tool; args: Record<string, unknown>; toolCallId: string; deps: ExecDeps }
-interface Strategy {
-  /** 策略名会进 tool:approval_decision 事件 —— 线上排查「这条为什么没问」全靠它 */
-  name: string;
-  run: (c: StrategyCtx) => Outcome | undefined | Promise<Outcome | undefined>;
-}
-
-/** 工具自带的兜底请求（always 档、以及分类器缺席时的保守请求） */
-function toolRequest(tool: Tool, args: Record<string, unknown>): ApprovalRequest {
-  return { title: `允许执行 ${tool.name}？`, message: JSON.stringify(args).slice(0, 600), riskLevel: "medium" };
-}
-/** 从参数里取命令串（Bash 用 command，个别工具用 cmd） */
-function commandOf(args: Record<string, unknown>): string {
-  return typeof args.command === "string" ? args.command : typeof args.cmd === "string" ? args.cmd : "";
-}
-
-/** 有序策略表：**第一条给出结论的生效**（返回 undefined 交给下一条）。顺序即语义，别随手重排：
- *  full-access → auto 分类器 → 会话规则 → always 问 → 本地启发式 → 无需审批档 → 兜底问。 */
-let strategiesCache: Strategy[] | undefined;
-function approvalStrategies(): Strategy[] {
-  return (strategiesCache ??= [
-    { name: "full-access-allow", run: (c) => (c.deps.permissionMode === "danger-full-access" ? { decision: "allow" } : undefined) },
-    {
-      name: "auto-mode-classifier",
-      // auto（实验）：无沙箱，但**每次**调用都让分类器审一遍 —— 不看本地启发式。
-      // ⚠️ fail-safe 而不是 fail-open：没有分类器 / 分类器抛错时**要审批**。这里踩过 —— 分类器
-      //    只声明没实现，而当时的写法是「没有分类器就放行」：auto 表面说「每次审一遍」、实际**全放行**。
-      run: async (c) => {
-        if (c.deps.permissionMode !== "auto") return undefined;
-        const cmd = commandOf(c.args);
-        if (!cmd) return { decision: "allow" };      // 没有命令串（写类工具）→ auto 也管不着，放行
-        let req: ApprovalRequest | null = null;
-        if (c.deps.classifier) {
-          try { req = await c.deps.classifier(cmd); }
-          catch { req = buildApprovalRequest(cmd, "medium"); }   // 分类器炸了 → 保守要权限
-        } else req = buildApprovalRequest(cmd, "medium");         // 没接分类器 → 保守要权限
-        if (!req) return { decision: "allow" };      // 分类器明确说没问题 → 放行
-        return { decision: "ask", request: req };
-      },
-    },
-    {
-      name: "session-rule",    // 命中用户明确记住的规则（按「后记的优先」倒序匹配）
-      run: (c) => {
-        if (!c.deps.store) return undefined;
-        const hit = sessionRuleDecision(c.deps.store, c.deps.ctxBase.threadId, c.tool.name, c.args, c.tool, c.deps.ctxBase.workdir);
-        return hit ? { decision: hit.decision, rule: hit.rule, denyReason: "会话规则" } : undefined;
-      },
-    },
-    {
-      name: "tool-always-ask",
-      // 工具声明了 always → 每次都问。⚠️ 必须走 onApprovalNeeded 通知：通知不发出去，界面/日志
-      // 就不知道有人在等，只能干等到 DOVE_APPROVAL_TIMEOUT_MS（5 分钟）自动拒绝 —— 用户从没看见弹窗。
-      run: (c) => (c.tool.approval === "always" ? { decision: "ask", request: toolRequest(c.tool, c.args) } : undefined),
-    },
-    {
-      name: "local-heuristic",
-      // 只对**带命令**的工具做本地规则；没有命令串就交棒给下一条
-      // （这是 Write/Edit 的必经之路：它们标了 heuristic 却只接受 file_path/content，没有 command）。
-      run: async (c) => {
-        if (c.tool.approval !== "heuristic") return undefined;
-        const cmd = commandOf(c.args);
-        if (!cmd) return undefined;
-        const local = classifyLocally(cmd, c.deps.ctxBase.workdir);
-        if (local === "safe" || local === "low") return { decision: "allow" };
-        let req: ApprovalRequest | null = local === "medium" ? buildApprovalRequest(cmd, "medium") : null;
-        if (!req && c.deps.classifier) { try { req = await c.deps.classifier(cmd); } catch { req = null; } }
-        if (!req) req = buildApprovalRequest(cmd, "medium");   // 兜底：一律要权限
-        return { decision: "ask", request: req };
-      },
-    },
-    {
-      name: "tool-never-allow",
-      // never 档：工具自己声明「不用审批」→ 放行。
-      // ⚠️ 第二半（heuristic 却没有 command）**是刻意保留**的既有行为，别改成「问一句」：Write/Edit
-      //    的档位就是 heuristic、参数里从来没有 command，写侧安全靠 resolveInsideWorkspace 把路径锁在
-      //    工作区内（见 builtin/util.ts 的踩坑史），不靠审批。这里必须放行，否则每个 Write/Edit 都弹窗。
-      run: (c) => {
-        if (c.tool.approval === "never") return { decision: "allow" };
-        // 只对**声明了参数模式**的工具放行（Write/Edit 的参数语义由它自己写清）；没声明 approvalRule
-        // 的启发式工具可能把命令塞在任意字段里 —— 那些一律不放行，避免变成「猜不到就放」。
-        if (c.tool.approval === "heuristic" && c.tool.approvalRule && !commandOf(c.args)) return { decision: "allow" };
-        return undefined;
-      },
-    },
-    { name: "fallback-ask", run: (c) => ({ decision: "ask", request: toolRequest(c.tool, c.args) }) },
-  ]);
-}
-
-/** 决定 → 最终回执；ask 在这里变成真正的阻塞等待 */
-async function finishApproval(out: Outcome, c: StrategyCtx): Promise<{ needed: boolean; request?: ApprovalRequest; response?: ApprovalResponse }> {
-  if (out.decision === "allow") return { needed: false };
-  if (out.decision === "deny") {
-    // 保持 agent/pending.ts 的既有措辞类别：reason="user" → 工具结果说「用户拒绝了这次操作」。
-    // 区别只是这次拒绝是**记住的规则**代用户表的态，denyReason 写清是哪条规则。
-    return { needed: true, response: { approved: false, reason: "user", decision: "deny", denyReason: out.denyReason } };
-  }
-  const req = out.request ?? toolRequest(c.tool, c.args);
-  c.deps.onApprovalNeeded?.(c.toolCallId, req);
-  const response = await c.deps.resolveApproval(req, c.toolCallId);
-  // 「同意并记住」→ 写会话规则。**只在 remember === true 时写**：默认不问自记 = 偷偷扩大授权。
-  if ((response as ApprovalResponseRemembered).remember === true && c.deps.store) {
-    rememberSessionRule(c.deps.store, c.deps.ctxBase.threadId, c.tool.name, c.args, c.tool, response.approved ? "allow" : "deny");
-  }
-  return { needed: true, request: req, response };
-}
-
-async function decideApproval(
-  tool: Tool, args: Record<string, unknown>, deps: ExecDeps, toolCallId: string,
-): Promise<{ needed: boolean; request?: ApprovalRequest; response?: ApprovalResponse }> {
-  const ctx: StrategyCtx = { tool, args, toolCallId, deps };
-  let out: Outcome | undefined; let by = "";
-  for (const s of approvalStrategies()) { out = await s.run(ctx); if (out) { by = s.name; break; } }   // 第一条给出结论的生效
-  // 诊断：这条是**哪条策略**决定的。以前这里是一串 if，出问题只能靠 printf 猜。
-  try {
-    deps.ctxBase.emit("tool:approval_decision", { toolCallId, tool: tool.name, by, decision: out?.decision ?? "allow", rule: out?.rule });
-  } catch { /* 事件发不出去不影响审批本身 */ }
-  return await finishApproval(out ?? { decision: "ask" }, ctx);
-}
-
 export async function executeOne(call: ToolCallPayload, deps: ExecDeps): Promise<ExecOutcome> {
   const started = Date.now();
   // 「看得见但不可执行」（exposure 轴）：必须在 prepareCall **之前**拦 —— 被裁的工具还在工具表里，
@@ -216,14 +91,18 @@ export async function executeOne(call: ToolCallPayload, deps: ExecDeps): Promise
   const appr = await decideApproval(tool, args, deps, call.id);
   if (appr.needed && !appr.response?.approved) {
     const reason = appr.response?.reason;
+    const denyReason = appr.response?.denyReason;
     // 超时要**说清等了多久**：原来只有一句「审批超时」，用户回来只看到「Bash 失败」。
     const waitedMs = appr.response?.timeoutMs ?? approvalTimeoutMs();
-    const text = reason === "timeout"
-      ? `[权限] 等待审批超时（${humanDuration(waitedMs)}），命令已被自动拒绝。` +
-        "没有人处理这次审批请求；想等久一点可以设置环境变量 DOVE_APPROVAL_TIMEOUT_MS（毫秒）。"
-      : reason === "no-window"
-        ? "[权限] 没有可用的审批窗口（界面没连上），命令已被自动拒绝。"
-        : "[权限] 用户拒绝了这次操作。";
+    const text = denyReason
+      // 策略自己拒的（受保护路径 / 会话规则 / 已拒形状 / 只读沙箱）：不是用户点的，**别嫁祸给用户**
+      ? `[权限] 这次调用被拒绝：${denyReason}`
+      : reason === "timeout"
+        ? `[权限] 等待审批超时（${humanDuration(waitedMs)}），命令已被自动拒绝。` +
+          "没有人处理这次审批请求；想等久一点可以设置环境变量 DOVE_APPROVAL_TIMEOUT_MS（毫秒）。"
+        : reason === "no-window"
+          ? "[权限] 没有可用的审批窗口（界面没连上），命令已被自动拒绝。"
+          : "[权限] 用户拒绝了这次操作。";
     if (reason === "timeout") {   // 超时不静默：单独发事件，面板/日志能显示成一条明确提示
       try {
         deps.ctxBase.emit("tool:approval_timeout", { toolCallId: call.id, tool: name, timeoutMs: waitedMs, message: text });
@@ -235,8 +114,17 @@ export async function executeOne(call: ToolCallPayload, deps: ExecDeps): Promise
     };
   }
 
+  // escalated = 这次调用的越界写已经被审批通道放行过（工具侧护栏据此放行；见 builtin/util.ts 的 resolveWritablePath）。
+  // 判据只有两条：① 审批链这次问了、用户批准了；② 沙箱就是完全权限（压根不问）。
+  // 其余情况（包括"该问却没问"的策略接线断裂）一律 false → 工具护栏 fail-closed。
+  const escalated = appr.needed
+    ? appr.response?.approved === true
+    : deps.permission?.sandbox === "danger-full-access";
   // 执行（超时 + 全包 try/catch）
-  const ctx: ToolContext = { ...deps.ctxBase, toolCallId: call.id, requestApproval: deps.resolveApproval };
+  const ctx: ToolContext = {
+    ...deps.ctxBase, toolCallId: call.id, requestApproval: deps.resolveApproval,
+    permission: { ...(deps.permission ?? DEFAULT_PROFILE), escalated },
+  };
   const timeout = tool.timeoutMs ?? deps.timeoutMs ?? TOOL_TIMEOUT_MS;
   let raw: unknown; let ok = true; let errorText: string | undefined;
   // ⚠️ 超时定时器**必须**在工具结束时清掉：原来那个裸 setTimeout 没人清，每次调用都给事件循环留一个最长

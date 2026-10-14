@@ -1,54 +1,43 @@
 /**
- * 权限模式路由（从 routes-project.ts 抽出来，那边超 400 行了）
+ * 权限路由（从 routes-project.ts 抽出来，那边超 400 行了）
  *
- * 三档对齐 Codex 的 SandboxMode：
- *   full       完全访问 —— 任何操作都不审批
- *   workspace  工作区内修改 —— 默认；工作区内放行，越界才问
- *   readonly   仅可查看 —— 写类工具直接从工具表里裁掉
+ * 权限模型 = 两轴（sandbox × approval），定义与预设表都在 core 的 tools/permission.ts ——
+ * 这里只做 HTTP 适配，**预设表不再复制一份**（原来 server 与面板各存一份，加一档要改两处）。
  *
- * 存在**线程 metadata** 里（不是全局设置）—— 权限是"这次对话能干多少"，
- * 换个任务可能就想放宽或收紧。
+ * 存储在线程 metadata（不是全局设置）—— 权限是"这次对话能干多少"，换个任务可能就想放宽或收紧。
+ * **双读双写**：新字段 `permission`（profile）优先，旧字段 `permissionMode` / `readOnly` 仍然兼容，
+ * 老面板只认 `mode` 时由 profile 反推一个最接近的档位（见 legacyModeOf）。
  */
+import * as os from "node:os";
+import * as path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
 import { json, readBody, findProjectByKey } from "./server.ts";
+import {
+  PERMISSION_PRESETS, normalizeProfile, legacyModeOf, normalizePermissionMode,
+  DEFAULT_PERMISSION_MODE, type PermissionProfile,
+} from "../../../core/src/tools/permission.ts";
 
-/** 收新机值 + 旧别名（存量数据里还是 full/workspace/readonly，双读兼容） */
-const MODES = new Set(["danger-full-access", "workspace-write", "read-only", "auto"]);
-const ALIAS: Record<string, string> = { full: "danger-full-access", workspace: "workspace-write", readonly: "read-only" };
-
-/**
- * 预设目录（B4）—— **主机下发，前端不再硬编码**。
- *
- * 参考 DSH 的 permission-presets catalog：加一档只改这里一处，
- * 前端只管渲染。`requiresConfirm` 让「完全权限要过确认闸」这件事
- * 由主机说了算，而不是各个界面各记一遍。
- */
-const PRESETS = [
-  {
-    value: "read-only", label: "仅可查看", requiresConfirm: false, experimental: false,
-    description: "只查不动：写文件、执行命令这些工具直接不给",
-  },
-  {
-    value: "workspace-write", label: "工作区内修改", requiresConfirm: false, experimental: false,
-    description: "工作区内直接改；越界（装依赖、访问工作区外）才问你",
-  },
-  {
-    value: "danger-full-access", label: "完全权限", requiresConfirm: true, experimental: false,
-    description: "任何操作都不再询问 —— 只在信任的任务上用",
-  },
-  {
-    value: "auto", label: "Auto review", requiresConfirm: true, experimental: true,
-    description: "无沙箱运行，但每次工具调用前由模型审一遍；审查拒绝的转你批准",
-  },
-] as const;
+/** 可写目录的入参校验：只收绝对路径（`~/` 展开）；相对路径直接丢掉 —— 它相对哪个 cwd 都是歧义 */
+function cleanRoots(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const r of raw) {
+    if (typeof r !== "string") continue;
+    const s = r.trim();
+    if (!s) continue;
+    if (s === "~" || s.startsWith("~/")) out.push(path.join(os.homedir(), s.slice(s === "~" ? 1 : 2)));
+    else if (path.isAbsolute(s)) out.push(s);
+  }
+  return [...new Set(out)];
+}
 
 export async function handlePermissionRoutes(
   path: string, _url: URL, req: IncomingMessage, res: ServerResponse, svc: Services,
 ): Promise<boolean> {
   // ── GET /api/permission-presets（B4）───────────────
   if (path === "/api/permission-presets" && req.method === "GET") {
-    json(res, 200, { success: true, default: "workspace-write", presets: PRESETS });
+    json(res, 200, { success: true, default: DEFAULT_PERMISSION_MODE, presets: PERMISSION_PRESETS });
     return true;
   }
 
@@ -67,34 +56,56 @@ export async function handlePermissionRoutes(
 
   if (req.method === "POST") {
     const b = await readBody(req);
-    const patch: Record<string, unknown> = {};
+    const cur = normalizeProfile(thread.metadata);
+    const next: PermissionProfile = { sandbox: cur.sandbox, approval: cur.approval, writableRoots: [...cur.writableRoots] };
+    let touched = false;
+
+    // ① 旧前端：整个档位（mode）—— 按预设绑定一次把两根轴都设好
     if (b.mode !== undefined) {
-      const raw = String(b.mode ?? "");
-      const mode = ALIAS[raw] ?? raw;            // 旧前端传 full 也认
-      if (!MODES.has(mode)) {
-        json(res, 400, { success: false, message: "mode 必须是 danger-full-access / workspace-write / read-only / auto" });
-        return true;
-      }
-      // readOnly 是老布尔字段，一起写保持兼容（runtime 两处都认）
-      patch.permissionMode = mode;
-      patch.readOnly = mode === "read-only";
+      const mode = normalizePermissionMode(b.mode);            // 旧别名 full / workspace / readonly 也认
+      const preset = PERMISSION_PRESETS.find((p) => p.value === mode) ?? PERMISSION_PRESETS[1]!;
+      next.sandbox = preset.profile.sandbox;
+      next.approval = preset.profile.approval;
+      touched = true;
+    }
+    // ② 新前端：按轴改（profile.sandbox / profile.approval 任给其一）
+    if (b.profile !== undefined && b.profile !== null && typeof b.profile === "object") {
+      const raw = b.profile as Record<string, unknown>;
+      const merged = normalizeProfile({ permission: { sandbox: next.sandbox, approval: next.approval, writableRoots: next.writableRoots, ...raw } });
+      next.sandbox = merged.sandbox;
+      next.approval = merged.approval;
+      touched = true;
+    }
+    // ③ 额外可写目录（绝对路径；相对路径一律丢弃，见 cleanRoots）
+    if (b.writableRoots !== undefined) {
+      next.writableRoots = cleanRoots(b.writableRoots);
+      touched = true;
+    }
+
+    const patch: Record<string, unknown> = {};
+    if (touched) {
+      patch.permission = next;
+      // readOnly 是更老的布尔字段：**继续一起写**（老内核/老读者还在读它），新读者读 permission
+      patch.readOnly = next.sandbox === "read-only";
     }
     // ── 计划模式（B5）────────────────────────────────
     // 人类在输入框打 /plan → 面板调这里。它**不改权限档**，只让运行时
     // 把写类工具从工具表里裁掉（照 Dove 的原则：计划模式是硬只读，不是软提示）。
     if (typeof b.planMode === "boolean") patch.planMode = b.planMode;
-    if (Object.keys(patch).length === 0) {
-      json(res, 400, { success: false, message: "至少给 mode 或 planMode 之一" });
+    if (!touched && patch.planMode === undefined) {
+      json(res, 400, { success: false, message: "至少给 mode / profile / writableRoots / planMode 之一" });
       return true;
     }
     svc.store.updateThread(thread.id, { metadata: { ...thread.metadata, ...patch } });
   }
 
-  const cur = svc.store.getThread(thread.id)?.metadata ?? {};
-  // 读的时候也过一遍映射：存量数据里可能是旧机值
-  const mode = cur.readOnly === true
-    ? "read-only"
-    : (ALIAS[String(cur.permissionMode ?? "")] ?? cur.permissionMode ?? "workspace-write");
-  json(res, 200, { success: true, mode, planMode: cur.planMode === true });
+  const meta = svc.store.getThread(thread.id)?.metadata ?? {};
+  const profile = normalizeProfile(meta);
+  json(res, 200, {
+    success: true,
+    mode: legacyModeOf(profile),      // 旧前端只认 mode —— 由 profile 反推一个最接近的档位
+    planMode: meta.planMode === true,
+    profile,                          // 新前端读这个（sandbox / approval / writableRoots）
+  });
   return true;
 }

@@ -379,6 +379,33 @@ approval: true          // 这是审批，不是普通提问
 remember_rule: "Bash(rm -rf /tmp/x)"   // 勾「记住」将落下的规则形状（逐字 = 工具自报的参数）；缺省 = 不给该选项
 ```
 
+`remember_rule` **缺省**有两种情形，面板都据此不画「记住」：
+① 工具没声明 `approvalRule`（算不出形状）；② 内核在请求的 `metadata.noRemember=true` 里明确禁止
+—— 目前只有**凭证类写目标**（`~/.ssh/authorized_keys`、`~/.aws/credentials`、`~/.gnupg/**`）走这一条：
+任何档位（含完全权限）都要单独确认一次，不允许「记住」。
+
+### 权限的两根轴（`GET/POST /api/projects/{port}/permission`）
+
+权限存在**项目线程的 metadata** 上，形如：
+
+```json
+{ "permission": { "sandbox": "workspace-write", "approval": "risky", "writableRoots": ["/abs/extra/dir"] } }
+```
+
+- `sandbox`：`read-only` | `workspace-write` | `danger-full-access`（能写哪）
+- `approval`：`never` | `risky` | `review`（要不要问）—— `review` 是实验档 Auto review
+- `writableRoots`：工作区之外**额外**允许写的目录（绝对路径；相对路径一律丢弃）
+
+**读**：`{success, mode, planMode, profile}` —— `mode` 是给老前端的**反推值**（由 profile 映射回四档），
+新前端读 `profile`。
+**写**：`{mode}`（旧，按预设绑定两根轴）/ `{profile:{sandbox?,approval?}}`（新，按轴改）
+/ `{writableRoots:[…]}`（替换整份列表）/ `{planMode}` 任给其一。旧字段 `permissionMode` / `readOnly`
+仍被**双读**（存量数据），新写回只写 `permission`（`readOnly` 为兼容继续一起写）。
+
+**行为**：`danger-full-access` 下 Write/Edit 可以写工作区外的文件（本轮修正的语义），
+越界时内核发 `tool:write-escalated` 事件留审计痕迹；`workspace-write` 下越界写弹一次审批
+（勾「记住」落成 `Write(<path>)` 会话规则）；`.git` / `.codex` / `.agents` 在 `workspace-write` 下**硬拒**。
+
 ### `GET /api/projects/{port}/subagents` 的 `usage`
 
 每行的 `usage` 从任务表（`metadata.taskId` → `TaskRegistry`）反查：

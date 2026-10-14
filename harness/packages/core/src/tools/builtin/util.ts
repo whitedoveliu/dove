@@ -7,6 +7,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import { assertReadablePath } from "../../security/paths.ts";
+import { decideWrite, writableRootsOf, DEFAULT_PROFILE, type PermissionProfile } from "../permission.ts";
 
 export type ToolOut = Record<string, unknown>;
 
@@ -36,29 +37,39 @@ export function resolvePath(p: unknown, workdir: string): string {
 }
 
 /**
- * 写操作的路径护栏：解析成绝对路径，并**强制它落在工作区内**。
+ * 写操作的路径护栏：解析成绝对路径，再按**两轴权限**判定（判定逻辑在 tools/permission.ts 的 decideWrite）。
  *
- * 为什么必须拦（实测查出来的缺口）：
- *   · Write/Edit 标了 approval: "heuristic"，但审批判定只看 args.command，
- *     而它们没有这个字段 → 走不到审批分支 → **从不审批**
- *   · 而 resolvePath 只做 normalize，不检查边界
- *   → 合起来：「工作区内修改」这一档实际能 Write("/etc/anything")、
- *     甚至写 ~/.ssh/authorized_keys，**不问不拦**。档位的名字是假的。
- *
- * 为什么直接拒绝而不是弹审批：简单、可预测。真要越界写，
- * 走 Bash（那边有分类器 + 审批兜着），别让静默路径存在。
+ * 历史（两次都栽过，别再踩）：
+ *   · 最初不检查边界 → 「工作区内修改」实际能 Write("/etc/anything")、写 ~/.ssh/authorized_keys，**不问不拦**；
+ *   · 修好后又锁死在"只看工作区内/外"，且不读权限档 → 「完全权限」下越界写照样被拒，
+ *     模型只好回头问用户（实测踩过，就是这一轮的起因）。
+ * 现在：判定归沙箱轴（decideWrite），审批归执行器的 write-scope 策略（审批轴）。
+ * 这里是**兜底**：正常路径上策略已经问过了；能走到"该问却没被问"的分支说明接线断了，
+ * 一律 fail-closed（抛错），绝不许静默放宽。
  */
-export function resolveInsideWorkspace(p: unknown, workdir: string): string {
+export function resolveWritablePath(
+  p: unknown, workdir: string, permission?: PermissionProfile & { escalated?: boolean },
+): string {
   const abs = resolvePath(p, workdir);
-  const root = path.resolve(workdir);
-  if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw new Error(
-      "路径在工作区外，已拒绝：" + abs + "\n" +
-      "当前工作区是 " + root + "。只允许写工作区内的文件。\n" +
-      "如果确实要写到外面，请让用户确认后用 Bash（那条路径有审批）。",
-    );
+  const profile: PermissionProfile = permission ?? DEFAULT_PROFILE;
+  const d = decideWrite(abs, profile, workdir);
+  if (d.kind === "allow") return abs;
+  if (d.kind === "deny") {
+    throw new Error("路径不可写，已拒绝：" + abs + "\n" + d.reason);
   }
-  return abs;
+  // ask（越界而沙箱不是完全权限）：只有这次调用**已经被审批通道放行过**才允许落盘
+  if (permission?.escalated) return abs;
+  throw new Error(
+    "路径在工作区外，已拒绝：" + abs + "\n" +
+    "当前可写根：" + writableRootsOf(profile, workdir).join("、") + "\n" +
+    "要写到外面，两条路：① 让用户在权限弹层里把目标目录加进「额外可写目录」；" +
+    "② 或把本次会话切到「完全权限」。",
+  );
+}
+
+/** @deprecated 老签名（工作区围栏版本）——只给还没迁移的调用方兜底，新代码用 resolveWritablePath */
+export function resolveInsideWorkspace(p: unknown, workdir: string): string {
+  return resolveWritablePath(p, workdir);
 }
 
 /**

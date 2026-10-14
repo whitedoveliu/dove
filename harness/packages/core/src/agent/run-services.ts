@@ -22,6 +22,7 @@ import { ImageRelay } from "./image-attach.ts";
 import { makeContextStats } from "./context-stats.ts";
 import { SubagentHost } from "./subagent-host.ts";
 import { executeOne } from "../loop/tool-exec.ts";
+import { DenialMemory } from "../tools/permission.ts";
 import { bindPtcRuntime, PTC_APPROVAL_PREFIX } from "../tools/builtin/run-script.ts";
 
 export interface RunServicesInput {
@@ -56,8 +57,17 @@ export interface RunServices {
   subagents: SubagentHost;
 }
 
+/**
+ * 进程级的「同一形状不再重复打扰」记忆（键里带线程 id，所以跨线程共享是安全的）。
+ *
+ * 为什么放这儿而不是 runtime：这是**接线**（谁给执行器提供记忆），不是运行时门面的事；
+ * 而且直接构造 ExecDeps 的单测拿不到它（deps.denials 为 undefined → 策略跳过），测试因此是确定的。
+ */
+export const processDenials = new DenialMemory();
+
 export function attachRunServices(input: RunServicesInput): RunServices {
   const svc = input.services;
+  input.execDeps.denials ??= processDenials;
   const images = new ImageRelay({
     store: input.store,
     threadId: input.parentThreadId,

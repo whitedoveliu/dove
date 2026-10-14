@@ -1,0 +1,5 @@
+# aa 运行产物：不进 git。config 与 checks/ 不在此列，它们应当被版本管理。
+logs/
+reviews/
+patches/
+drafts/

@@ -90,7 +90,8 @@ ON_DEMAND 的每个工具**必须写 `discoverable`**（`ToolSearch` 的描述�
 | **四道闸门**：steering > 完成守卫 > 权限续跑 > 自动续跑，互斥 | `loop/gates.ts` | `npm test` 的 4 个闸门用例 |
 | **工具输出预算**：三档 + 6000 字符 + spill + 截断三要素文案 | `tools/budget.ts` | `npm test` 的「大结果被截断」 |
 | **调用修复**：名字模糊匹配 + 参数错名映射 | `tools/repair-call.ts` | `npm test` 的 3 个修复用例 |
-| **审批链**：只读放行 → 区内重定向放行 → 越界要权限 | `tools/approval.ts` | `npm test` 的 4 个审批用例 |
+| **审批链**：凭证必问 → 会话规则 → 已拒形状 → 写边界 → never 放行 → 分类器 → 启发式 | `loop/approval-chain.ts` | `npm test` 的审批用例 + `packages/core/test/write-scope.test.ts` |
+| **两轴权限**：sandbox（能写哪）× approval（要不要问），档位只是命名绑定 | `tools/permission.ts` | `npm test` 的 `permission-profile / write-scope / permission-inherit` |
 | **前缀缓存**：静态段在前，易变内容走 `mt` 进 messages | `context/assemble.ts` `tail-context.ts` | `npm test` 的「mt prepend 到最后一条 user」 |
 | **AutoCompact**：阈值 80 / 保留 4 回合 / 去抖 | `context/compact.ts` | `scripts/smoke-context.ts` |
 

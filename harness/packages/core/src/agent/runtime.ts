@@ -14,8 +14,7 @@ import { Watchdog } from "../loop/watchdog.ts";
 import { SteeringQueue } from "../loop/steering.ts";
 import { buildExecDeps } from "./wire.ts";
 import { applyThreadPolicy, renderPolicyNotice, executionBlockedReason, exposureModeFromEnv } from "./tool-policy.ts";
-import { PLAN_MODE_NOTICE, planAwareMode } from "./plan-mode.ts";
-import { normalizePermissionMode } from "../tools/approval.ts";
+import { PLAN_MODE_NOTICE, resolveMode } from "./plan-mode.ts";
 import { approvalTimeoutMs } from "../constants.ts";
 import { runDispatch } from "./dispatch.ts";
 import { SubagentTranscript, makeSubagentThreadId } from "../agents/subagent-store.ts";
@@ -190,11 +189,11 @@ export class AgentRuntime {
     let lastUsage: { inputTokens: number; outputTokens: number; cacheReadTokens: number } | undefined;
 
     // ⚠️ 必须在 buildExecDeps **之前**声明 —— const 有 TDZ，声明写后面会直接抛。
-    const { planMode, permissionMode } = planAwareMode(thread.metadata);   // 计划模式 = 硬只读
+    const { planMode, profile } = resolveMode(thread.metadata);   // 计划模式 = 硬只读（sandbox 抬到 read-only）
 
-    // ── 线程级工具策略（D8）：Home 拿不到写类工具，是能力裁剪不是提示词请求。⚠️ 必须排在 buildExecDeps 之前（见上：TDZ —— 它依赖的 planAwareMode 是上面那条 const）
+    // ── 线程级工具策略（D8）：Home 拿不到写类工具，是能力裁剪不是提示词请求。⚠️ 必须排在 buildExecDeps 之前（见上：TDZ —— 它依赖的 resolveMode 是上面那条 const）
     const exposure = exposureModeFromEnv();   // DOVE_TOOL_EXPOSURE=visible 才开新轴；缺省 cut（工具真被删掉）
-    const readOnly = permissionMode === "read-only";
+    const readOnly = profile.sandbox === "read-only";
     const policy = applyThreadPolicy(thread.kind, this.#s.tools, { readOnly, exposure });
     const policyNotice = renderPolicyNotice(thread.kind, policy.blocked, store.listProjects().map((p) => p.id), policy.reason, policy.exposure);
     const blockedNames: ReadonlySet<string> = new Set(policy.blockedFromExecution);
@@ -213,7 +212,7 @@ export class AgentRuntime {
       sink: opts.sink as (e: { type: string; [k: string]: unknown }) => void,
       threadId: opts.threadId, projectId, workdir, outputsDir: workdir + "/outputs", signal,
       // 走通用通道 —— 以后再加 ExecDeps 顶层字段不用动 wire.ts（栽过三次的地方）；classifier 也走这里，它曾只声明没转发
-      execOverrides: { permissionMode, classifier: this.#s.classifier, store: this.#s.store,
+      execOverrides: { permission: profile, classifier: this.#s.classifier, store: this.#s.store,
         // exposure=visible 时工具还在表里：这里把被裁名单拦成 ok:false（**不置 denied**，见 gates.ts）
         blockedFromExecution: (name: string) => executionBlockedReason(name, blockedNames, policy.reason) },
       onApprovalNeeded: (id, req) => {
@@ -222,7 +221,7 @@ export class AgentRuntime {
         logs.append("tool_approval", { toolCallId: id, riskLevel: req.riskLevel, title: req.title, timeoutMs }, { run: runId });
         const tp = toolIndex.get(id);
         if (tp) { tp.state = "approval-requested"; }
-        opts.sink({ type: "tool_approval", toolCallId: id, message: req.message, title: req.title, riskLevel: req.riskLevel, timeoutMs });
+        opts.sink({ type: "tool_approval", toolCallId: id, message: req.message, title: req.title, riskLevel: req.riskLevel, timeoutMs, metadata: req.metadata });
       },
     });
 

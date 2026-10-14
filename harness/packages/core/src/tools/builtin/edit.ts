@@ -4,7 +4,7 @@
  */
 import * as fsp from "node:fs/promises";
 import { defineTool, S } from "../types.ts";
-import { guarded, resolvePath, resolveInsideWorkspace, relPath, str, optBool, readTextFile } from "./util.ts";
+import { guarded, resolvePath, resolveWritablePath, relPath, str, optBool, readTextFile } from "./util.ts";
 import { recordFileMutation } from "../turn-diff.ts";
 import type { ToolAccesses } from "../types.ts";
 
@@ -42,7 +42,7 @@ export const EditTool = defineTool({
   approvalRule: ruleArg,
   execute: (input, ctx) => guarded(async () => {
     // ⚠️ 必须用带护栏的版本 —— 否则能改工作区外的文件且不审批（见 util 的说明）
-    const abs = resolveInsideWorkspace(str(input, "file_path"), ctx.workdir);
+    const abs = resolveWritablePath(str(input, "file_path"), ctx.workdir, ctx.permission);
     const oldStr = str(input, "old_string");
     const newStr = String(input.new_string ?? "");
     const replaceAll = optBool(input, "replace_all", false);

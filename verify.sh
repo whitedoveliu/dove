@@ -38,7 +38,7 @@ echo "== 0. 前置检查 =="
 # 症状是「8831 上响应 /api/health 的不是这次起的那个内核」这类看着像代码坏了的报错。
 # 与其让人去猜，不如在这里就把话说清楚、直接失败。
 BUSY=""
-for p in 8831 8841 8851 8861 8862 8871 8881 8882 8883 8884; do
+for p in 8831 8841 8851 8861 8862 8871 8881 8882 8883 8884 8885; do
   if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then BUSY="$BUSY $p"; fi
 done
 if [ -n "$BUSY" ]; then
@@ -47,7 +47,7 @@ if [ -n "$BUSY" ]; then
   echo "     清掉：   for p in$BUSY; do lsof -t -nP -iTCP:\$p -sTCP:LISTEN | xargs -r kill; done"
   echo "     确认没有别的 verify 在跑之后重试。"
 else
-  ok "冒烟端口（8831/8841/8851/8861/8862/8871/8881/8882/8883/8884）都空闲"
+  ok "冒烟端口（8831/8841/8851/8861/8862/8871/8881/8882/8883/8884/8885）都空闲"
 fi
 
 echo "== 1. 静态检查 =="
@@ -75,7 +75,7 @@ for s in smoke-routes.mjs smoke-cli-exit.mjs smoke-cli.mjs; do
 done
 
 echo "== 3b. 新能力冒烟（PTC / 后台任务 / 循环纪律 / 目标验收 / 本机准入 / 撤销 / 文件面边界 / 打开方式 / 预览路由）=="
-for s in smoke-ptc smoke-jobs smoke-loop-audit smoke-goal-eval smoke-goal-events smoke-auth smoke-undo smoke-legacy-files smoke-legacy-open-in-app smoke-preview; do
+for s in smoke-ptc smoke-jobs smoke-loop-audit smoke-goal-eval smoke-goal-events smoke-auth smoke-undo smoke-legacy-files smoke-legacy-open-in-app smoke-preview smoke-stream; do
   if (cd "$H" && node --no-warnings "scripts/$s.ts" >/dev/null 2>&1); then ok "$s"; else bad "$s 失败"; fi
 done
 

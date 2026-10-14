@@ -4,11 +4,12 @@
  * 纪律（D7）：一个工具一个文件；registry.ts 只做汇总排序。
  */
 import type { ToolSchema } from "../providers/types.ts";
+import type { PermissionProfile } from "./permission.ts";
 
 /** 输出档位（T3.5） */
 export type OutputTier = "passthrough" | "exact" | "compact";
 
-/** 审批档位（T3.7-T3.9） */
+/** 审批档位（T3.7-T3.9）。⚠️ 这是**工具自己的**档位；权限档位见 permission.ts 的 ApprovalPolicy */
 export type ApprovalMode = "never" | "heuristic" | "always";
 
 export interface ToolContext {
@@ -25,6 +26,12 @@ export interface ToolContext {
   requestApproval: (req: ApprovalRequest) => Promise<ApprovalResponse>;
   /** 数据服务（记忆等）注入点，避免 tools 直接依赖 memory */
   services: ToolServices;
+  /**
+   * 本轮生效的权限（两轴：沙箱 × 审批），由执行器从 ExecDeps 注入。
+   * 缺省 = workspace-write 语义（只写工作区）——**fail-closed**，没接线时绝不放宽。
+   * `escalated`：这次调用的越界写已经被审批通道放行过（工具侧护栏据此放行）。
+   */
+  permission?: PermissionProfile & { escalated?: boolean };
 }
 
 export interface ApprovalRequest {

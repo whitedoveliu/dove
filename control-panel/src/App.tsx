@@ -33,6 +33,7 @@ import {
   ensureLocalToken,
   getLocalTokenState,
   retryLocalToken,
+  sendChatMessage,
   type LocalTokenState,
   type Project,
 } from "@/lib/api";
@@ -41,6 +42,13 @@ import { isHtmlPath, projectFileUrl } from "@/lib/preview-url";
 
 // 获取 API 主机地址（支持局域网访问）
 const getApiHost = () => typeof window !== "undefined" ? window.location.hostname : "localhost";
+
+/**
+ * 待发消息（空状态里说的那句话）。
+ * `projectId === null` = 任务**还在建**（端口还没有）—— 这个区别决定它中途能不能被收回去，
+ * 见 App 的 takeBackPending / firePendingKickoff。
+ */
+type PendingMessage = { projectId: string | null; text: string };
 
 function ControlPanel() {
   // 项目选择状态
@@ -415,13 +423,14 @@ function ControlPanel() {
   // 选择项目
   const handleProjectSelect = async (port: string) => {
     /**
-     * 切任务时，把「还没发出去的待发消息」还给用户。
+     * 切任务时处置「还没发出去的待发消息」（见 releasePending）。
      *
-     * 那条消息属于**上一个任务**（见 handleQuickCreateTask），跟着切过去就会被
-     * 发到别的任务里。也不能像以前那样 setPendingMessage(null) 一删了之 ——
-     * 那就是「我打的字凭空消失」。交给 ChatPanel 放回输入框 + 提示。
+     * 那条消息属于**另一个任务**（见 handleQuickCreateTask），跟着切过去就会被发到
+     * 别的任务里 —— 但也不能像以前那样一律收回去：任务已经建好的，收回去就等于
+     * 「我发的消息没发出去」（用户报的就是这个）。所以：没建好的还给用户，
+     * 已经建好的由 App 直接发给它自己的线程。
      */
-    if (pendingMessageRef.current && pendingMessageRef.current.projectId !== port) takeBackPending();
+    if (pendingMessageRef.current && pendingMessageRef.current.projectId !== port) releasePending();
     // 切换项目前，先关闭当前项目的服务器（仅热更新模式）
     if (projectId && projectId !== port && isDevServerReady && enableHotReload) {
       try {
@@ -433,6 +442,15 @@ function ControlPanel() {
     }
     
     setProjectId(port);
+    /**
+     * ⚠️ 同步把镜像推到新端口：ref 平时靠 useEffect 追平，但建完任务那一刻
+     * （handleQuickCreateTask 的兜底判断）读的就是它 —— 而 state 的提交与副作用
+     * 都还没跑，那里会读到**上一个**端口，于是把刚建好、面板明明会接手的那条消息
+     * 当成「用户已经走了」由 App 直接发出去：气泡不出现、过程也没人画
+     * （用户报的「新会话里消息没马上发出去」就是这条）。这里同步写 = 语义是
+     * 「选中意图」，比 state 更早为真，正合那个判断的用途。
+     */
+    projectIdRef.current = port;
     setIsDevServerReady(false);  // 重置服务器状态
     setDevServerPort(null);
     localStorage.setItem("dove_port", port);
@@ -681,6 +699,7 @@ function ControlPanel() {
         const { projects: fresh } = await getProjects();
         if (projectId && !fresh.some((p) => p.port === projectId)) {
           setProjectId(null);
+          projectIdRef.current = null;   // 镜像同步推进（理由见 handleProjectSelect 里那段）
           // ⚠️ localStorage 也要清 —— App 启动时会从它恢复选中项目（App.tsx 的 savedPort）。
           //    不清的话下次打开又指向这个已经不存在的端口。
           localStorage.removeItem("dove_port");
@@ -695,6 +714,9 @@ function ControlPanel() {
    * 建项目。可选 `permission`：建好后**在选中它之前**把权限落库。
    * 可选 `kickoff`：这次建项目是「空状态里直接说的话」触发的，成功提示要说清
    *   「消息正在发出去」—— 否则用户只看到任务被建出来，会以为消息被吞了。
+   * 可选 `onCreated`：**端口一到手**就回调（早于落权限 / 选中项目）——
+   *   调用方要拿它把「待发消息」绑到这个线程上，否则链尾那次 handleProjectSelect(port)
+   *   会被当成「用户导航走了」，把还没发的消息收回去（见 handleQuickCreateTask）。
    *
    * ⚠️ 顺序很关键：ChatPanel 的 usePermissionMode 在 projectId 变化时会**立刻读一次**。
    *    如果先 handleProjectSelect 再写权限，那次读到的还是旧值（workspace），
@@ -704,7 +726,13 @@ function ControlPanel() {
    * 返回**端口**（成功）或 undefined（失败）。调用方**必须看返回值** ——
    * 新会话页那句话的发送就挂在它上面（见 handleQuickCreateTask）。
    */
-  const handleCreateProject = async (input: { name: string; project?: string; permission?: PermissionMode; kickoff?: boolean }) => {
+  const handleCreateProject = async (input: {
+    name: string;
+    project?: string;
+    permission?: PermissionMode;
+    kickoff?: boolean;
+    onCreated?: (port: string) => void;
+  }) => {
     try {
       const result = await createTask(input);
       if (!result.success) throw new Error(result.message);
@@ -717,29 +745,38 @@ function ControlPanel() {
           : result.project?.path,
         tone: "success",
       });
-      // 先落权限，再选中 —— 见上面注释
-      if (port && input.permission) {
-        try { await setPermissionMode(port, input.permission); }
-        catch { /* 设不上也得继续，别把建项目本身搞挂 */ }
+      // 端口一到手就通知调用方（见函数头的 onCreated）。必须赶在下面那次
+      // handleProjectSelect(port) **之前** —— 那次选中在「待发消息」眼里是一次导航。
+      if (port) input.onCreated?.(port);
+      /**
+       * 权限 / 计划模式 / 长期目标：三件互相独立的事 → **并行**。
+       * 以前是三条串行的 await，每一步都在挡着「把那条消息发出去」；
+       * 计划 / 目标两份草稿要**先读出来**（它们的读取是同步的，落地才是请求）。
+       * 谁失败都不挡别的：allSettled + 各自兜底，建项目本身更不能因此挂掉。
+       */
+      if (port) {
+        const draftGoal = readDraftGoal();
+        const jobs: Promise<unknown>[] = [];
+        if (input.permission) {
+          jobs.push(setPermissionMode(port, input.permission)
+            .catch(() => { /* 设不上也得继续，别把建项目本身搞挂 */ }));
+        }
+        if (readDraftPlanMode()) {
+          // **必须赶在第一条消息之前**，否则第一轮就不是硬只读了（内核每轮开始才读线程 metadata）
+          jobs.push(setPlanMode(port, true)
+            .then(() => writeDraftPlanMode(false))   // 用完即清，别让下一个新任务莫名其妙又是计划模式
+            .catch(() => { /* 设不上不影响建项目 */ }));
+        }
+        if (draftGoal) {
+          jobs.push(postGoal(port, { action: "create", objective: draftGoal })
+            .then(() => clearDraftGoal())
+            .catch(() => { /* 目标没设上不能挡住建任务 */ }));
+        }
+        await Promise.allSettled(jobs);
       }
-      // 新会话页选的「计划模式」草稿同样在这里落地：**必须赶在第一条消息之前**，
-      // 否则第一轮就不是硬只读了（内核每轮开始才读线程 metadata）。
-      if (port && readDraftPlanMode()) {
-        try {
-          await setPlanMode(port, true);
-          writeDraftPlanMode(false);   // 用完即清，别让下一个新任务莫名其妙又是计划模式
-        } catch { /* 设不上不影响建项目 */ }
-      }
-      // 新会话页写的「长期目标」草稿也在这里落地 —— 目标在内核里是线程级的，
-      // 所以只能等任务建好再写；同样要赶在第一条消息之前，第一轮就知道自己有目标。
-      const draftGoal = readDraftGoal();
-      if (port && draftGoal) {
-        try {
-          await postGoal(port, { action: "create", objective: draftGoal });
-          clearDraftGoal();
-        } catch { /* 目标没设上不能挡住建任务 */ }
-      }
-      await loadProjects(true);
+      // 列表刷新**从关键路径上拿掉**：新任务要出现在左栏里，但不该让那条消息等它。
+      // 面板侧的待发气泡与 ChatPanel 都只等端口（它自己会再拉一次）。
+      void loadProjects(true);
       if (port) {
         await handleProjectSelect(port);
         setAsideCollapsed(true);   // 新任务先不看预览
@@ -771,6 +808,14 @@ function ControlPanel() {
     // 任务名继续从消息头派生（任务列表里可读）。**只用来取名** ——
     // 发出去的那条消息用的是 `text` 原文，一个字符都不改。
     const name = firstLine.slice(0, 24) || "新任务";
+    /**
+     * 先把这条消息立起来（此刻任务**还没建出来**，projectId 是空的）：
+     *   · 链路上用户中途导航走 → 收回（这才是 takeBackPending 唯一该用的场合）；
+     *   · 面板看得见它（起始页那条小提示 / 新任务里的「正在发送…」气泡，见 ChatPanel）。
+     */
+    const entry: PendingMessage = { projectId: null, text };
+    pendingMessageRef.current = entry;
+    setPendingMessage(entry);
     // 新会话页选的权限，连同建项目一起交下去 —— 由 handleCreateProject
     // 保证「先落权限、再选中项目」的顺序（见那边的注释）。
     const port = await handleCreateProject({
@@ -778,41 +823,125 @@ function ControlPanel() {
       project: draftProject ?? undefined,
       permission: readDraftPermission(),
       kickoff: true,
+      // 端口一到手就绑上：这样链尾那次「选中新任务」（handleProjectSelect(port)）在
+      // 「待发消息」眼里不是「用户导航走了」—— 任务已经建出来，kickoff 已经承诺。
+      onCreated: (createdPort) => {
+        // 用户已经把它收回去了（那条消息此刻在输入框里）：那是明确的意愿，别再发一遍
+        if (pendingMessageRef.current !== entry) return;
+        const bound: PendingMessage = { projectId: createdPort, text };
+        pendingMessageRef.current = bound;
+        setPendingMessage(bound);
+      },
     });
-    if (!port) return false;
-    // 带上 projectId：这样即使中途切了任务，这条消息也不会"追着"发到别的任务里
-    setPendingMessage({ projectId: port, text });
+    if (!port) {
+      // 没建出来：内容归调用方（它会放回输入框）—— 但**用户已经收回去过**的那种
+      // 不能再还一次（那条路已经把它放进输入框 + 提示过了，再还就是两份），
+      // 所以按「已被接手」回 true。顺手把我立的那条撤掉，免得留个永远发不出去的气泡。
+      if (pendingMessageRef.current !== entry) return true;
+      pendingMessageRef.current = null;
+      setPendingMessage(null);
+      return false;
+    }
+    // 建好了但用户已经不在那个线程上（链路上切走 / 开了新会话）→ 由 App 直接发出去。
+    // 绝大多数情况下这里是空的：ChatPanel 的 effect 一看到就接手并把它清了。
+    const mine = pendingMessageRef.current;
+    if (mine && mine.projectId === port && projectIdRef.current !== port) {
+      firePendingKickoff({ projectId: port, text: mine.text });
+    }
     return true;
   };
 
   /**
    * 待发消息。**带 projectId**，不只是个字符串 ——
    * 只存文本的话，「A 建好 → 用户切到 B」会让这条消息发进 B（实测会）。
+   * `projectId === null` = 任务**还在建**（端口还没有）：这时收回它是允许的，见 takeBackPending。
    */
-  const [pendingMessage, setPendingMessage] = useState<{ projectId: string; text: string } | null>(null);
-  /** pendingMessage 的镜像：handleProjectSelect / takeBackPending 要在事件里同步读它 */
-  const pendingMessageRef = useRef<{ projectId: string; text: string } | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<PendingMessage | null>(null);
+  /** pendingMessage 的镜像：handleProjectSelect / releasePending 要在事件里同步读它 */
+  const pendingMessageRef = useRef<PendingMessage | null>(null);
   useEffect(() => { pendingMessageRef.current = pendingMessage; }, [pendingMessage]);
+  /**
+   * projectId 的镜像 —— 建完任务那一刻要判断「用户还在不在这个线程上」（见 handleQuickCreateTask）。
+   * 读 state 会拿到那个闭包创建时的旧值，所以只能照 ref。
+   */
+  const projectIdRef = useRef<string | null>(null);
+  useEffect(() => { projectIdRef.current = projectId; }, [projectId]);
   /**
    * 用户自己离开（点「新会话」/切任务）时被收回来的那条消息 ——
    * 交给 ChatPanel 放回输入框 + 提示。token 变化代表一次新的还原。
    */
   const [restoreDraft, setRestoreDraft] = useState<{ text: string; token: number } | null>(null);
 
+  /**
+   * 把还没送出去的待发消息**还给用户**（放回输入框 + 一条能行动的提示）。
+   *
+   * ⚠️ 只对「任务还没建出来」的那条用（projectId 还是空）—— 任务已经建好的（kickoff 已承诺）
+   * **不许收回**：用户报的「我发出去的消息没发出去」就是被这条路收走的。已经建好还离开了
+   * 那个线程的，走 releasePending → firePendingKickoff（由 App 直接发出去）。
+   */
   const takeBackPending = () => {
     const p = pendingMessageRef.current;
-    if (!p) return;
+    if (!p || p.projectId) return;
     pendingMessageRef.current = null;
     setPendingMessage(null);
     setRestoreDraft({ text: p.text, token: Date.now() });
+  };
+
+  /**
+   * kickoff 的兜底发送：任务**已经建好**、但用户已经不在那个线程上 → 由 App 直接发出去。
+   *
+   * 为什么不让 ChatPanel 发：它那个 effect 只在「正看着这个线程」时接手；用户已经导航走时
+   * 这条消息没有任何人接手（以前正是被 takeBackPending 收回去的）。这里**吞掉响应体**
+   * 就行 —— 不需要 UI 接线：等用户回到那个线程时，面板会用 streamFrom 的重放把这一轮补上。
+   */
+  const firePendingKickoff = (p: { projectId: string; text: string }) => {
+    // 先清再发：留着的话下一次导航又发一遍（发失败也不重发 —— 用户回到那个线程能看到那轮）
+    pendingMessageRef.current = null;
+    setPendingMessage(null);
+    void sendChatMessage(
+      {
+        message: p.text,
+        project_id: p.projectId,
+        // 和面板里那条发送路径同一批冻结值（见 ChatPanel.handleSend 的说明）。
+        // **不带 model**：内核自己那份是权威存储，面板每次换模型都会写进去。
+        if_thinking: true,
+        if_memory: true,
+        continuous_chat: true,
+        if_hot_reload: true,
+        if_recommend_files: true,
+      },
+      () => { /* 响应体不需要：过程由重挂的那条流补（见上面） */ },
+    ).catch((e: unknown) => {
+      // 静默失败是「消息没发出去」这类投诉的温床：说出来
+      toast({
+        title: "这条消息没能发出去",
+        description: e instanceof Error ? e.message : String(e),
+        tone: "danger",
+      });
+    });
+  };
+
+  /**
+   * 用户离开了待发消息所属的那个线程 —— 怎么处置它：
+   *   · 任务**还没建出来**（projectId 还是空）→ 还给用户（放回输入框，可以直接重试）；
+   *   · 任务**已经建好**（kickoff 已承诺）→ 必须发出去，由 App 直接发（见 firePendingKickoff）。
+   *     面板只是「恰好也在看」而已 —— 它不看了，这句话也得出去。
+   */
+  const releasePending = () => {
+    const p = pendingMessageRef.current;
+    if (!p) return;
+    if (p.projectId) firePendingKickoff({ projectId: p.projectId, text: p.text });
+    else takeBackPending();
   };
   // 起始页上预选的项目（不弹窗也能把新会话挂到某个项目下）
   const [draftProject, setDraftProject] = useState<string | null>(null);
 
   // 点「新会话」：不弹窗，直接回到聊天主界面
   const handleStartNewSession = () => {
-    takeBackPending();   // 还没发出去的消息不能跟着会话一起消失（见上）
+    // 还没发出去的那句话不能跟着会话一起消失：没建好的还给用户，已经建好的**发出去**
+    releasePending();
     setProjectId(null);
+    projectIdRef.current = null;   // 镜像同步推进（理由见 handleProjectSelect 里那段）
     localStorage.removeItem("dove_port");
     setPreviewUrl("");
     setLatestVersion(0);
@@ -964,7 +1093,12 @@ function ControlPanel() {
             restoreDraft={restoreDraft}
             asideCollapsed={asideCollapsed}
             onToggleAside={() => setAsideCollapsed((prev) => !prev)}
-            onPendingMessageConsumed={() => setPendingMessage(null)}
+            onPendingMessageConsumed={() => {
+              // 面板接手了这条待发消息 → 立刻清，**连 ref 一起**：不然在一个渲染周期里
+              // 用户正好导航走的话，releasePending 还会把它当成「没人接手」再发一遍
+              pendingMessageRef.current = null;
+              setPendingMessage(null);
+            }}
           />
           {/* 设置弹窗（侧栏底部齿轮 / ⌘,）。挂在这一层是因为它要在**任何**分支下都在：
               入口在侧栏，而 ChatPanel 自己还有起始页 / 项目页两棵树，挂在那边迟早漏一个。
