@@ -11,12 +11,14 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Settings,
   Trash2,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { StatusDot } from "@/components/ui/badge";
 import { IconButton } from "@/components/ui/icon-button";
+import { Shortcut } from "@/components/ui/kbd";
 import { Spinner } from "@/components/ui/spinner";
 import { Hint } from "@/components/ui/tooltip";
 import {
@@ -47,6 +49,8 @@ export interface ProjectSidebarProps {
   onNewSession?: () => void;
   /** 在某个项目下新建会话（预选该项目） */
   onNewSessionInProject?: (project: string) => void;
+  /** 打开设置弹窗（底部那颗齿轮 / ⌘,）—— 弹窗挂在 App 上，这里只要一个回调 */
+  onOpenSettings?: () => void;
   onRefreshProjects: () => void;
   onStartServer: (port: string) => void;
   onStopServer: (port: string) => void;
@@ -119,6 +123,7 @@ export function ProjectSidebar({
   onCreateProject,
   onNewSession,
   onNewSessionInProject,
+  onOpenSettings,
   onRefreshProjects,
   onStartServer,
   onStopServer,
@@ -211,6 +216,11 @@ export function ProjectSidebar({
           ))}
         </div>
         <ThemeToggle collapsed />
+        {/* 收起态只剩图标：文字没了，**无障碍名称必须留着** —— 齿轮本身不发声，
+            读屏和 `getByLabelText` 认的都是这个 aria-label，别省。 */}
+        <IconButton aria-label="设置" onClick={onOpenSettings}>
+          <Settings />
+        </IconButton>
         <NewProjectDialog
           open={newTaskOpen}
           onOpenChange={setNewTaskOpen}
@@ -391,6 +401,25 @@ export function ProjectSidebar({
             );
           })
         )}
+      </div>
+
+      {/* 底部：设置 + 连接状态 + 主题。
+          设置单独占一行（DSH 的侧栏底部就是一个固定的 Settings 控件），
+          点开的是 App 上挂的那个设置弹窗。 */}
+      <div className="shrink-0 px-2 pb-1">
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          className="group flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-sm text-text-secondary transition-colors duration-fast hover:bg-[rgb(var(--nb-75))] hover:text-text-primary dark:hover:bg-[rgba(255,255,255,0.06)]"
+        >
+          <Settings className="size-4 shrink-0 text-text-tertiary" />
+          <span className="min-w-0 flex-1 truncate text-left">设置</span>
+          {/* 快捷键悬停才露（DSH 同款）：常态不抢注意力，找它的人一问就有。
+              用 opacity 不用 hidden —— 和目录行上那排按钮同理，别碰布局。 */}
+          <span className="opacity-0 transition-opacity duration-fast group-hover:opacity-100 group-focus-visible:opacity-100">
+            <Shortcut keys={["mod", ","]} />
+          </span>
+        </button>
       </div>
 
       {/* 底部：连接状态 + 主题 */}

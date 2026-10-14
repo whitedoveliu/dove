@@ -755,13 +755,26 @@ export async function startProjectServer(port: string): Promise<{
 export interface SubagentInfo {
   id: string;
   label: string;
+  /** running | done | error | canceled | unknown（内核归一过，见 CONTRACT.md） */
   status: string;
   background: boolean;
   taskId: string | null;
   parentId: string;
+  projectId?: string | null;
+  /**
+   * 它跑的时候用的模型。**null = 内核没记过**（记录模型之前的老子代理）——
+   * 界面显示「未记录」，**不要**退回任何默认值（见 CONTRACT.md 的说明）。
+   */
+  model?: string | null;
+  roleId?: string | null;
   startedAt: number;
   finishedAt: number | null;
+  /** 开始到结束的毫秒；还在跑 = null（界面拿 startedAt 自己走表） */
+  durationMs?: number | null;
   parts: number;
+  endReason?: string | null;
+  /** 项目根路径（卡片上那行仓库路径） */
+  projectPath?: string | null;
   /**
    * token 用量（后台子代理才有：记录在任务表里，见内核 agents/task-registry.ts）。
    * null = 没有记录 / provider 没报 → 界面显示「未上报」，**不是 0**。
@@ -769,12 +782,60 @@ export interface SubagentInfo {
   usage: { inputTokens: number; outputTokens: number } | null;
 }
 
-/** 列出某个项目派出去的所有子代理 */
-export async function listSubagents(projectKey: string): Promise<SubagentInfo[]> {
-  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(projectKey)}/subagents`);
+/** 「后台 Agent」列表的状态页签（与内核 `?status=` 一一对应） */
+export type SubagentStatusFilter = "recent" | "running" | "done" | "failed" | "all";
+
+/**
+ * 列出某个项目派出去的子代理。
+ *
+ * 不带参数 = 内核的 `all`（升序、全量）—— 老的调用方（ChatPanel 的顶栏补历史）走这条。
+ * 「后台 Agent」页带着 status 走，拿到的就是那个页签该显示的那批。
+ */
+export async function listSubagents(
+  projectKey: string,
+  opts: { status?: SubagentStatusFilter } = {},
+): Promise<SubagentInfo[]> {
+  const q = opts.status ? `?status=${encodeURIComponent(opts.status)}` : "";
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(projectKey)}/subagents${q}`);
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { subagents?: SubagentInfo[] };
   return d.subagents ?? [];
+}
+
+/**
+ * 一个子代理的运行过程条目（「点进去看它干了什么」）。
+ *
+ * 形状对齐内核（见 legacy/CONTRACT.md）：思考 / 正文 / 工具调用 + 结果，顺序 = 发生顺序。
+ * `result` **只有它结束落盘之后才有** —— 运行中那段走 SSE 的实时时间线（面板自己拼）。
+ */
+export interface SubagentEntry {
+  kind: "reasoning" | "text" | "tool";
+  text?: string;
+  tool?: string;
+  /** 参数摘要（内核用实时流同一个 toolInfoLine 抽的） */
+  info?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  /** true 成功 / false 失败 / 缺省 = 只记了调用、没有结论 */
+  ok?: boolean;
+  at?: number;
+}
+
+export interface SubagentDetail {
+  subagent: SubagentInfo;
+  entries: SubagentEntry[];
+  /** 它还在跑：过程要等结束才落盘，所以上面的 entries 多半是空的（实时走 SSE） */
+  running: boolean;
+}
+
+/** 取单个子代理的元信息 + 过程条目 */
+export async function readSubagent(projectKey: string, id: string): Promise<SubagentDetail> {
+  const url = `${getApiBaseUrl()}/api/projects/${encodeURIComponent(projectKey)}/subagents/${encodeURIComponent(id)}`;
+  const r = await apiFetch(url);
+  if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
+  const d = (await r.json()) as Partial<SubagentDetail>;
+  if (!d.subagent) throw new Error("响应里没有 subagent");
+  return { subagent: d.subagent, entries: d.entries ?? [], running: d.running === true };
 }
 
 /**
@@ -1601,6 +1662,85 @@ export async function openProjectPath(input: {
     return { ok: false, message: `打开失败：HTTP ${response.status}` };
   } catch (e) {
     return { ok: false, message: `打开失败：${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * 「用哪个 App 打开」（分体按钮）的后端三件套：清单 / 用指定 App 打开 / App 图标。
+ *
+ * 为什么清单必须问内核而不是面板自己写死：探测（在 Applications 目录里找 bundle）只有内核做得到，
+ * 面板自己写死就会列出一堆本机没装的 App。清单是**数据表**
+ * （harness/packages/server/src/legacy/open-in-app.ts），面板只渲染内核回的 `{id,name}`。
+ *
+ * 与 openProjectPath 的分工：那个是「用系统默认应用打开」（交给 OS 的文件关联），
+ * 这里是指定 App（同一个路径守卫，见 routes-open-in-app.ts 顶部的安全边界）。
+ */
+export interface OpenInAppEntry {
+  id: string;
+  name: string;
+  /** 这个 App 的动作：`open` = 打开这个文件；`reveal` = 显示它所在的位置（访达那行） */
+  action: "open" | "reveal";
+}
+
+/** 已装 App 清单。失败**抛**（不是回空清单）：调用方要能区分「探测失败」与「一个都没装」。 */
+export async function listOpenInApps(): Promise<{ apps: OpenInAppEntry[]; platform: string }> {
+  const response = await apiFetch(`${getApiBaseUrl()}/api/open-in-app/apps`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`读取已装 App 清单失败：HTTP ${response.status}`);
+  const data = (await response.json()) as { apps?: unknown; platform?: unknown };
+  const apps = Array.isArray(data.apps)
+    ? data.apps
+      .map((raw) => raw as { id?: unknown; name?: unknown; action?: unknown })
+      .filter((raw) => typeof raw.id === "string" && typeof raw.name === "string")
+      .map((raw) => ({
+        id: String(raw.id),
+        name: String(raw.name),
+        // 老内核（没有 action 字段）一律当 open —— 别因为缺个字段就让菜单崩掉
+        action: (raw.action === "reveal" ? "reveal" : "open") as "open" | "reveal",
+      }))
+    : [];
+  return { apps, platform: typeof data.platform === "string" ? data.platform : "" };
+}
+
+/** 用**清单里的某个 App** 打开这个路径（appId 走内核清单，面板传不了可执行文件名）。 */
+export async function openProjectPathWithApp(input: {
+  /** 项目端口 / id / 目录名（三键查找）；不传 = 以工作区根为边界 */
+  projectId?: string | null;
+  path: string;
+  appId: string;
+}): Promise<{ ok: boolean; message: string }> {
+  try {
+    const response = await apiFetch(`${getApiBaseUrl()}/api/open-in-app`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        appId: input.appId,
+        path: input.path,
+        ...(input.projectId ? { project_id: input.projectId } : {}),
+      }),
+    });
+    const data = (await response.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
+    if (data && typeof data.message === "string") return { ok: data.ok === true, message: data.message };
+    return { ok: false, message: `打开失败：HTTP ${response.status}` };
+  } catch (e) {
+    return { ok: false, message: `打开失败：${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * App 图标（内核用 sips 从 `.icns` 抽的 64px PNG）。
+ *
+ * 为什么要绕一道 blob：图标路由在 `/api/*` 令牌闸门之内（同 8008 的其它路由），
+ * 而 `<img src>` 发不了 `X-Dove-Token` 头 —— 直接把 URL 塞给 img 只会拿到 401。
+ * 取不到（404 / 内核不带图标能力）返回 null，调用方退回通用图标。
+ */
+export async function fetchOpenInAppIcon(id: string): Promise<Blob | null> {
+  try {
+    const response = await apiFetch(`${getApiBaseUrl()}/api/open-in-app/icon?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!response.ok) return null;
+    const blob = await response.blob();
+    return blob.size > 0 && blob.type.startsWith("image/") ? blob : null;
+  } catch {
+    return null;
   }
 }
 

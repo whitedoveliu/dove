@@ -165,6 +165,22 @@ function fmtTokens(n: number): string {
 }
 
 /**
+ * 耗时文案：`14分50秒` / `1小时2分` / `38秒`。
+ *
+ * 读法对齐 Kimi Code 那排后台任务卡片（中文、不带冒号、超过一小时才说小时）——
+ * 秒数在跑的时候是活的（调用方自己按 startedAt 走表，见 subagent-pane 的 useNow）。
+ */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}小时${m}分`;
+  if (m > 0) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+/**
  * 用量文案。**未上报 ≠ 0**：没有数就写「未上报」，写 0 会被读成「没花 token」
  * （内核存的也是 NULL 而不是 0，两边口径一致，见 agents/task-registry.ts:finish）。
  */
@@ -338,6 +354,63 @@ export function SubagentBar({
           </div>
         );
       })()}
+    </div>
+  );
+}
+
+/**
+ * 输入框上方的后台任务按钮（「后台 Agent n」）。
+ *
+ * 对齐 Kimi Code：输入框上方一排小按钮，点了在**右侧面板**开「后台 Agent」那一页
+ * （不是在这里展开 —— 过程要看的东西多，得给块整地方）。
+ *
+ * 几条取舍，写下来免得下次有人「顺手」改掉：
+ *   · 这里**只有 Agent 一种**。Kimi 还有「后台 Bash」（后台跑的命令流），
+ *     而 Dove 的后台任务只有子代理一种（Bash 走工具、没有后台模式）——
+ *     不给一个按不动的按钮，等真有后台命令了再加第二个。
+ *   · 只在**当前项目有子代理**时出现；一旦出现就一直在（跑完了也留着），
+ *     否则刷新之后就没有入口去看已完成的那些了（用户明确要求「刷新后还能看到」）。
+ *   · 数量角标：跑着几个就显示几个（带转圈）；都跑完了显示总数（带对勾）。
+ */
+export function SubagentButtons({
+  agents, onOpen, className,
+}: {
+  agents: SubagentInfo[];
+  /** 点按钮 → 打开右侧面板的「后台 Agent」页 */
+  onOpen: () => void;
+  className?: string;
+}) {
+  if (agents.length === 0) return null;
+  const running = agents.filter((a) => a.status === "running").length;
+
+  return (
+    <div className={cn("flex items-center gap-1.5 px-1", className)}>
+      <button
+        type="button"
+        onClick={onOpen}
+        title={
+          running > 0
+            ? `${running} 个 Agent 正在后台跑，点开看它们的进度与过程`
+            : `${agents.length} 个后台 Agent 已结束，点开看它们的过程`
+        }
+        className={cn(
+          "flex h-6 items-center gap-1.5 rounded-full border border-border bg-surface-inset px-2 text-2xs",
+          "text-text-secondary transition-colors duration-fast hover:bg-surface-hover hover:text-text-primary",
+        )}
+      >
+        {running > 0
+          ? <Loader2 className="size-3 shrink-0 animate-spin text-accent" />
+          : <Bot className="size-3 shrink-0" />}
+        <span>后台 Agent</span>
+        <span
+          className={cn(
+            "rounded-sm px-1 font-medium tabular-nums",
+            running > 0 ? "bg-accent-subtle text-accent-subtle-fg" : "bg-surface-hover text-text-tertiary",
+          )}
+        >
+          {running > 0 ? running : agents.length}
+        </span>
+      </button>
     </div>
   );
 }

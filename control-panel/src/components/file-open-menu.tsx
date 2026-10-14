@@ -20,15 +20,21 @@ import {
 /**
  * 动作执行器（带 toast 反馈）—— 查看器里的醒目按钮与菜单共用同一套反馈口径。
  * 返回值 `{ok, message}` 的约定见 lib/file-actions.ts。
+ *
+ * 除了弹 toast，还把结果**原样返回**：有的调用方要按结果决定下一步（比如分体按钮
+ * 「只在成功之后才记住这次选择」），各处再各写一遍 toast 必然口径不一致。
  */
-export function useFileActionRunner(): (fn: () => Promise<ActionResult> | ActionResult) => Promise<void> {
+export function useFileActionRunner(): (fn: () => Promise<ActionResult> | ActionResult) => Promise<ActionResult> {
   const { toast } = useToast();
   return React.useCallback(async (fn) => {
     try {
       const r = await fn();
       toast({ title: r.ok ? "完成" : "没做成", description: r.message, tone: r.ok ? "success" : "danger" });
+      return r;
     } catch (e) {
-      toast({ title: "没做成", description: e instanceof Error ? e.message : String(e), tone: "danger" });
+      const message = e instanceof Error ? e.message : String(e);
+      toast({ title: "没做成", description: message, tone: "danger" });
+      return { ok: false, message };
     }
   }, [toast]);
 }
@@ -51,6 +57,10 @@ export interface FileOpenMenuProps {
 /**
  * 「打开方式」菜单 —— 六个动作**只有一个实现**（file-actions.ts），
  * 每轮文件卡片 / 文件 tab / 查看器工具栏都挂它，避免三处各写一遍然后行为漂移。
+ *
+ * 现在查看器工具栏那颗按钮换成了「分体按钮」（components/open-in-app-button.tsx：左半用记住的
+ * App 打开、右半挑 App），但这个菜单**没有退休**：本机一个可探测的 App 都没有 / 探测失败 /
+ * 非 macOS 时，分体按钮就是渲染它 —— 六个动作一个都不能少。所以这里改行为等于同时改那条退化路径。
  *
  * 平台差异照实说（做不到的不假装能做到）：
  *  · macOS 的「在文件管理器里显示」会在 Finder 里**选中**该文件；Linux 只能开到所在目录；

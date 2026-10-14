@@ -9,6 +9,7 @@ import { useDevToolsBridge } from "@/hooks/useDevToolsBridge";
 import { AppShell } from "@/components/shell/app-shell";
 import { ProjectSidebar } from "@/components/shell/project-sidebar";
 import { FilePeek } from "@/components/shell/file-peek";
+import { SettingsDialog } from "@/components/settings-dialog";
 import { ToastProvider, useToast } from "@/components/ui/toast";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import {
@@ -79,6 +80,12 @@ function ControlPanel() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [asideCollapsed, setAsideCollapsed] = useState(false);
   const [health, setHealth] = useState<"unknown" | "online" | "offline">("unknown");
+  /**
+   * 设置弹窗（侧栏底部那颗齿轮 / ⌘,）。挂在 App 这一层，不挂在 ChatPanel 里：
+   * 入口在左侧栏，而侧栏和对话是两个分支 —— 挂在谁下面都会让另一个开不了它。
+   * 看哪个分区由弹窗自己记着（同一个实例可以先后被侧栏和模型入口打开）。
+   */
+  const [settingsOpen, setSettingsOpen] = useState(false);
   /**
    * 本地令牌状态。取不到令牌时 8008 的每条请求都会 401 —— `apiFetch` 带不上 X-Dove-Token 头，
    * `<img>/<video>/pdf` 的资源 URL 也拼不出 `?token=`。面板照常渲染，但必须在界面上说清楚
@@ -611,6 +618,23 @@ function ControlPanel() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  // Cmd/Ctrl + , 开关设置（macOS 上的惯例）。
+  // 只认 ⌘, —— 和面板里已有的 ⌘K（搜索任务）/ ⌘N（新任务）/ ⌘B（折叠目录）都不撞。
+  //
+  // 已经开着的**别的**弹窗摆在前面时不插队（DSH 同口径）：模型入口走的是 ChatPanel 里
+  // 那另一个设置实例，这里再叠一层就是两个一模一样的弹窗盖在一起。自己开着的那个例外 ——
+  // 再按一次就该收起来。
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key !== ",") return;
+      event.preventDefault();
+      if (document.querySelector('[role="dialog"][data-state="open"]') && !settingsOpen) return;
+      setSettingsOpen((prev) => !prev);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [settingsOpen]);
+
   // 切到新任务时按"有没有产出"给个初始态；之后完全听用户的，不再自动改
   useEffect(() => {
     setAsideCollapsed(latestVersion === 0 && !isDevServerReady);
@@ -880,6 +904,7 @@ function ControlPanel() {
           onCreateProject={(input) => void handleCreateProject(input)}
           onNewSession={handleStartNewSession}
           onNewSessionInProject={handleNewSessionInProject}
+          onOpenSettings={() => setSettingsOpen(true)}
           onRefreshProjects={() => void loadProjects()}
           onStartServer={handleStartServerFor}
           onStopServer={handleStopServerFor}
@@ -941,6 +966,10 @@ function ControlPanel() {
             onToggleAside={() => setAsideCollapsed((prev) => !prev)}
             onPendingMessageConsumed={() => setPendingMessage(null)}
           />
+          {/* 设置弹窗（侧栏底部齿轮 / ⌘,）。挂在这一层是因为它要在**任何**分支下都在：
+              入口在侧栏，而 ChatPanel 自己还有起始页 / 项目页两棵树，挂在那边迟早漏一个。
+              内容 portal 到 body，放这儿不影响布局。 */}
+          <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
         </div>
       }
       aside={
