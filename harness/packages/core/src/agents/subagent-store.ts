@@ -6,6 +6,7 @@
  *
  * 做法：把子代理当成**一条子线程**（kind='subagent'），过程写进 messages.parts。
  * 这样「点进去看」直接复用主对话的历史回放路径（partsToEvents），不用新写一套渲染。
+ * 读侧（列表 / 过程条目）在 agents/subagent-report.ts —— 本文件只写不读。
  *
  * 为什么不能塞进父消息的 parts：那会污染父线程的**上下文装配** ——
  * 子代理的过程会被当成父代理自己的输出重新喂给模型。
@@ -15,10 +16,8 @@
  * 缓存放在这个文件是因为它和线程记录是同一条生命周期，且 agent/subagent-host.ts 贴着 400 行上限。
  */
 import type { ChatMessage } from "../providers/types.ts";
-import type { Message, Part, Thread } from "../session/types.ts";
+import type { Message, Part } from "../session/types.ts";
 import type { Store } from "../session/store.ts";
-import type { AgentSummary } from "../tools/types.ts";
-import type { TaskRegistry } from "./task-registry.ts";
 
 /** 线程 id 前缀，方便一眼认出、也方便级联删除时筛选 */
 export const SUBAGENT_THREAD_PREFIX = "sub_";
@@ -36,6 +35,12 @@ export interface TranscriptInit {
   threadId: string;
   /** 用的是哪个角色（续跑要沿用同一个角色，不能因为历史被淘汰就悄悄放宽成 general） */
   roleId?: string;
+  /**
+   * 它这次跑用的模型（`provider.stream` 的 model）。
+   * 落进 metadata.model —— 面板「后台 Agent」卡片上那一行「模型」只认这一个字段，
+   * **没记 = 显示未记录**，不拿 threads.model 的默认值冒充（见 subagent-report.ts 的 subagentItem）。
+   */
+  model?: string;
   /**
    * 续跑（resume）：线程已经存在，**不要**再建。
    * 踩过的坑：threads.id 是主键，重挂同一个子代理时再 createThread 会撞唯一约束抛错 ——
@@ -74,14 +79,18 @@ export class SubagentTranscript {
 
     if (init.reuse) {
       // 续跑：只把状态翻回 running（ListAgents / 面板据此看得出它又跑起来了），
-      // 标题保留第一次的名字，另外记一笔 resumedAt。
+      // 标题保留第一次的名字，另外记一笔 resumedAt。模型按这次的写（续跑可能换了模型）。
       const th = this.#store.getThread(this.threadId);
       try {
         this.#store.updateThread(this.threadId, {
+          model: init.model ?? th?.model,
           metadata: {
             ...(th?.metadata ?? {}),
             parentThreadId: init.parentThreadId, background: init.background,
             roleId: init.roleId ?? null, status: "running", resumedAt: Date.now(),
+            model: init.model ?? th?.metadata?.model ?? null,
+            // 谁在跑这条子代理（进程号）—— 读侧据此认出「重启后永远停在 running 的那条」
+            ownerPid: process.pid,
           },
         });
       } catch { /* 状态更新失败不影响这一次跑 */ }
@@ -91,9 +100,16 @@ export class SubagentTranscript {
         kind: "subagent",
         projectId: this.#projectId,
         title: init.label,
+        // model 只在调用方给了的时候才落列 —— 不给就让 schema 默认值留在那儿，
+        // 而 metadata.model 缺席 = 面板显示「未记录」（拿默认值当事实就是编造）
+        ...(init.model ? { model: init.model } : {}),
         metadata: {
           parentThreadId: init.parentThreadId, label: init.label, background: init.background,
           taskId: init.taskId ?? null, roleId: init.roleId ?? null, status: "running",
+          model: init.model ?? null,
+          // 这条子代理是**哪个进程**起的。读侧（agents/subagent-report.ts 的 subagentItem）
+          // 用它把「重启后永远停在 running 的僵尸」判成 stale，而不是让面板一直转圈。
+          ownerPid: process.pid,
         },
       });
     }
@@ -115,17 +131,48 @@ export class SubagentTranscript {
     else this.#parts.push({ type: "text", text: delta, id: this.#nextId("t") });
   }
 
-  /** 一次工具调用。工具名进 type（`tool-Bash`），和主循环的 parts 形状保持一致 */
-  tool(name: string, args: Record<string, unknown>): void {
+  /**
+   * 一次工具调用。工具名进 type（`tool-Bash`），和主循环的 parts 形状保持一致。
+   *
+   * `toolCallId` 用**调用方给的那个**（provider 的 call id）—— 结果回来时按它配对。
+   * 不给才自己造一个（没有 provider id 的调用方：老代码 / 测试）。
+   */
+  tool(name: string, args: Record<string, unknown>, toolCallId?: string): void {
     if (this.#finished || !name) return;
     this.#parts.push({
       type: `tool-${name}`,
-      toolCallId: this.#nextId("c"),
+      toolCallId: toolCallId ?? this.#nextId("c"),
       toolName: name,
       input: args,
-      state: "output-available",
+      // 和主循环一致：调用时是 input-available，结果回来了才 output-available（见 toolResult）
+      state: "input-available",
       startedAt: Date.now(),
     });
+  }
+
+  /**
+   * 一次工具调用的结果，补进那次调用对应的 part。
+   *
+   * 为什么必须补：面板「后台 Agent」点进去要看的是「它调了什么、拿到了什么」——
+   * 只有调用没有结果，读起来就是一串悬空的命令（用户明确要求带结果）。
+   * 实时那条流（SSE 的 subagent_tool）仍然只发调用：结果是**落盘之后**才有的，
+   * 运行中的过程由面板的实时时间线兜底（见 finish 的说明）。
+   */
+  toolResult(toolCallId: string, ok: boolean, output?: unknown, errorText?: string): void {
+    if (this.#finished) return;
+    // 从后往前找：同一个 toolCallId 只会有一条，而从后往前命中更快（刚调完的那个多半就在尾巴上）
+    for (let i = this.#parts.length - 1; i >= 0; i--) {
+      const p = this.#parts[i]!;
+      if (p.type.startsWith("tool-") && (p as { toolCallId?: string }).toolCallId === toolCallId) {
+        const tp = p as { state?: string; output?: unknown; errorText?: string; finishedAt?: number };
+        tp.state = ok ? "output-available" : "output-error";
+        if (ok) tp.output = output ?? {};
+        else tp.errorText = errorText ?? "执行失败";
+        tp.finishedAt = Date.now();
+        return;
+      }
+    }
+    // 找不到对应的调用（part 被裁掉 / id 对不上）→ 什么都不做，不新造一条孤立的「结果」行
   }
 
   get partCount(): number { return this.#parts.length; }
@@ -181,141 +228,9 @@ export function makeSubagentThreadId(label: string, taskId?: string): string {
   return `${SUBAGENT_THREAD_PREFIX}${slug}_${uniq}`;
 }
 
-/** 列出某个父线程派出去的所有子代理（按开始时间正序） */
-export function listSubagents(store: Store, parentThreadId: string): Thread[] {
-  return store.listThreads("subagent")
-    .filter((t) => String(t.metadata?.parentThreadId ?? "") === parentThreadId)
-    .sort((a, b) => a.createdAt - b.createdAt);
-}
-
-// ── 记录表的两条读路径（从 agent/subagent-host.ts 搬来） ──────
-// 为什么搬：这里写的是「子代理的记录怎么被读出来」，和 SubagentTranscript 是同一张表的两面；
-// 而 agent/subagent-host.ts 贴着 400 行硬约束，那边只留**生命周期**（启动 / 注入 / 中断 / 续跑）。
-
-/** 本进程还在跟踪的一次运行（host 里的 AgentRun 结构上就是它） */
-export interface LiveRunRef {
-  id: string;
-  label: string;
-  background: boolean;
-  taskId?: string;
-  status: "running" | "done" | "error" | "canceled";
-  startedAt: number;
-  finishedAt?: number;
-  steps?: number;
-  endReason?: string;
-  output?: string;
-}
-
-export interface AgentRef<T extends LiveRunRef = LiveRunRef> {
-  run?: T;
-  threadId?: string;
-  output?: string;
-}
-
-const PREVIEW_CHARS = 240;
-
-function clip(s: string | undefined, n = PREVIEW_CHARS): string | undefined {
-  if (!s) return undefined;
-  const t = s.replace(/\s+/g, " ").trim();
-  return t.length > n ? t.slice(0, n) + "…" : t;
-}
-
-function mapTaskStatus(s: string): AgentSummary["status"] {
-  if (s === "running" || s === "done" || s === "error" || s === "canceled") return s;
-  return "unknown";
-}
-
-function mapMetaStatus(s: unknown): AgentSummary["status"] {
-  return typeof s === "string" ? mapTaskStatus(s) : "unknown";
-}
-
-/** 子线程里最后一条 assistant 文本（结论预览 / 降级续跑的种子） */
-export function threadOutput(store: Store, threadId: string): string | undefined {
-  try {
-    const msgs = store.listMessages(threadId).filter((m) => m.role === "assistant");
-    const last = msgs[msgs.length - 1];
-    if (!last) return undefined;
-    const text = last.parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text).join("");
-    return text || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * 把一个 id 解析成「本进程正在跟踪的运行 / 落库的子线程 / 后台任务记录」。
- * 三处都要看：id 可能是子代理线程 id、Task 返回的 taskId，也可能是**只有库里留档**的旧子代理。
- * ⚠️ 归属校验也在这一层：不是本父线程的子代理一律当「不存在」返回 —— 跨线程操作别人家的子代理
- *    会让 A 项目的代理去改 B 项目的东西。
- */
-export function resolveAgent<T extends LiveRunRef>(input: {
-  runs: Map<string, T>;
-  store: Store;
-  tasks?: TaskRegistry;
-  parentThreadId: string;
-}, id: string): AgentRef<T> {
-  const direct = input.runs.get(id);
-  if (direct) return { run: direct, threadId: direct.id, output: direct.output };
-  const byTask = [...input.runs.values()].find((r) => r.taskId === id);
-  if (byTask) return { run: byTask, threadId: byTask.id, output: byTask.output };
-  const th = input.store.getThread(id);
-  if (th && th.kind === "subagent" && String(th.metadata?.parentThreadId ?? "") === input.parentThreadId) {
-    return { threadId: id, output: threadOutput(input.store, id) };
-  }
-  const sub = input.store.listThreads("subagent").find((t) =>
-    String(t.metadata?.taskId ?? "") === id && String(t.metadata?.parentThreadId ?? "") === input.parentThreadId);
-  if (sub) return { threadId: sub.id, output: threadOutput(input.store, sub.id) };
-  const rec = input.tasks?.get(id);
-  if (rec && rec.threadId === input.parentThreadId) return { output: rec.result ?? "" };
-  return {};
-}
-
-/**
- * ListAgents 的合并视图：本进程跟踪的 + TaskRegistry 的 + 落库子线程的，按开始时间排序。
- * 三个来源各有一条理由：live 能中断/追加；record 是「已经结束但用户还看得到」；
- * task 是后台任务（它的 id 是 taskId，用户点得进去）。
- */
-export function listAgentSummaries(input: {
-  runs: Map<string, LiveRunRef>;
-  store: Store;
-  tasks?: TaskRegistry;
-  parentThreadId: string;
-}): AgentSummary[] {
-  const byId = new Map<string, AgentSummary>();
-  for (const run of input.runs.values()) {
-    byId.set(run.id, {
-      id: run.id, label: run.label, status: run.status, background: run.background,
-      taskId: run.taskId, startedAt: run.startedAt, finishedAt: run.finishedAt,
-      steps: run.steps, endReason: run.endReason, source: "live",
-      outputPreview: clip(run.output),
-    });
-  }
-  const linkedTaskIds = new Set([...input.runs.values()].map((r) => r.taskId).filter(Boolean) as string[]);
-  for (const t of input.tasks?.list(input.parentThreadId) ?? []) {
-    if (linkedTaskIds.has(t.id) || byId.has(t.id)) continue;
-    byId.set(t.id, {
-      id: t.id, label: t.kind, status: mapTaskStatus(t.status), background: true,
-      taskId: t.id, startedAt: t.createdAt, finishedAt: t.finishedAt, source: "record",
-      outputPreview: clip(t.result),
-    });
-  }
-  for (const th of listSubagents(input.store, input.parentThreadId)) {
-    if (byId.has(th.id)) continue;
-    const meta = th.metadata ?? {};
-    byId.set(th.id, {
-      id: th.id,
-      label: String(meta.label ?? th.title ?? "子代理"),
-      status: mapMetaStatus(meta.status),
-      background: meta.background === true,
-      taskId: typeof meta.taskId === "string" ? meta.taskId : undefined,
-      startedAt: th.createdAt,
-      finishedAt: typeof meta.finishedAt === "number" ? meta.finishedAt : undefined,
-      source: "record",
-      outputPreview: clip(threadOutput(input.store, th.id)),
-    });
-  }
-  return [...byId.values()].sort((a, b) => a.startedAt - b.startedAt);
-}
+// ── 记录表的读路径都搬去了 agents/subagent-report.ts ──────────
+// 为什么再搬一次：本文件写在 400 行硬约束上（写过程 + 生命周期），而「记录怎么被读出来」
+// 和面板的列表 / 过程条目是同一件事（派生视图），放一起才读得完。
 
 /**
  * 「旧结论当种子」的降级 prompt：只在历史已被淘汰（或跨进程续跑）时才走这条路 ——

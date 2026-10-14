@@ -28,7 +28,10 @@ turn_diff            本轮净 diff（files: [{path,added,removed,created,delete
                      内核只在这轮**真有 Write/Edit 自报改动**时发；空 diff 不映射（面板不渲染空块）
                      兼容层收到后按 assistant 消息 id **落盘**一份，/api/history 回放时回填
                      （见下面「文件模块」—— 这是刷新后「每轮文件卡片」还在的唯一依据）
-subagent             子代理/后台任务状态（done 时带 usage: {inputTokens,outputTokens}；没报则缺省）
+subagent             子代理/后台任务状态（done 时带 usage: {inputTokens,outputTokens}；没报则缺省）。
+                     action: start|text|reasoning|tool|done|injected。
+                     ⚠️ **只有调用、没有结果**（`tool` 那一支只带 tool + info）——
+                     结果落盘在子代理的过程条目里，见下面「后台 Agent」一节
 build_start          构建开始
 build_error          构建错误
 commit               提交
@@ -53,6 +56,8 @@ text_editor_code_execution_tool_result
 ```
 /api/health
 /api/history
+/api/open-in-app/apps
+/api/open-in-app/icon
 /api/project-info
 /api/project-status
 /api/projects
@@ -64,6 +69,9 @@ text_editor_code_execution_tool_result
 /api/projects/{port}/session-log/stream
 /api/projects/{port}/sessions
 /api/projects/{port}/stat
+/api/projects/{port}/subagents            （?status=recent|running|done|failed|all，见「后台 Agent」一节）
+/api/projects/{port}/subagents/{id}       （单个子代理的元信息 + 过程条目，同上）
+/api/threads/{threadId}/messages
 /api/tts/voices
 /api/versions
 /preview/{project_id}/{file_path}
@@ -76,6 +84,7 @@ text_editor_code_execution_tool_result
 /api/chat
 /api/dialog/choose-folder
 /api/import-project
+/api/open-in-app
 /api/open-path
 /api/projects/attach
 /api/projects/create
@@ -96,7 +105,9 @@ text_editor_code_execution_tool_result
 /api/user-input
 ```
 
-共 39 条（GET 16 + POST 23；`/stat` 与 `/open-path` 是本轮新增的两条 —— 见下面「文件模块」）。
+共 44 条（GET 21 + POST 24；本轮的「打开方式」三条 `/api/open-in-app{,/apps,/icon}` 见下面「文件模块」；
+`/stat` 与 `/open-path` 是更早一轮新增的两条，也在那一节；
+GET 里的 `/api/projects/{port}/subagents*` 与 `/api/threads/{id}/messages` 见「后台 Agent」一节）。
 **兼容层不需要全实现** —— 只做 `control-panel` 实际在调的。
 判断「实际在调哪些」用 `control-panel/src/lib/api.ts` 里的 fetch 调用为准。
 （`/api/settings/model*` 是**新加的**三条之一，不在最初那份 36 条清单里 —— 见下面「模型设置」。）
@@ -155,10 +166,45 @@ body: { path, action: "default" | "reveal", project_id? }
 500 {ok:false, message:"打开失败（open）：…"}
 ```
 
+**边界不只有一个根**：`DOVE_CONFIG`（默认 `~/.dove`）也在允许清单里 —— 设置里的
+「打开记忆文件夹」开的就是它（SOUL / USER / MEMORY / HEARTBEAT / memory 日记都住在那里，
+本来就在工作区之外）。实现是「先按 realpath 挑目标落在哪个允许根里（配置目录优先；
+都不沾退回工作区根）」，挑中的根**照样过上面那三道闸** —— 挑根不是放宽边界，是换一个允许的边界。
+挑中配置目录时文案换成 `拒绝：路径不在允许的目录（配置目录）内（/…）`（同上两处 403）。
+
 - macOS：`open` / `open -R`（选中文件）；Linux：`xdg-open`（reveal 降级成「打开所在目录」）；
   其它平台**明确 501**，不猜命令。
 - 一律 `execFile`（数组参数、不走 shell）+ 5s 超时：路径里带 `;` `$()` 只是普通字符。
-- 实现：`routes-open-path.ts`（三道闸的顺序与理由写在文件头）。
+- 实现：`routes-open-path.ts`；②③ 两道路径闸与 `/api/open-in-app` **共用同一份实现**
+  （`path-guard.ts` 的 `guardOpenTarget`）——两条路由都会真的执行 `open`，判定不能有两份。
+
+### `/api/open-in-app` ×3（新增）—— 右上角「打开方式」分体按钮的后端
+
+```
+GET  /api/open-in-app/apps       200 { apps: [{id, name, action: "open"|"reveal"}], platform }
+GET  /api/open-in-app/icon?id=   200 image/png（Cache-Control: public, max-age=3600）
+                                 404 {ok:false, message:"没有 <id> 的图标（App 不在清单/没装/抽图标失败）"}
+POST /api/open-in-app            body: { appId, path, project_id? }
+400 {ok:false, message:"缺少 path" | "缺少 appId"}
+400 {ok:false, message:"清单里没有这个 App（或本机没装）：<appId>"}
+403 / 404                        ← 与 /api/open-path 完全同一份路径守卫（上面三条）
+404 {ok:false, message:"项目不存在（…）"}
+501 {ok:false, message:"当前平台（linux）不支持用指定 App 打开（清单为空）"}
+200 {ok:true,  message:"已用 Cursor 打开：/…"}
+500 {ok:false, message:"打开失败（open）：…"}
+```
+
+- 清单是**数据表**（`open-in-app.ts` 的 `APP_TABLE`）：id / 名字 / bundle 候选 / 启动方式
+  （`open -a <bundle>` 或 `open -R`）/ 目标（文件本身 or 所在目录）。macOS **只**在
+  `/Applications` 与 `~/Applications` 里按 bundle 名找 —— 装在别处、改过名的探测不到（照实说）。
+- **`appId` 是请求体里唯一能影响命令的东西**：bundle 路径一律来自探测结果，
+  用户输入永远进不了 `open -a` 的参数位（否则这就是一条「让内核替我执行任意命令」的路）。
+- 图标：`plutil` 读 `CFBundleIconFile` + `sips -Z 64` 转 PNG（系统自带，不引依赖）；
+  结果按 bundle 缓存（含 null，与「装完新 App 要重启」同口径）。
+- 平台：非 darwin 清单为空 + POST 501，面板据此退回原来的「打开方式」菜单（不变砖）。
+- 实现：`routes-open-in-app.ts`（安全边界写在文件头）+ `open-in-app.ts`（表 / 探测 / 拼命令）
+  + `open-in-app-icons.ts`（图标）。冒烟：`harness/scripts/smoke-legacy-open-in-app.ts`
+  （launcher 是注入的，跑一遍**不会弹出任何窗口**）。
 
 ### 每轮文件改动（`turn_diff`）的落盘与回填
 
@@ -338,6 +384,83 @@ remember_rule: "Bash(rm -rf /tmp/x)"   // 勾「记住」将落下的规则形�
 每行的 `usage` 从任务表（`metadata.taskId` → `TaskRegistry`）反查：
 `{inputTokens, outputTokens}` 或 `null`。**null = 没记录 / provider 没报**（界面显示「未上报」，
 不许显示 0）。实时通道（SSE `subagent` done 事件）里也带同一份 usage（内核本来就在发）。
+
+---
+
+## 后台 Agent：列表与过程（A7）
+
+面板输入框上方的「后台 Agent」按钮 → 右侧面板的「后台 Agent」页（状态页签 + 卡片），
+点一张卡片 → 面板里开一个 tab，内容是它的**运行过程**。
+
+两条接口都是**只读派生**（`threads` 里 `kind='subagent'` 的行 + `messages.parts`，
+实现是 `core/src/agents/subagent-report.ts` 的纯函数）—— 所以刷新、重启之后照样在，
+内存里那份（`SubagentRun`）只是运行时的加速，不是第二个真相源。
+
+### `GET /api/projects/{port}/subagents[?status=…]`
+
+```
+status: recent | running | done | failed | all      缺省 / 认不出 = all（老面板不带它，行为不变）
+  running  只留还在跑的
+  done     只留跑完的
+  failed   error **和 canceled** —— 对用户来说两者都是「没干成」，分两个页签只会让人找不着
+  recent   按开始时间**倒序**取前 20 条（概览，不是全量）
+  all      全部，按开始时间**升序**（= 老面板看到的顺序，不能改）
+
+200 {success:true, filter:"all", subagents:[{
+      id, label, status, background, taskId, parentId, projectId,
+      model,          // metadata.model；**没记 = null**（界面显示「未记录」）
+                      //   ⚠️ 不退回 threads.model —— 那一列有 NOT NULL DEFAULT 'deepseek-flash'，
+                      //      记录模型之前的老线程全是那个默认值，拿它当事实就是编造
+      roleId, startedAt, finishedAt,
+      durationMs,     // finishedAt - startedAt；**还在跑 = null**（界面拿 startedAt 自己走表）
+      parts,          // 落盘的过程条数
+      endReason,
+      usage,          // 同上面那节：null = 没报（不是 0）
+      projectPath,    // 项目根（卡片上那行仓库路径，面板自己截断）
+    }]}
+404 {success:false, message:"项目不存在"}
+```
+
+`status` 逐行归一成 `running | done | error | canceled | stale | unknown`（认不出就是 unknown，不猜）。
+
+**`stale` = 「记录说它在跑，但它已经不在跑了」**：写这条记录的进程不是当前进程
+（内核重启 / 崩过，线程上的 `running` 没人来得及改）。判据是 `metadata.ownerPid`
+（`SubagentTranscript` 写入 `process.pid`）—— **没记过 ownerPid 的老记录不动**
+（证明不了的事不猜，维持 running）。没有这一条，面板会为一个早已不在跑的子代理一直转圈，
+而且它会永远卡在「进行中」页签里。`stale` 不算 `running`，也不算 `failed` ——
+它只在「全部 / 最近」里出现（界面显示「已中断」）。
+
+### `GET /api/projects/{port}/subagents/{id}`
+
+```
+200 {success:true,
+     subagent: { …同上那一行的全部字段… },
+     entries: [ { kind:"reasoning"|"text"|"tool", … } ],   // 顺序 = 发生顺序
+     running: false }
+404 {success:false, message:"子代理不存在（sub_xxx）"}
+     · 不属于**这个项目**的 id 一律 404（归属按「项目 / 父线程」判，与列表同口径）——
+       猜到了 id 也读不到别人家子代理的过程
+```
+
+条目形状（`entries` 的元素）：
+
+```
+reasoning / text : { kind, text }
+tool             : { kind:"tool", tool, info, args, result?, ok?, at? }
+                   · info   = 参数摘要，**和实时流用同一个 toolInfoLine**（两条路长一样）
+                   · result = 工具结果（截到 2000 字符）；对象会被序列化
+                   · ok     = true / false / 缺省（只记了调用、没有结论）
+                   · at     = 这次调用开始的时间（毫秒）
+```
+
+⚠️ **两条边界，别当成 bug**：
+
+1. **结果只在它结束之后才看得到**。过程 parts 是在 `SubagentTranscript.finish()` 时一次性落盘的
+   （`addMessage` 没有增量更新语义），所以运行中的那个子代理 `entries` 多半是空的 ——
+   实时过程走 SSE 的 `subagent` 事件（`action: start|text|reasoning|tool|done`），面板自己拼。
+   同理，**工具结果不推实时流**：`subagent_tool` 只发调用（结果可能很长）。
+2. `entries` 只来自 `role='assistant'` 的过程消息，`step-start` / `injection` / 图片这些
+   **不进过程**（界面要的是「它想了什么、调了什么、拿到了什么」）。
 
 ---
 

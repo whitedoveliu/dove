@@ -11,6 +11,7 @@
  * 起的是**进程内**兼容层（临时库 + 临时端口 8882），不碰用户正在跑的内核（8790 / 8008）。
  * ⚠️ 验不了什么：面板的渲染；`/api/open-path` 真的调起系统应用（那条要人看，且会弹窗）——
  * 它这里只被间接覆盖（同一份 path-guard 的 inside/realOrNull）。
+ * 「用哪个 App 打开」（/api/open-in-app）在**另一个脚本**里：smoke-legacy-open-in-app.ts。
  */
 import "./_isolate.ts";   // ⚠️ 必须最先 import：把库与配置指到临时目录，别碰生产库
 import { request as httpRequest } from "node:http";

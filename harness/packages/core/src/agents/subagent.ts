@@ -53,11 +53,17 @@ export interface SubagentOptions {
   drainSteering?: () => string[];
   onText?: (delta: string) => void;
   /** 工具调用。**带参数** —— 只给名字的话界面上只能看到「subagent 调用了 Bash」，
-   *  看不到它到底在跑什么命令。 */
-  onToolUse?: (name: string, args: Record<string, unknown>) => void;
+   *  看不到它到底在跑什么命令。第三个参数是 provider 给的调用 id —— 结果回来时靠它配对。 */
+  onToolUse?: (name: string, args: Record<string, unknown>, toolCallId?: string) => void;
   /** 思考过程（provider 的 reasoning_content）。子代理是黑盒跑很久，
    *  不把思考流出来的话界面上只有一个转圈。 */
   onReasoning?: (delta: string) => void;
+  /**
+   * 一次工具调用的**结果**。调用（onToolUse）当时就发了，结果要等它真的跑完 ——
+   * 落盘成 part 之后，面板「后台 Agent」的过程条目才能显示「它拿到了什么」。
+   * 不推实时流：结果可能很长，而运行中的过程另有 SSE 时间线兜底。
+   */
+  onToolResult?: (r: { toolCallId: string; toolName: string; ok: boolean; output?: unknown; errorText?: string }) => void;
 }
 
 export interface SubagentResult {
@@ -151,7 +157,8 @@ export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult
       let args: Record<string, unknown> = {};
       try { args = JSON.parse(c.function.arguments || "{}") as Record<string, unknown>; }
       catch { args = { _raw: c.function.arguments }; }
-      opts.onToolUse?.(c.function.name, args);
+      // toolCallId 一并给出去：结果回来时要靠它找到「这是哪一次调用」
+      opts.onToolUse?.(c.function.name, args, c.id);
     }
     const outcomes = opts.execDeps
       ? await executeBatch(stream.toolCalls, { ...opts.execDeps, tools })
@@ -162,6 +169,11 @@ export async function runSubagent(opts: SubagentOptions): Promise<SubagentResult
         errorText: "这个子代理没有工具权限，不能调用工具。", durationMs: 0,
       }));
     for (const o of outcomes) {
+      opts.onToolResult?.({
+        toolCallId: o.toolCallId, toolName: o.toolName, ok: o.ok, output: o.output,
+        // 被权限策略拒绝 ≠ 执行失败：留一句说清的话，别让面板上只有「执行失败」
+        errorText: o.errorText ?? (o.denied ? "被权限策略拒绝（没有执行）" : undefined),
+      });
       messages.push({
         role: "tool", tool_call_id: o.toolCallId, name: o.toolName,
         content: JSON.stringify(o.ok ? (o.output ?? {}) : { error: o.errorText ?? "失败" }),

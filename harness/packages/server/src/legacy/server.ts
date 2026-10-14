@@ -57,6 +57,7 @@ import { handleGoalRoutes } from "./routes-goal.ts";
 import { handleSubagentRoutes } from "./routes-subagents.ts";
 import { handleSettingsRoutes } from "./routes-settings.ts";
 import { handleOpenPathRoutes } from "./routes-open-path.ts";
+import { handleOpenInAppRoutes } from "./routes-open-in-app.ts";
 
 export interface LegacyContext { svc: Services }
 
@@ -298,6 +299,7 @@ export async function handleLegacy(
   if (await handleSubagentRoutes(path, url, req, res, svc)) return true;
   if (await handleSettingsRoutes(path, req, res, svc)) return true;
   if (await handleOpenPathRoutes(path, req, res, svc)) return true;
+  if (await handleOpenInAppRoutes(path, url, req, res, svc)) return true;
 
   // 没实现的端点：明确 404（前端会看到，但不会白屏）
   json(res, 404, { success: false, message: `兼容层未实现：${req.method} ${path}` });

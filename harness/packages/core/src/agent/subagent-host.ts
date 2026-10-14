@@ -14,17 +14,16 @@
  *     **不建 task 记录**，因为结论已经直接回给模型了，再注一次就是重复。
  *  ④ 续跑优先**重挂同一段上下文**（#scopes 里的历史），不是新起一个 —— 新起的那个什么都不记得，
  *     只能靠「旧结论当种子」重来一遍，那是降级路而不是默认路。
- * 记录表的两条读路径（ListAgents 汇总 / id 寻址）搬去了 agents/subagent-store.ts —— 本文件贴着 400 行上限。
+ * 记录表的读路径（ListAgents 汇总 / id 寻址 / 面板的列表与过程条目）搬去了
+ * agents/subagent-report.ts —— 本文件贴着 400 行上限。
  */
 import type { Provider } from "../providers/types.ts";
 import type { Store } from "../session/store.ts";
 import type { Tool, ToolServices, AgentSummary, AgentSendResult, AgentInterruptResult } from "../tools/types.ts";
 import type { ExecDeps } from "../loop/tool-exec.ts";
 import type { TaskRegistry, TaskUsage } from "../agents/task-registry.ts";
-import {
-  SubagentTranscript, makeSubagentThreadId, SubagentScopeCache, listAgentSummaries, resolveAgent, seedPrompt,
-} from "../agents/subagent-store.ts";
-import type { AgentScope } from "../agents/subagent-store.ts";
+import { SubagentTranscript, makeSubagentThreadId, SubagentScopeCache, seedPrompt, type AgentScope } from "../agents/subagent-store.ts";
+import { listAgentSummaries, resolveAgent } from "../agents/subagent-report.ts";
 import { runSubagent } from "../agents/subagent.ts";
 import type { SubagentRole, SubagentSpawnResult, SubagentSpawnRequest } from "../agents/roles.ts";
 import {
@@ -324,7 +323,7 @@ export class SubagentHost {
       const transcript = new SubagentTranscript({
         store: this.#store, parentThreadId: this.#parentThreadId, projectId: this.#projectId,
         label: runLabel, background: bg.background, taskId: bg.taskId, threadId, roleId: role.id,
-        reuse: scope !== undefined,
+        model: this.#model, reuse: scope !== undefined,
       });
       // 角色裁剪在这里落地：父线程策略结果 ∩ 角色白名单（角色只能削减，见 agents/roles.ts）
       const tools = applyRolePolicy(this.#tools, role).tools;
@@ -340,7 +339,9 @@ export class SubagentHost {
         drainSteering: () => run.steering.splice(0, run.steering.length),
         onText: (d) => { transcript.text(d); this.#sink({ type: "subagent_text", content: d, label: runLabel, subagentId: threadId }); },
         onReasoning: (d) => { transcript.reasoning(d); this.#sink({ type: "subagent_reasoning", content: d, label: runLabel, subagentId: threadId }); },
-        onToolUse: (name, args) => { transcript.tool(name, args); this.#sink({ type: "subagent_tool", tool: name, args, label: runLabel, subagentId: threadId }); },
+        onToolUse: (name, args, callId) => { transcript.tool(name, args, callId); this.#sink({ type: "subagent_tool", tool: name, args, label: runLabel, subagentId: threadId }); },
+        // 工具结果只落盘（面板「后台 Agent」点进去要看「调了什么、拿到了什么」）
+        onToolResult: (o) => transcript.toolResult(o.toolCallId, o.ok, o.output, o.errorText),
       });
       transcript.finish(r.endReason === "error" ? "error" : "done", r.endReason);
       run.status = r.endReason === "aborted" ? "canceled" : r.endReason === "error" ? "error" : "done";

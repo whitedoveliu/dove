@@ -23,6 +23,18 @@ export const FATIGUE_SLEEPY_AT = 80;
 export const FATIGUE_WAKE_AT = 8;
 export const FATIGUE_DEFAULT_REST_MINUTES = 20;
 
+/**
+ * 空闲多久算「睡过一觉」。
+ *
+ * 为什么必须有这条规则（真栽过）：疲劳/清醒时长全靠 `sleep()` / `wake()` 复位，
+ * 而**没有任何生产调用方**去调它们（只有 `/api/fatigue` 路由与冒烟脚本），
+ * 于是 `awakeSince` 从第一次运行起就冻住 —— 实测 `~/.dove/fatigue.json` 停在 10-06，
+ * 到了 10-14 模型每轮都被告知「已连续清醒 206 小时、疲劳 100/100 / 能量 0」。
+ * 规则：醒着且距上次落库超过这个时长 → 这一段按睡眠算（疲劳按睡眠速率回落，
+ * 醒来时间就是现在）。于是「连续清醒」的上界就是它，不依赖任何外部调度器记得调 sleep()。
+ */
+export const FATIGUE_IDLE_SLEEP_AFTER_HOURS = 3;
+
 export type FatigueState = "awake" | "tired" | "sleepy" | "sleeping";
 
 export const FATIGUE_STATE_LABEL: Record<FatigueState, string> = {
@@ -89,10 +101,21 @@ export class FatigueService {
     return this.#file;
   }
 
-  /** 当前快照（已按经过时间推进），纯读不落盘 */
+  /**
+   * 当前快照（已按经过时间推进）。**推进过的状态会顺手落盘**（一分钟粒度）。
+   *
+   * 为什么不能纯读：`updatedAt` 只由 sleep/wake/rest/set 推进，而这几条在生产里没人调 ——
+   * 只读不落盘的话，`updatedAt` 永远停在老值：疲劳每读一次就从同一个老起点重算一遍
+   * （越算越大），「空闲算睡」那条规则也会每次都从同一个老起点重新推、永远睡不着。
+   * 落盘节流到一分钟：读的频率远高于一分钟（每轮对话、面板轮询），不值得每次都写盘。
+   */
   snapshot(): FatigueSnapshot {
     const now = this.#nowMs();
-    return this.#project(this.#apply(now), now);
+    const next = this.#apply(now);
+    if (next.updatedAt !== this.#state.updatedAt && next.updatedAt - this.#state.updatedAt >= 60_000) {
+      this.#save(next);
+    }
+    return this.#project(next, now);
   }
 
   /** 去睡觉：转成 sleeping，之后疲劳按 FATIGUE_SLEEP_PER_HOUR 快速回落 */
@@ -160,6 +183,16 @@ export class FatigueService {
     if (elapsed === 0) return { ...s };
     const hours = elapsed / 3_600_000;
     if (!s.sleeping) {
+      // 空闲超过阈值 = 没人记这一觉（生产里没人调 sleep()）→ 按睡过处理。
+      // 不这么做，「连续清醒」会无限累积（实测冻到 206 小时）。
+      if (hours >= FATIGUE_IDLE_SLEEP_AFTER_HOURS) {
+        return {
+          ...s,
+          fatigue: clamp(s.fatigue - hours * FATIGUE_SLEEP_PER_HOUR),
+          awakeSince: now,
+          updatedAt: now,
+        };
+      }
       return { ...s, fatigue: clamp(s.fatigue + hours * FATIGUE_AWAKE_PER_HOUR), updatedAt: now };
     }
     // 睡着：先按睡眠速率回落；睡够了就自然醒，醒来后的时间按清醒速率重新累积
