@@ -27,6 +27,9 @@ export default defineConfig({
       "/api/local-token": "http://127.0.0.1:8790",
       "/api/health": "http://127.0.0.1:8790",
       "/api/config": "http://127.0.0.1:8790",
+      // 「重新挂上正在跑的回合」（lib/api.ts 的 streamFrom）也在内核自己那个 origin 上，
+      // 只有 dev（3006）需要这一跳 —— 产品形态（面板由内核托管）本来就同源。
+      "/api/stream": "http://127.0.0.1:8790",
     },
   },
   build: {

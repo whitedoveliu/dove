@@ -10,7 +10,7 @@
  * 进入：人类在输入框打 /plan（或面板开关）→ 线程 metadata.planMode = true。
  */
 
-import { normalizePermissionMode } from "../tools/approval.ts";
+import { normalizeProfile, legacyModeOf, type PermissionProfile } from "../tools/permission.ts";
 
 export const PLAN_MODE_KEY = "planMode";
 
@@ -40,11 +40,21 @@ export const PLAN_MODE_POLICY_REASON = "plan-mode";
  * 运行时决议：从线程 metadata 一次算出「是否计划模式」与「本轮权限档」。
  * 计划模式 = **硬只读**（写类工具从工具表里裁掉，不是提示词请求）。
  */
-export function planAwareMode(metadata: Record<string, unknown> | null | undefined): {
+export function resolveMode(metadata: Record<string, unknown> | null | undefined): {
   planMode: boolean;
-  permissionMode: ReturnType<typeof normalizePermissionMode>;
+  profile: PermissionProfile;
 } {
   const planMode = metadata?.planMode === true;
-  const readOnly = planMode || metadata?.readOnly === true;
-  return { planMode, permissionMode: normalizePermissionMode(readOnly ? "read-only" : metadata?.permissionMode) };
+  const profile = normalizeProfile(metadata);
+  // 计划模式 = 硬只读（写类工具从工具表里裁掉，见 runtime 的 applyThreadPolicy）
+  return { planMode, profile: planMode ? { ...profile, sandbox: "read-only" } : profile };
+}
+
+/** 兼容旧调用方（返回旧枚举值）。新代码用 resolveMode —— 两轴模型下"模式"只是预设的名字 */
+export function planAwareMode(metadata: Record<string, unknown> | null | undefined): {
+  planMode: boolean;
+  permissionMode: ReturnType<typeof legacyModeOf>;
+} {
+  const { planMode, profile } = resolveMode(metadata);
+  return { planMode, permissionMode: legacyModeOf(profile) };
 }

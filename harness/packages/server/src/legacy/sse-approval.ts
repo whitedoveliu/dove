@@ -48,6 +48,8 @@ export function approvalAskEvents(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] 
   // 形状从 tool_start 记下的那对 (工具, 入参) 算（两条事件共享同一个 toolCallId）
   const pending = ctx.toolCalls?.get(toolCallId);
   const shape = pending ? rememberedShape(ctx.tools, pending.tool, pending.input) : undefined;
+  // 内核可以在请求的 metadata 里说「这条不给记住」（凭证类写目标：每次都要单独确认，见 core 的 credential-write 策略）
+  const meta = (e.metadata ?? {}) as { noRemember?: boolean };
   return [{
     type: "ask_user",
     tool_use_id: toolCallId,
@@ -61,6 +63,6 @@ export function approvalAskEvents(e: AgentEvent, ctx: LegacyCtx): LegacyEvent[] 
     ].filter(Boolean).join("\n\n"),
     suggestions: ["允许", "拒绝"],
     approval: true,
-    remember_rule: shape,
+    remember_rule: meta.noRemember === true ? undefined : shape,
   }];
 }

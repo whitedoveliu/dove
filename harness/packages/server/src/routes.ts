@@ -11,6 +11,7 @@ import { answerWithText } from "../../core/src/tools/builtin/ask-user.ts";
 import { SseHub } from "./sse.ts";
 import { handleServiceRoutes } from "./routes-services.ts";
 import { handlePreviewRoutes } from "./routes-preview.ts";
+import { handleStreamRoutes } from "./routes-stream.ts";
 import { handleThreadRoutes } from "./routes-threads.ts";
 import { handleToolRoutes } from "./routes-tools.ts";
 import { readRuntimeLog, listRuntimeFiles } from "../../core/src/session/runtime-log.ts";
@@ -155,6 +156,14 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
     const client = hub.add(threadId, res);
     const controller = new AbortController();
     running.set(threadId, controller);
+    // 新回合：上一回合的重放帧作废（历史里已经有了），并且这一轮的帧要**广播给所有订阅者** ——
+    // 不只是这次 POST 的客户端：切走又切回来的面板会挂在 /api/stream 上（见那条路由的注释）。
+    hub.beginTurn(threadId);
+    const emit = (e: Record<string, unknown>): void => {
+      // 帧序号由 hub 分配（每线程单调、每轮归零）——**不要**用 eventLog.seq，
+      // 那个只在写日志时前进，一轮里多帧会共享同一个 id（冒烟 smoke-stream 抓到过）。
+      hub.broadcast(threadId, e, hub.remember(threadId, e));
+    };
 
     try {
       const result = await svc.runtime.run({
@@ -162,19 +171,23 @@ export async function handle(req: IncomingMessage, res: ServerResponse, deps: Ro
         model: b.model ? String(b.model) : undefined,
         signal: controller.signal,
         // SSE 帧带 id: <seq> → 浏览器断线重连时可以用 Last-Event-ID 续传
-        sink: (e) => hub.send(client, e, svc.eventLog.seq),
+        sink: emit,
       });
-      hub.send(client, { type: "done", assistantMessageId: result.assistantMessageId, endReason: result.endReason });
+      emit({ type: "done", assistantMessageId: result.assistantMessageId, endReason: result.endReason });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      hub.send(client, { type: "error", content: msg });
-      hub.send(client, { type: "done" });
+      emit({ type: "error", content: msg });
+      emit({ type: "done" });
     } finally {
       running.delete(threadId);
       try { res.end(); } catch { /* ignore */ }
     }
     return true;
   }
+
+  // ── 重新挂上「正在跑的回合」（面板切走再回来 / 标签页回到前台）──────
+  // 语义与契约（attach 帧 / 重放 / 广播）见 routes-stream.ts 的文件头。
+  if (handleStreamRoutes(path, url, req, res, hub, running, json)) return true;
 
   if (path === "/api/stop" && req.method === "POST") {
     const b = await readBody(req);

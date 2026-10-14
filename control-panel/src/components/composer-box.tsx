@@ -3,7 +3,8 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowUp, Loader2, Square, Shield, ShieldOff, Eye, ChevronDown, Check } from "lucide-react";
 import { SlashMenu, filterSlashCommands, slashQuery, type SlashCommand } from "@/components/slash-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { PERM_COPY, usePermissionPresets, presetOf, type PermissionMode, type PermissionPreset } from "@/lib/permission";
+import { PERM_COPY, usePermissionPresets, presetOf, sandboxOfPreset, useWritableRoots, type PermissionMode, type PermissionPreset } from "@/lib/permission";
+import { chooseFolder } from "@/lib/api";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { ComposerInput, type ComposerHandle } from "@/components/composer-input";
@@ -242,7 +243,7 @@ export function SendButton({
  * 一个是「当前项目的值」），所以这里只做受控 UI，取值/存值交给调用方。
  */
 export function PermissionSelect({
-  value, onChange, disabled, surface = "session",
+  value, onChange, disabled, surface = "session", projectKey,
 }: {
   value: PermissionMode;
   onChange: (m: PermissionMode) => void;
@@ -254,6 +255,11 @@ export function PermissionSelect({
    * 用同一份文案会让用户以为改的是同一个东西（上一轮就踩了这个）。
    */
   surface?: "session" | "defaults";
+  /**
+   * 当前项目（端口 / id / 目录名）—— 给了才会显示「额外可写目录」那一节。
+   * 它写的是**线程 metadata**，所以没有线程（新会话页）时不给这个 prop。
+   */
+  projectKey?: string | null;
 }) {
   const { presets } = usePermissionPresets();
   const [pending, setPending] = useState<PermissionPreset | null>(null);
@@ -261,11 +267,19 @@ export function PermissionSelect({
   const cur = presetOf(presets, value);
   const dangerous = value === "danger-full-access";
   const Icon = dangerous ? ShieldOff : value === "read-only" ? Eye : Shield;
+  const sandbox = sandboxOfPreset(cur, value);
+  const writable = useWritableRoots(projectKey);
 
   /** 要确认的预设先过闸（B2）—— 比如完全权限 */
   const choose = (p: PermissionPreset) => {
     if (p.requiresConfirm && p.value !== value) { setPending(p); return; }
     onChange(p.value);
+  };
+
+  /** 加一个可写目录：走系统原生选择框（内核侧 /api/projects/pick-folder） */
+  const pickRoot = async () => {
+    const picked = await chooseFolder();
+    if (picked?.success && picked.path) await writable.add(picked.path);
   };
 
   return (
@@ -313,6 +327,41 @@ export function PermissionSelect({
               </span>
             </button>
           ))}
+          {/* 额外可写目录（沙箱轴的一部分）—— 只在「工作区内修改」下有意义：
+              写这些目录不再弹审批；完全权限下本来就全放行，显示它只会让人误以为还有边界。 */}
+          {projectKey && sandbox === "workspace-write" && (
+            <div className="mt-1 border-t border-border-default px-2 py-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-2xs text-text-tertiary">额外可写目录（工作区之外）</span>
+                <button
+                  type="button"
+                  onClick={() => void pickRoot()}
+                  className="rounded px-1.5 py-0.5 text-2xs text-text-secondary hover:bg-surface-hover hover:text-text-primary"
+                >
+                  + 添加文件夹
+                </button>
+              </div>
+              {writable.roots.length === 0 ? (
+                <div className="mt-1 text-2xs text-text-tertiary">没有。写工作区外的文件会先问你一次。</div>
+              ) : (
+                <ul className="mt-1 space-y-0.5">
+                  {writable.roots.map((r) => (
+                    <li key={r} className="flex items-center gap-1 text-2xs text-text-secondary">
+                      <span className="min-w-0 flex-1 truncate" title={r}>{r}</span>
+                      <button
+                        type="button"
+                        aria-label={"移除 " + r}
+                        onClick={() => void writable.remove(r)}
+                        className="rounded px-1 text-text-tertiary hover:bg-surface-hover hover:text-text-primary"
+                      >
+                        ✕
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </PopoverContent>
       </Popover>
 

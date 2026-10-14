@@ -105,6 +105,35 @@ for (const [legacy, want] of [["full", "danger-full-access"], ["workspace", "wor
   if (legacy === "full") check("旧值 full 仍等价完全权限（无审批）", approvals === 0, "approvals=" + approvals);
 }
 
+// 新机值（两轴 profile）也必须行为正确 —— 面板写的就是这个字段：
+//   · {sandbox:"danger-full-access"} → 一条审批都不许有（"完全权限"的另一半是审批轴，不是沙箱轴）
+//   · {sandbox:"read-only"}          → 写类工具从工具表裁掉（发 policy 事件）
+console.log("=== 新机值：两轴 profile（sandbox × approval）===");
+for (const profile of [
+  { sandbox: "danger-full-access", approval: "never", writableRoots: [] },
+  { sandbox: "workspace-write", approval: "risky", writableRoots: [] },
+  { sandbox: "read-only", approval: "never", writableRoots: [] },
+] as const) {
+  const t = svc.store.getOrCreateHomeThread();
+  svc.store.updateThread(t.id, { metadata: { permission: profile } });
+  let err = "";
+  let approvals = 0;
+  let blockedWrite = false;
+  try {
+    await svc.runtime.run({
+      threadId: t.id,
+      userText: "用 Bash 跑：cd /tmp && rm -rf /tmp/dove-smoke-profile && echo done",
+      sink: (e) => {
+        if (e.type === "tool_approval") approvals++;
+        if (e.type === "policy") blockedWrite = true;
+      },
+    });
+  } catch (e) { err = e instanceof Error ? e.message : String(e); }
+  check(`profile ${profile.sandbox} 能跑`, err === "", err.slice(0, 160));
+  if (profile.sandbox === "danger-full-access") check("完全权限（profile）下没有任何审批请求", approvals === 0, "approvals=" + approvals);
+  if (profile.sandbox === "read-only") check("只读（profile）下裁掉了写类工具", blockedWrite, blockedWrite ? "" : "没发 policy 事件");
+}
+
 console.log("\n" + "=".repeat(56));
 console.log(fail === 0 ? `全部通过（${pass}）` : `失败 ${fail} / ${pass + fail}`);
 finish(svc, fail === 0 ? 0 : 1);

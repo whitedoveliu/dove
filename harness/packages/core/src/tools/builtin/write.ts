@@ -5,7 +5,7 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { defineTool, S } from "../types.ts";
-import { guarded, resolvePath, resolveInsideWorkspace, relPath, str, ensureDir, readTextFile } from "./util.ts";
+import { guarded, resolvePath, resolveWritablePath, relPath, str, ensureDir, readTextFile } from "./util.ts";
 import { recordFileMutation } from "../turn-diff.ts";
 import type { ToolAccesses } from "../types.ts";
 
@@ -64,7 +64,7 @@ export const WriteTool = defineTool({
   approvalRule: ruleArg,
   execute: (input, ctx) => guarded(async () => {
     // ⚠️ 必须用带护栏的版本 —— 否则能写到工作区外且不审批（见 util 的说明）
-    const abs = resolveInsideWorkspace(str(input, "file_path"), ctx.workdir);
+    const abs = resolveWritablePath(str(input, "file_path"), ctx.workdir, ctx.permission);
     if (input.content === undefined || input.content === null) throw new Error("缺少必填参数 content");
     const content = String(input.content);
     const existed = await fsp.stat(abs).then((s) => s.isFile()).catch(() => false);

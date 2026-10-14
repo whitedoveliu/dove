@@ -408,27 +408,26 @@ export interface SSEEvent {
   // todo_update 相关字段
   todos?: TodoItem[];
   merge?: boolean;
+  // attach 帧相关字段（只有 `GET /api/stream` 会发，见 streamFrom）
+  threadId?: string;
+  running?: boolean;
+  lastSeq?: number;
 }
 
 /**
- * 发送聊天消息并处理 SSE 流式响应
+ * 逐帧读一条 SSE 响应体 —— `POST /api/chat` 和 `GET /api/stream` **共用这一份**。
+ *
+ * 两种帧都要认：
+ *   · `data: {…}`                 —— 老契约（8008 的 /api/chat）只有这个；
+ *   · `id: <seq>` + `data: {…}`   —— 内核的帧带帧序号（重挂时要拿它算 after，见 streamFrom）。
+ *
+ * `id` **用完即清**：SSE 规范里它是粘的（后面的帧继承上一个 id），而 attach 那帧故意不带 seq ——
+ * 粘住就等于把 attach 当成「有编号的一帧」，客户端的「已看到哪」被它往前带（内核 sse.ts 记着同一个坑）。
  */
-export async function sendChatMessage(
-  request: ChatRequest,
-  onEvent: (event: SSEEvent) => void
+async function readSseFrames(
+  response: Response,
+  onFrame: (event: SSEEvent, seq: number | null) => void
 ): Promise<void> {
-  const response = await apiFetch(`${API_BASE_URL}/api/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-
   const reader = response.body?.getReader();
   const decoder = new TextDecoder();
 
@@ -437,6 +436,7 @@ export async function sendChatMessage(
   }
 
   let buffer = "";
+  let frameId: number | null = null;
 
   try {
     while (true) {
@@ -454,38 +454,147 @@ export async function sendChatMessage(
       buffer = lines.pop() || ""; // 保留最后一个不完整的行
 
       for (const line of lines) {
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6);
+        if (line.startsWith("id: ")) {
+          const n = Number(line.slice(4));
+          frameId = Number.isFinite(n) ? n : null;
+          continue;
+        }
+        // 心跳（`: ping`）与空行走到这儿就被跳过了
+        if (!line.startsWith("data: ")) continue;
 
-          if (data.trim()) {
-            try {
-              const event: SSEEvent = JSON.parse(data);
-              
-              // 添加时间戳，证明是流式接收
-              const timestamp = new Date().toISOString().split('T')[1].slice(0, -1); // HH:MM:SS.mmm
-              // 对于特殊事件，打印完整信息
-              if (event.type === "browser_action" || event.type === "restore_confirm" || event.type === "todo_update") {
-                console.log(`[${timestamp}] ${event.type}:`, event);
-              } else {
-                console.log(`[${timestamp}] ${event.type}:`, event.content?.substring(0, 30) || event.tool || '');
-              }
-              
-              onEvent(event);
+        const data = line.slice(6);
+        if (!data.trim()) continue;
 
-              // 如果收到 done 事件，停止处理
-              if (event.type === "done") {
-                return;
-              }
-            } catch (e) {
-              console.error("Failed to parse SSE event:", data, e);
-            }
+        try {
+          const event: SSEEvent = JSON.parse(data);
+
+          // 添加时间戳，证明是流式接收
+          const timestamp = new Date().toISOString().split('T')[1].slice(0, -1); // HH:MM:SS.mmm
+          // 对于特殊事件，打印完整信息
+          if (event.type === "browser_action" || event.type === "restore_confirm" || event.type === "todo_update") {
+            console.log(`[${timestamp}] ${event.type}:`, event);
+          } else {
+            console.log(`[${timestamp}] ${event.type}:`, event.content?.substring(0, 30) || event.tool || '');
           }
+
+          onFrame(event, frameId);
+          frameId = null;
+
+          // 收到 done 事件，停止处理。**要主动收线**：/api/stream 是常驻广播
+          // （回合跑完连接还开着），不 cancel 它就一直挂着不放。
+          if (event.type === "done") {
+            await reader.cancel().catch(() => { /* 已经关了 */ });
+            return;
+          }
+        } catch (e) {
+          console.error("Failed to parse SSE event:", data, e);
         }
       }
     }
   } finally {
     reader.releaseLock();
   }
+}
+
+/**
+ * 发送聊天消息并处理 SSE 流式响应。
+ *
+ * `seq` 是内核给这一帧分配的帧序号（只有内核才带，见 readSseFrames）——
+ * 调用方拿它记「这个线程已经处理到哪儿了」，重挂时不重复应用（见 streamFrom）。
+ */
+export async function sendChatMessage(
+  request: ChatRequest,
+  onEvent: (event: SSEEvent, seq: number | null) => void
+): Promise<void> {
+  const response = await apiFetch(`${API_BASE_URL}/api/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  await readSseFrames(response, onEvent);
+}
+
+/** `GET /api/stream` 的第一帧（内核 routes-stream.ts）：这一轮在不在跑、缓冲里最后一帧的序号 */
+export interface StreamAttachInfo {
+  threadId: string;
+  /** 这轮还在跑吗 */
+  running: boolean;
+  /** 帧缓冲里最后一帧的 seq（0 = 这轮没跑过 / 什么都没留） */
+  lastSeq: number;
+}
+
+/**
+ * 重新挂上某个线程「正在跑的那一轮」：`GET /api/stream?threadId=<id>&after=<seq>`（SSE）。
+ *
+ * 为什么要它：`POST /api/chat` 的 SSE 只活在**那次连接**上 —— 切走（换任务 / 标签页切后台 /
+ * 页面重开）之后回来，那轮的 thinking / 工具行在面板里没有任何地方可以补看
+ * （消息历史要等回合结束才落库）。契约（内核 routes-stream.ts）：
+ *   ① 先来一帧 attach（**不带 seq**）告诉你这轮在不在跑；
+ *   ② 再补 `seq > after` 的最近一回合的帧；
+ *   ③ 之后跟着广播走，直到 done。帧序号每线程、每轮从 1 起（内核 beginTurn 会归零）。
+ *
+ * ⚠️ 只有**内核（8790）**有这条路由，而且只有内核起的回合会进它的帧缓冲。
+ *    走 `getPanelOrigin()`（产品形态 = 面板同源的内核）；dev（vite 3006）不在内核的 CORS
+ *    白名单里，那里靠 vite 的 proxy 转发（见 vite.config.ts）。
+ *
+ * 返回 `abort()`：切线程 / 卸载**必须**调 —— 旧流的回调还会继续跑，不 abort 就是
+ * 「A 的 delta 落进 B 的视图」。`done` 是这条流的收尾（失败会 reject，调用方自己决定要不要吭声）。
+ */
+export function streamFrom(
+  threadId: string,
+  after: number,
+  onEvent: (event: SSEEvent, seq: number | null) => void,
+  onAttach?: (info: StreamAttachInfo) => void,
+  signal?: AbortSignal
+): { abort: () => void; done: Promise<void> } {
+  const ac = new AbortController();
+  if (signal) {
+    if (signal.aborted) ac.abort();
+    else signal.addEventListener("abort", () => ac.abort(), { once: true });
+  }
+  const query = `threadId=${encodeURIComponent(threadId)}&after=${Math.max(0, Math.floor(after) || 0)}`;
+  // 两个候选（照 settings-dialog.tsx 那套）：先面板同源，再按主机名 + 内核默认端口。
+  // 产品形态下这两个是同一个地址 —— 去重，别白打一遍。
+  const bases = [...new Set(
+    typeof window === "undefined"
+      ? [getPanelOrigin()]
+      : [getPanelOrigin(), `http://${window.location.hostname}:8790`]
+  )];
+
+  const done = (async () => {
+    let lastError = "";
+    for (const base of bases) {
+      try {
+        const res = await apiFetch(`${base}/api/stream?${query}`, { signal: ac.signal, cache: "no-store" });
+        if (!res.ok) { lastError = `HTTP ${res.status}`; continue; }
+        await readSseFrames(res, (event, seq) => {
+          if (event.type === "attach") {
+            onAttach?.({
+              threadId: typeof event.threadId === "string" ? event.threadId : threadId,
+              running: event.running === true,
+              lastSeq: typeof event.lastSeq === "number" ? event.lastSeq : 0,
+            });
+            return;
+          }
+          onEvent(event, seq);
+        });
+        return;
+      } catch (e) {
+        if (ac.signal.aborted) return;   // 自己 abort 的：不是错误
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    }
+    throw new Error(`挂不上 ${threadId} 的流：${lastError || "没有可用的内核地址"}`);
+  })();
+
+  return { abort: () => ac.abort(), done };
 }
 
 /**
@@ -853,13 +962,24 @@ export async function readThreadMessages(threadId: string): Promise<{
 }
 
 /**
- * 权限模式（对齐 Codex 的 SandboxMode 三档）。
+ * 权限：**两轴**（sandbox × approval），见内核 `tools/permission.ts`。
  *
- *   full       完全访问 —— 任何操作都不审批
- *   workspace  工作区内修改 —— 默认；工作区内放行，越界才问
- *   readonly   仅可查看 —— 写类工具直接从工具表里裁掉
+ *   sandbox   能碰到什么：read-only | workspace-write | danger-full-access
+ *   approval  要不要问：  never | risky（启发式+分类器）| review（实验：每条带命令的调用都过分类器）
+ *   writableRoots  工作区之外**额外**允许写的目录（绝对路径）
+ *
+ * UI 上那四个档位（见 PermissionPreset.value）只是给这两根轴取个名字；
+ * 新代码想知道「这一档到底会怎样」就读 profile，别再从 value 反推。
  */
 export type PermissionMode = "read-only" | "workspace-write" | "danger-full-access" | "auto";
+export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type ApprovalPolicy = "never" | "risky" | "review";
+
+export interface PermissionProfile {
+  sandbox: SandboxMode;
+  approval: ApprovalPolicy;
+  writableRoots: string[];
+}
 
 /** 权限预设（B4）—— 主机下发，前端只渲染 */
 export interface PermissionPreset {
@@ -868,6 +988,8 @@ export interface PermissionPreset {
   description: string;
   requiresConfirm: boolean;
   experimental: boolean;
+  /** 这一档真正生效的两根轴（主机下发；老主机没有这个字段时按 value 兜底） */
+  profile?: PermissionProfile;
 }
 
 export async function getPermissionPresets(): Promise<PermissionPreset[]> {
@@ -882,6 +1004,29 @@ export async function getPermissionMode(port: string): Promise<PermissionMode> {
   if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
   const d = (await r.json()) as { mode?: PermissionMode };
   return d.mode ?? "workspace-write";
+}
+
+/** 读整份 profile（两轴 + 可写目录）。读不到时返回 undefined —— 调用方保留现值，别编默认值 */
+export async function getPermissionProfile(port: string): Promise<PermissionProfile | undefined> {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`);
+  if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
+  const d = (await r.json()) as { profile?: PermissionProfile };
+  return d.profile;
+}
+
+/**
+ * 改「额外可写目录」（整份替换）。
+ * 只收绝对路径 —— 相对路径内核会丢掉（它相对哪个 cwd 都是歧义）。
+ */
+export async function setWritableRoots(port: string, writableRoots: string[]): Promise<PermissionProfile | undefined> {
+  const r = await apiFetch(`${getApiBaseUrl()}/api/projects/${encodeURIComponent(port)}/permission`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ writableRoots }),
+  });
+  if (!r.ok) throw new Error(`HTTP error! status: ${r.status}`);
+  const d = (await r.json()) as { profile?: PermissionProfile };
+  return d.profile;
 }
 
 export async function setPermissionMode(port: string, mode: PermissionMode): Promise<PermissionMode> {

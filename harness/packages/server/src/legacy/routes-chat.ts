@@ -8,6 +8,7 @@
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
+import type { SseHub } from "../sse.ts";
 import { json, readBody, projectIdToPort, portToProject, findProjectByKey, type LegacyProject } from "./server.ts";
 import { toLegacy, sessionIdEvent, MODIFYING_TOOLS, type LegacyEvent, type LegacyCtx } from "./sse-compat.ts";
 import { listPendingAsks, answerWithText } from "../../../core/src/tools/builtin/ask-user.ts";
@@ -43,7 +44,11 @@ function hasBuildScript(dir: string): boolean {
   return existsSync(join(dir, "tools", "build.mjs"));
 }
 
-/** threadId → 中止控制器（/api/stop 用） */
+/**
+ * threadId → 中止控制器（/api/stop 用）。**默认那份是进程内的兜底**：
+ * 生产形态由 main.ts 把内核同一份 Map 注入进来（`deps.running`），
+ * 这样 8790 的 `GET /api/stream` 才能如实回答「这轮在不在跑」。
+ */
 const running = new Map<string, AbortController>();
 
 /** projectId(port) → 用户对上次 ask_user 的回答（/api/user-input 用） */
@@ -59,7 +64,10 @@ function writeSse(res: ServerResponse, e: LegacyEvent): void {
 
 export async function handleChatRoutes(
   path: string, url: URL, req: IncomingMessage, res: ServerResponse, svc: Services,
+  deps: { hub?: SseHub; running?: Map<string, AbortController> } = {},
 ): Promise<boolean> {
+  const hub = deps.hub;
+  const runMap = deps.running ?? running;
   // ── POST /api/steer（运行中插话 / steering）─────────
   // 面板拿不到新内核的 threadId，所以和权限 / 目标路由一样用**三键查找**
   // （端口 → 项目 id → 目录名）定位项目，再取它的 project 线程。
@@ -110,7 +118,9 @@ export async function handleChatRoutes(
 
     const thread = svc.store.getOrCreateProjectThread(proj.id, proj.name);
     const ctrl = new AbortController();
-    running.set(thread.id, ctrl);
+    runMap.set(thread.id, ctrl);
+    // 帧序号每轮归零、上一轮的缓冲丢掉（历史里已经有了）—— 见 sse.ts 的 beginTurn。
+    hub?.beginTurn(thread.id);
     writeSse(res, sessionIdEvent(thread.id));
 
     let modified = false;
@@ -136,6 +146,11 @@ export async function handleChatRoutes(
             });
           }
         }
+        // 帧缓冲记的是**面板看见的那份**（toLegacy 之后的），这样 `GET /api/stream` 的重放
+        // 与实时流逐帧一致 —— 面板读的就是这套词表（走 8008 的那条路）。
+        // 内核自己的 /api/chat（8790）记的是内核词表；两条路哪天混用同一条线程，重放会串词表，
+        // 但产品形态下面板只走 8008、脚本只走 8790，一条线程只会由其中一条发起。
+        if (hub) hub.broadcast(thread.id, le as Record<string, unknown>, hub.remember(thread.id, le as Record<string, unknown>));
         writeSse(res, le);
       }
     };
@@ -185,7 +200,7 @@ export async function handleChatRoutes(
       if (ctrl.signal.aborted) writeSse(res, { type: "interrupted" });
       else writeSse(res, { type: "error", message: e instanceof Error ? e.message : String(e) });
     } finally {
-      running.delete(thread.id);
+      runMap.delete(thread.id);
       writeSse(res, { type: "done" });
       try { res.end(); } catch { /* ignore */ }
     }
@@ -212,9 +227,9 @@ export async function handleChatRoutes(
     } catch { /* 没有 body 或解析失败 → 走全停（老行为） */ }
 
     let n = 0;
-    for (const [threadId, c] of running) {
+    for (const [threadId, c] of runMap) {
       if (only && threadId !== only) continue;
-      c.abort("user"); running.delete(threadId); n++;
+      c.abort("user"); runMap.delete(threadId); n++;
     }
     json(res, 200, { success: true, message: `已发送终止信号到 ${n} 个活动会话` });
     return true;

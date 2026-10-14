@@ -110,7 +110,9 @@ server.on("error", (e: NodeJS.ErrnoException) => {
 const legacyPort = Number(process.env.DOVE_LEGACY_PORT ?? 8008);
 let legacy: Awaited<ReturnType<typeof startLegacyServer>> = null;
 if (process.env.DOVE_LEGACY !== "off") {
-  legacy = await startLegacyServer(svc, legacyPort, apiToken);
+  // hub 与 running 与内核（8790）**共用同一份**：面板走 8008 发起的回合，
+  // 8790 的 GET /api/stream 也要能重放它的帧、并如实回答「在不在跑」。
+  legacy = await startLegacyServer(svc, legacyPort, apiToken, { hub, running });
   if (legacy) console.log(`[dove] 兼容层: http://127.0.0.1:${legacy.port}（control-panel 用这个）`);
   else console.warn(`[dove] 兼容层没起来：端口 ${legacyPort} 被占用（control-panel 会连不上后端）`);
 }

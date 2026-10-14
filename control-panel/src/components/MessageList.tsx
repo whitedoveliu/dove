@@ -62,6 +62,12 @@ import { extractPresentedFiles } from "@/lib/presented-files";
 
 interface MessageListProps {
   messages: Message[];
+  /**
+   * 「正在发送…」待发气泡的正文（还没进 messages 的那句话）。
+   * 建完任务到它真正进列表之间有一小段（见 ChatPanel 的 sendingText），
+   * 空列表时也靠它，用户才不会对着空白等。
+   */
+  pendingText?: string | null;
   onActionClick?: (action: string) => void;
   isLoading?: boolean;
   isSwitchingVersion?: boolean;  // 是否正在切换版本
@@ -995,8 +1001,30 @@ function StickyCollapseButton({
   );
 }
 
+/**
+ * 「正在发送…」待发气泡（Bug B）。
+ *
+ * 为什么要有它：建完任务到这条消息真正进列表之间是一整条链（选中任务 → 切回最新版本 → 发请求），
+ * 这期间消息哪儿都不显示，用户看到的就是「我发出去的消息没发出去」。这里先把它画出来，
+ * 灰色 + 转圈，等真正的用户气泡进列表时它自己就没了。
+ */
+function PendingBubble({ text }: { text: string }) {
+  return (
+    <div className="my-1 flex flex-col items-end gap-1 py-2 opacity-60" aria-live="polite">
+      <div className="max-w-[85%] rounded-2xl bg-[rgb(var(--bubble))] px-3.5 py-2">
+        <div className="whitespace-pre-wrap break-words text-sm text-text-primary">{text}</div>
+      </div>
+      <div className="flex items-center justify-end gap-1.5 px-1 text-2xs text-text-tertiary">
+        <Loader2 className="size-3 animate-spin" />
+        <span>正在发送…</span>
+      </div>
+    </div>
+  );
+}
+
 export default function MessageList({
   messages,
+  pendingText,
   onActionClick,
   isLoading,
   isSwitchingVersion,
@@ -1030,7 +1058,7 @@ export default function MessageList({
     });
   };
   
-  if (messages.length === 0) {
+  if (messages.length === 0 && !pendingText) {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="text-center space-y-4">
@@ -1145,6 +1173,8 @@ export default function MessageList({
           />
         ));
       })}
+      {/* 待发气泡永远在最后：它是「马上要变成下一条用户消息」的那句话 */}
+      {pendingText && <PendingBubble text={pendingText} />}
     </div>
   );
 }

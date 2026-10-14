@@ -12,6 +12,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { readFileSync, statSync } from "node:fs";
 import { join, extname } from "node:path";
 import { hostIsLoopback } from "../routes.ts";
+import type { SseHub } from "../sse.ts";
 import { inside, realOrNull } from "./path-guard.ts";
 
 /**
@@ -190,6 +191,7 @@ export function toLegacyProject(svc: Services, p: { id: string; name: string; pa
 
 export async function handleLegacy(
   req: IncomingMessage, res: ServerResponse, svc: Services, token: string,
+  deps: { hub?: SseHub; running?: Map<string, AbortController> } = {},
 ): Promise<boolean> {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname;
@@ -289,7 +291,7 @@ export async function handleLegacy(
     return true;
   }
 
-  if (await handleChatRoutes(path, url, req, res, svc)) return true;
+  if (await handleChatRoutes(path, url, req, res, svc, deps)) return true;
   if (await handleCaptureRoutes(path, req, res)) return true;
   if (await handleProjectFileRoutes(path, url, req, res, svc)) return true;
   if (await handleProjectRoutes(path, url, req, res, svc)) return true;
@@ -314,11 +316,22 @@ export interface LegacyServerHandle { port: number; close(): void }
  * `token` 是**必需**的 —— 少了它兼容层就没有闸门（等于把门焊死在打开状态），
  * 所以这里直接抛，宁可起不来也不静默裸奔。令牌由 main.ts 从 <DOVE_CONFIG>/api-token 取（见 local-token.ts）。
  */
-export async function startLegacyServer(svc: Services, port = 8008, token?: string): Promise<LegacyServerHandle | null> {
+export async function startLegacyServer(
+  svc: Services,
+  port = 8008,
+  token?: string,
+  /**
+   * 内核（8790）那一侧的共享件 —— 兼容层的 `/api/chat` 要把**面板看见的那份帧**
+   * 记进同一个 hub、并把「这轮在跑」写进同一份 running**，否则 8790 的 `GET /api/stream`
+   * 对面板自己发起的回合一无所知（帧缓冲里没有帧、running 也永远是 false）。
+   * 不传就退回本模块自己的兜底（老测试/冒烟照旧）。
+   */
+  deps: { hub?: SseHub; running?: Map<string, AbortController> } = {},
+): Promise<LegacyServerHandle | null> {
   if (!token) throw new Error("startLegacyServer 需要本地令牌：见 local-token.ts（<DOVE_CONFIG>/api-token）");
 
   const server = createServer((req, res) => {
-    handleLegacy(req, res, svc, token).catch((e) => {
+    handleLegacy(req, res, svc, token, deps).catch((e) => {
       try {
         json(res, 500, { success: false, message: e instanceof Error ? e.message : String(e) });
       } catch { /* 已经发过响应了 */ }

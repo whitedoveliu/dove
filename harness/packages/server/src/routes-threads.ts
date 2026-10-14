@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { Services } from "./bootstrap.ts";
 import { clearTurnFilesForThread } from "./legacy/turn-files-store.ts";
+import { normalizeProfile } from "../../core/src/tools/permission.ts";
 
 type Body = () => Promise<Record<string, unknown>>;
 type Json = (res: ServerResponse, code: number, data: unknown) => void;
@@ -69,7 +70,8 @@ export async function handleThreadRoutes(
     return true;
   }
 
-  // 只读权威（T8.2）：用户显式要求「只看不改」时用这个开关做硬约束
+  // 只读权威（T8.2）：用户显式要求「只看不改」时用这个开关做硬约束。
+  // 落到**两轴模型**的沙箱轴（关闭 = 从 read-only 抬回 workspace-write）；旧的 readOnly 布尔继续一起写。
   const roMatch = /^\/api\/threads\/([^/]+)\/readonly$/.exec(path);
   if (roMatch && req.method === "POST") {
     const id = decodeURIComponent(roMatch[1]!);
@@ -77,8 +79,12 @@ export async function handleThreadRoutes(
     const th = svc.store.getThread(id);
     if (!th) { json(res, 404, { error: "线程不存在" }); return true; }
     const readOnly = b.enabled !== false;
-    svc.store.updateThread(id, { metadata: { ...th.metadata, readOnly } });
-    json(res, 200, { ok: true, readOnly });
+    const cur = normalizeProfile(th.metadata);
+    const sandbox = readOnly ? "read-only" : (cur.sandbox === "read-only" ? "workspace-write" : cur.sandbox);
+    svc.store.updateThread(id, {
+      metadata: { ...th.metadata, readOnly, permission: { ...cur, sandbox } },
+    });
+    json(res, 200, { ok: true, readOnly, profile: { ...cur, sandbox } });
     return true;
   }
   return false;

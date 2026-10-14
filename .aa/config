@@ -1,0 +1,12 @@
+# aa 配置：告诉闸门这个仓库怎么验证自己。
+#
+# 为什么 VERIFY_QUICK 不用现成的 ./verify.sh --quick：
+#   它的第 4 段「服务健康」打的是**真实在跑的内核**（8790 / 8008），
+#   第 5 段 E2E 还要真发一轮对话。app 没起时这两段必然失败 ——
+#   挂在 pre-push 上就等于"每次推送都被拦"，闸门会立刻被人用 --no-verify 绕过。
+#   所以 pre-push 只跑「零外部依赖」的那一半：lint + 完整单测 glob。
+#   这与 .github/workflows/verify.yml 的取舍一致（那个 workflow 的注释解释过同样的事）。
+#
+# 需要完整验收（含服务健康 / E2E）时：把 app 起着，手动跑 ./verify.sh。
+VERIFY_QUICK="(cd harness && npm run lint) && (cd harness && node --no-warnings --test packages/core/test/*.test.ts)"
+VERIFY_FULL="./verify.sh"

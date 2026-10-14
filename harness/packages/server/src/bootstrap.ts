@@ -25,6 +25,7 @@ import { GoalStore } from "../../core/src/agents/goal-store.ts";
 import { makeExitPlanMode } from "./plan-mode-wiring.ts";
 import { allTools } from "../../core/src/tools/index.ts";
 import type { Tool } from "../../core/src/tools/types.ts";
+import { cronThreadMetadata } from "./cron-permission.ts";
 import { PreviewManager } from "../../core/src/projects/preview.ts";
 import { ProjectManager } from "../../core/src/projects/manager.ts";
 import { MemoryService } from "../../core/src/memory/index.ts";
@@ -312,7 +313,11 @@ export async function bootstrap(cfg: Config): Promise<Services> {
       const homeId = store.getOrCreateHomeThread().id;
       const threadId = job.mode === "main"
         ? (job.deliverTo ?? homeId)
-        : store.createThread({ id: `cron_${job.id}_${Date.now().toString(36)}`, kind: "project", title: `定时：${job.name}` }).id;
+        : store.createThread({
+            id: `cron_${job.id}_${Date.now().toString(36)}`, kind: "project", title: `定时：${job.name}`,
+            // 档位**显式**落到新线程上（见 cron-permission.ts：不显式就等于静默用默认档，最难查）
+            metadata: cronThreadMetadata(store, job),
+          }).id;
       emit({ type: "cron_start", jobId: job.id, name: job.name, threadId, mode: job.mode });
       const r = await runtime.run({ threadId, userText: job.prompt, model: job.model, sink: (e) => emit({ ...e, cron: job.id }) });
       const text = assistantText(r.assistantMessageId, threadId);

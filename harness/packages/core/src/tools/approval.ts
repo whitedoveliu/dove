@@ -150,49 +150,15 @@ export function redirectsInsideWorkspace(cmd: string, workdir: string): boolean 
 export type LocalVerdict = "safe" | "low" | "medium" | null;
 
 /**
- * 权限模式（对齐 Codex 的 SandboxMode 三档）。
- *
- *   full       danger-full-access —— 任何操作都不审批（用户明确授权）
- *   workspace  workspace-write    —— 默认。工作区内放行，越界才问
- *   readonly   read-only          —— 只查不动，写类工具直接从工具表里裁掉
- *
- * 为什么要有：默认档必须能**不打断地干活**。以前所有 `cd X && ...` 都被
- * 判成可疑，用户要一条条点允许 —— 那不是"安全"，那是没法用。
+ * 权限模型已迁往 tools/permission.ts（两轴：sandbox × approval）。
+ * 这里只做**转出**，让既有 import（tool-exec / plan-mode / 测试）不用改路径。
+ * 纪律：新代码一律直接 import tools/permission.ts，别从这里拿。
  */
-export type PermissionMode =
-  | "danger-full-access"    // 任何操作都不审批。danger- 前缀是刻意的：让值本身带警示
-  | "workspace-write"       // 默认。工作区内放行，越界才问
-  | "read-only"             // 只查不动：写类工具直接从工具表里裁掉
-  | "auto";                 // 实验：无沙箱，但每次调用前由模型审一遍
-
-export const DEFAULT_PERMISSION_MODE: PermissionMode = "workspace-write";
-
-/**
- * 旧机值 → 新机值。
- *
- * 为什么改：对齐 Codex 的 SandboxMode 与 DSH 的 preset，
- * 而且 `danger-full-access` 这个名字**自带警告**，比光秃秃的 `full` 好。
- *
- * 存量的 metadata 不写迁移脚本 —— 这里**双读**，读到旧值就映射成新值，
- * 下次写回时自然落成新值。停机迁移不值得。
- */
-const LEGACY_ALIASES: Record<string, PermissionMode> = {
-  full: "danger-full-access",
-  workspace: "workspace-write",
-  readonly: "read-only",
-};
-
-export function normalizePermissionMode(v: unknown): PermissionMode {
-  if (typeof v !== "string") return DEFAULT_PERMISSION_MODE;
-  if (v in LEGACY_ALIASES) return LEGACY_ALIASES[v]!;
-  const all: PermissionMode[] = ["danger-full-access", "workspace-write", "read-only", "auto"];
-  return all.includes(v as PermissionMode) ? (v as PermissionMode) : DEFAULT_PERMISSION_MODE;
-}
-
-/** 完全权限要过一道确认闸（UI 用） */
-export function requiresConfirm(mode: PermissionMode): boolean {
-  return mode === "danger-full-access";
-}
+export type { PermissionMode, PermissionProfile, SandboxMode, ApprovalPolicy } from "./permission.ts";
+export {
+  DEFAULT_PERMISSION_MODE, DEFAULT_PROFILE, normalizePermissionMode, normalizeProfile,
+  legacyModeOf, requiresConfirm, PERMISSION_PRESETS,
+} from "./permission.ts";
 
 /** 本地预判；null 表示需要交给 LLM / 弹窗 */
 export function classifyLocally(cmd: string, workdir: string): LocalVerdict {
