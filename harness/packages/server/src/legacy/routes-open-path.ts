@@ -17,17 +17,19 @@
  *      这种逃逸：resolve 出来的字面路径在界内，真实路径不在。
  * 另外一律用 execFile（数组参数、不走 shell）—— 路径里带 `;` `$()` 也只是普通字符。
  *
+ * ②③ 与 `/api/open-in-app` **共用同一份实现**（path-guard.ts 的 guardOpenTarget）：
+ * 这两条路由都会真的执行 `open`，判定写两份必然漂移，漂移一次就是一条能打开任意文件的路由。
+ *
  * 平台差异照实说：macOS 的 `open -R` 能选中文件；Linux 的 xdg-open 只能开到目录
  * （各家文件管理器没有统一的「选中某个文件」入口），所以 reveal 降级成「打开所在目录」。
  * 其它平台**明确不支持**，而不是悄悄执行一条可能不存在的命令。
  */
 import { execFile } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Services } from "../bootstrap.ts";
 import { json, readBody, findProjectByKey } from "./server.ts";
-import { inside, realOrNull } from "./path-guard.ts";
+import { guardOpenTarget, pickOpenRoot } from "./path-guard.ts";
 
 /** 系统命令不该让 HTTP 请求悬着 —— 超时就当失败（用户能看到原因，也能自己去打开） */
 const EXEC_TIMEOUT_MS = 5_000;
@@ -54,28 +56,20 @@ export async function handleOpenPathRoutes(
   // 边界：项目根优先（面板总是带着项目在操作），没给才退回工作区根
   const proj = key ? findProjectByKey(svc, key) : null;
   if (key && !proj) { json(res, 404, { ok: false, message: `项目不存在（${key}）` }); return true; }
-  const root = proj?.path ?? svc.cfg.workspaceRoot;
-  const rootAbs = resolve(root);
+  const rootAbs = resolve(proj?.path ?? svc.cfg.workspaceRoot);
 
-  const target = isAbsolute(raw) ? resolve(raw) : resolve(rootAbs, raw);
-
-  // ② 字面路径判定：越界连「存不存在」都不告诉调用方
-  if (!inside(rootAbs, target)) {
-    json(res, 403, { ok: false, message: `拒绝：路径不在项目工作区内（${target}）` });
-    return true;
-  }
-  if (!existsSync(target)) {
-    json(res, 404, { ok: false, message: `文件不存在：${target}` });
-    return true;
-  }
-
-  // ③ 软链逃逸：真实路径必须也落在界内
-  const rootReal = realOrNull(rootAbs) ?? rootAbs;
-  const targetReal = realOrNull(target);
-  if (!targetReal || !inside(rootReal, targetReal)) {
-    json(res, 403, { ok: false, message: `拒绝：真实路径不在项目工作区内（${targetReal ?? target}）` });
-    return true;
-  }
+  // 三道闸（字面路径 → 存在性 → realpath）在 path-guard.ts 里，与 /api/open-in-app 共用一份。
+  //
+  // 根不恒定一个：设置里的「打开记忆文件夹」要开 `DOVE_CONFIG`（默认 `~/.dove`），它在工作区之外。
+  // 先按 realpath 挑「目标落在哪个已知根里」（配置目录优先；都不沾就退回工作区根，照旧 403），
+  // 挑中的那个根**照样过那三道闸** —— 挑根不是放宽边界，只是换一个允许的边界。
+  const cfgDir = svc.cfg.configDir;
+  const picked = cfgDir ? pickOpenRoot([cfgDir, rootAbs], raw, rootAbs) : null;
+  const root = picked ?? rootAbs;
+  const verdict = guardOpenTarget(root, raw, root === cfgDir ? "允许的目录（配置目录）" : "项目工作区");
+  if (!verdict.ok) { json(res, verdict.status, { ok: false, message: verdict.message }); return true; }
+  const targetReal = verdict.abs;
+  const isDir = verdict.isDir;
 
   const platform = process.platform;
   if (platform !== "darwin" && platform !== "linux") {
@@ -84,8 +78,6 @@ export async function handleOpenPathRoutes(
   }
 
   // macOS: open / open -R（选中文件）；Linux: xdg-open（reveal 只能开到目录）
-  let isDir = false;
-  try { isDir = statSync(targetReal).isDirectory(); } catch { /* 已经 existsSync 过，这里只是拿目录判定 */ }
   let cmd: string;
   let args: string[];
   if (platform === "darwin") {
