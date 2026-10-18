@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#-快速开始"><img src="https://img.shields.io/badge/Quick_Start-3_steps-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-能力"><img src="https://img.shields.io/badge/Tools-44-green?style=for-the-badge" alt="Tools"></a>
-  <a href="#-验证"><img src="https://img.shields.io/badge/Tests-294_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
+  <a href="#-验证"><img src="https://img.shields.io/badge/Tests-366_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -36,9 +36,11 @@ HTTP 客户端 —— 同一份记忆、同一份会话、同一套审批。
 | 🐍 **PTC（RunScript）** | 模型写一段 TS/JS 脚本去调其它工具；一次审批覆盖整段脚本，脚本里每次调用仍回内核 |
 | ⌨️ **`dove` CLI** | 对着常驻内核的 18 个子命令（`run` · `chat` · `approve` · `steer` · `undo` · `tools` …）；`--json` 出 NDJSON |
 | 🤖 **子代理** | 四个角色（`general` / `coder` / `explore` / `plan`）各有自己的工具白名单、100 步上限，过程落盘成**可点进去**的子线程；`resume` 重挂**同一段**上下文，而不是从零开始 |
+| 🔌 **可重连的回合流** | 内核按线程缓存**最近一回合**的帧；跑着的时候切走再回来、或整页刷新，错过的思考、工具行、**挂在等批的审批卡**都会被补上，而不是丢掉 |
+| 🛰️ **后台 Agent** | 列表 + 过程接口和面板页（状态页签、卡片、可点进去看运行过程）；后台子代理比父回合的流活得久，盘上的终态永远优先于过期的 `running` |
 | 🖥️ **终端 · 后台任务** | 一个 shell 常驻，`cd` / `export` 跨命令保留；后台任务保留**尾部** 200,000 字符，90 秒无输出标 stalled，60 秒自动转后台 |
 | 📋 **目标验收** | `criteria` 每轮由**独立评估器**打分；空证据 = 自动 FAIL，失败项反馈进下一轮 |
-| 🛡️ **权限** | 只读是把写类工具**从工具表里删掉**；审批扫命令链的**每一段**，脚本调用也回同一条链 |
+| 🛡️ **权限** | 两轴（sandbox × approval）上的三档（`read-only` / `workspace-write` / `danger-full-access`）；只读把写类工具**从工具表里删掉**，`workspace-write` 往工作区外写会问一次，凭证路径在所有档位都要问；审批扫命令链的**每一段**，脚本调用也回同一条链 |
 | 📝 **项目指令** | `AGENTS.md`：配置目录 → `~/.agents` → 仓库根到 cwd 逐层拼接，每段带 `<!-- From: 路径 -->` 锚点（可反查「这条规矩来自哪个文件」）；超 32 KiB 只警告不截断 |
 | 🔒 **秘密路径护栏** | 读侧硬拒名单（SSH / 云凭证 / `.env`，以及本仓库自己的 `env`），**不转成审批弹窗**；Grep/Glob 命中是过滤掉结果而不是报错 |
 | 🧩 **事件溯源** | 模型可见 ⟺ 已落盘；未配对的工具调用记为「结果未知」；回合无产出会发 `interrupted` 事件而不是静默 |
@@ -118,7 +120,7 @@ harness/          内核（Node 原生跑 .ts，无构建步骤）
   packages/cli/     CLI：端口发现 · HTTP + SSE 客户端 · 18 个子命令
   packages/core/    循环 · 工具 · 记忆 · 子代理 · 权限
   packages/server/  HTTP + SSE · 工具控制面 · 界面在用的旧契约兼容层
-  packages/prompts/ 12 个提示词槽位（s01–s12；s12 = 项目的 AGENTS.md）
+  packages/prompts/ 12 个提示词槽位（s01–s12；s12 = 项目的 AGENTS.md）+ swarm-mode 增补段
   scripts/          冒烟测试（跑的是真实路径）
 control-panel/    界面（React 19 + Vite）
 apps/desktop/     桌面壳（启动时解析内核位置：DOVE_REPO → ~/.dove/repo → 向上查找）
@@ -159,8 +161,8 @@ apps/desktop/     桌面壳（启动时解析内核位置：DOVE_REPO → ~/.dov
 ## ✅ 验证
 
 ```bash
-./verify.sh              # lint · 全量单测 glob · 18 个冒烟 · 2 项服务健康 · 2 项 E2E
-cd harness && npm test   # 304 项（36 个文件，303 通过 / 1 跳过）
+./verify.sh              # lint · 全量单测 glob · 20 个冒烟 · 2 项服务健康 · 2 项 E2E
+cd harness && npm test   # 367 项（47 个文件，366 通过 / 1 跳过）
 ```
 
 单测那一步现在跑**完整**的 `packages/core/test/*.test.ts`。它以前只手点 3 个文件，
@@ -169,8 +171,8 @@ cd harness && npm test   # 304 项（36 个文件，303 通过 / 1 跳过）
 
 冒烟脚本都是**真实执行**它们声称覆盖的路径：`smoke-turn` `smoke-subagent` `smoke-memory`
 `smoke-terminal` `smoke-mcp-resources` `smoke-context` `smoke-routes` `smoke-cli-exit` `smoke-cli` `smoke-ptc`
-`smoke-jobs` `smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo` `smoke-legacy-files` `smoke-preview`
-`smoke-legacy-files` `smoke-preview`。
+`smoke-jobs` `smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo`
+`smoke-legacy-files` `smoke-legacy-open-in-app` `smoke-preview` `smoke-stream`。
 
 属于**环境问题而不是回归**的失败项：两项服务健康与 `smoke-routes` 需要 8790 上有内核在跑；
 E2E 需要一个已存在的项目。另外 `verify.sh` 现在会在冒烟端口被占用时**直接拒绝启动** ——

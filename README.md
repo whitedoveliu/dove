@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#-quick-start"><img src="https://img.shields.io/badge/Quick_Start-3_steps-blue?style=for-the-badge" alt="Quick Start"></a>
   <a href="#-features"><img src="https://img.shields.io/badge/Tools-44-green?style=for-the-badge" alt="Tools"></a>
-  <a href="#-verification"><img src="https://img.shields.io/badge/Tests-294_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
+  <a href="#-verification"><img src="https://img.shields.io/badge/Tests-366_passing-brightgreen?style=for-the-badge" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge" alt="License"></a>
 </p>
 
@@ -36,9 +36,11 @@ change code  →  build to prove it  →  look at the result  →  roll back if 
 | 🐍 **PTC (RunScript)** | the model writes a TS/JS script that calls other tools; one approval covers the whole script, every call still re-enters the kernel |
 | ⌨️ **`dove` CLI** | 18 subcommands against the resident kernel (`run` · `chat` · `approve` · `steer` · `undo` · `tools` …); `--json` emits NDJSON |
 | 🤖 **Subagents** | four roles (`general` / `coder` / `explore` / `plan`) each with its own tool allow-list, 100-step cap, and a run you can click into; `resume` re-attaches the **same** context instead of starting over |
+| 🔌 **Reattachable turns** | the kernel keeps a per-thread frame buffer for the latest turn; switch away and back — or reload mid-turn — and the missed thinking, tool lines and **pending approval card** are replayed instead of lost |
+| 🛰️ **Background agents** | list + process endpoints and a panel page (status tabs, cards, the run itself); a background subagent outlives its parent turn's stream, and the on-disk terminal state always wins over a stale `running` |
 | 🖥️ **Terminal & jobs** | one shell stays alive, so `cd` / `export` survive; background jobs keep the last 200,000 chars, stall at 90 s, auto-background at 60 s |
 | 📋 **Goals with acceptance** | `criteria` are graded by an independent evaluator each round; empty evidence = automatic FAIL, failures are fed into the next round |
-| 🛡️ **Permissions** | read-only removes the write tools from the tool table; approvals scan **every segment**, and script calls re-enter the same chain |
+| 🛡️ **Permissions** | two axes (sandbox × approval) with three modes (`read-only` / `workspace-write` / `danger-full-access`); read-only removes the write tools from the tool table, `workspace-write` asks once before a write leaves the workspace, credential paths ask in every mode; approvals scan **every segment**, and script calls re-enter the same chain |
 | 📝 **Project instructions** | `AGENTS.md` from config home, `~/.agents`, then repo root → cwd, each block tagged with a `<!-- From: path -->` anchor; over 32 KiB warns instead of truncating |
 | 🔒 **Secret-path guard** | a hard deny list (SSH / cloud creds / `.env`, plus this repo's own `env`) that **never** becomes an approval prompt; Grep and Glob filter hits out instead of erroring |
 | 🧩 **Event-sourced turns** | what the model saw is what is on disk; unpaired tool calls become "unknown result"; a turn with no output emits `interrupted` |
@@ -120,7 +122,7 @@ harness/          kernel (Node runs .ts natively — no build step)
   packages/cli/     CLI: port discovery · HTTP + SSE client · 18 subcommands
   packages/core/    loop · tools · memory · subagents · permissions
   packages/server/  HTTP + SSE · tool control plane · the legacy API the UI talks to
-  packages/prompts/ 12 prompt slots (s01–s12; s12 = project AGENTS.md)
+  packages/prompts/ 12 prompt slots (s01–s12; s12 = project AGENTS.md) + the swarm-mode addendum
   scripts/          smoke tests (they execute the real paths)
 control-panel/    UI (React 19 + Vite)
 apps/desktop/     Tauri shell (resolves the kernel at runtime: DOVE_REPO → ~/.dove/repo → upward search)
@@ -163,8 +165,8 @@ Reading a `SKILL.md` pre-checks its `requires.bins` / `requires.env` and warns a
 ## ✅ Verification
 
 ```bash
-./verify.sh              # lint · full unit glob · 18 smoke scripts · 2 health · 2 E2E
-cd harness && npm test   # 304 tests across 36 files (303 pass, 1 skipped)
+./verify.sh              # lint · full unit glob · 20 smoke scripts · 2 health · 2 E2E
+cd harness && npm test   # 367 tests across 47 files (366 pass, 1 skipped)
 ```
 
 The unit step runs the whole `packages/core/test/*.test.ts` glob. It used to name three files by hand, which
@@ -172,8 +174,9 @@ silently skipped `cache-usage` / `capture` / `mode` / `prefix` — "tests pass" 
 looked. It also now prints the pass/fail tally.
 
 Smoke scripts real-execute the paths they claim to cover: `smoke-turn` `smoke-subagent` `smoke-memory`
-`smoke-terminal` `smoke-mcp-resources` `smoke-context` `smoke-routes` `smoke-cli-exit` `smoke-cli` `smoke-ptc` `smoke-jobs`
-`smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo` `smoke-legacy-files` `smoke-preview` `smoke-legacy-files` `smoke-preview`.
+`smoke-terminal` `smoke-mcp-resources` `smoke-context` `smoke-routes` `smoke-cli-exit` `smoke-cli` `smoke-ptc`
+`smoke-jobs` `smoke-loop-audit` `smoke-goal-eval` `smoke-goal-events` `smoke-auth` `smoke-undo`
+`smoke-legacy-files` `smoke-legacy-open-in-app` `smoke-preview` `smoke-stream`.
 
 Failures that are environmental, not regressions: the two health checks and `smoke-routes` need a kernel on 8790;
 E2E needs an existing project. `verify.sh` refuses to start if a smoke port is already taken — two concurrent
